@@ -271,11 +271,14 @@ while true; do
   set -e
 
   set +e
-  omni-autonomous-agent --hook-stop >/dev/null 2>&1
+  hook_output="$(omni-autonomous-agent --hook-stop 2>&1)"
   hook_status=$?
   set -e
 
   if [[ "$hook_status" -eq 2 ]]; then
+    if [[ -n "$hook_output" ]]; then
+      printf '%s\n' "$hook_output" >&2
+    fi
     continue
   fi
 
@@ -283,6 +286,9 @@ while true; do
     exit "$cmd_status"
   fi
 
+  if [[ -n "$hook_output" ]]; then
+    printf '%s\n' "$hook_output" >&2
+  fi
   printf '[omni] hook-stop failed with code %s.\n' "$hook_status" >&2
   exit "$hook_status"
 done
@@ -319,11 +325,14 @@ def _configure_specific_wrapper(
         "  set -e\n"
         "\n"
         "  set +e\n"
-        "  omni-autonomous-agent --hook-stop >/dev/null 2>&1\n"
+        '  hook_output="$(omni-autonomous-agent --hook-stop 2>&1)"\n'
         "  hook_status=$?\n"
         "  set -e\n"
         "\n"
         '  if [[ "$hook_status" -eq 2 ]]; then\n'
+        '    if [[ -n "$hook_output" ]]; then\n'
+        '      printf "%s\\n" "$hook_output" >&2\n'
+        "    fi\n"
         "    continue\n"
         "  fi\n"
         "\n"
@@ -331,6 +340,9 @@ def _configure_specific_wrapper(
         '    exit "$cmd_status"\n'
         "  fi\n"
         "\n"
+        '  if [[ -n "$hook_output" ]]; then\n'
+        '    printf "%s\\n" "$hook_output" >&2\n'
+        "  fi\n"
         "  printf '[omni] hook-stop failed with code %s.\\n' \"$hook_status\" >&2\n"
         '  exit "$hook_status"\n'
         "done\n"

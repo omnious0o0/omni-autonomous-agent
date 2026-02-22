@@ -52,6 +52,15 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.env["PATH"] = f"{self.bin_dir}:{self.env.get('PATH', '')}"
         self.env.pop("AGENT", None)
 
+        cli_shim = self.bin_dir / "omni-autonomous-agent"
+        cli_shim.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f'exec "{sys.executable}" "{MAIN_SCRIPT}" "$@"\n',
+            encoding="utf-8",
+        )
+        cli_shim.chmod(0o755)
+
     def tearDown(self) -> None:
         self._temp_dir.cleanup()
 
@@ -343,15 +352,19 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         added = _run_cli(["--add", "-R", "wrapper block", "-D", "dynamic"], self.env)
         self.assertEqual(added.returncode, 0)
 
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaises(subprocess.TimeoutExpired) as timeout_ctx:
             subprocess.run(
                 [str(wrapper), "--exit-code", "0"],
                 env=self.env,
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=0.3,
+                timeout=1.0,
             )
+
+        timed_out = timeout_ctx.exception
+        partial_output = f"{timed_out.stdout or ''}\n{timed_out.stderr or ''}"
+        self.assertIn("stop-blocked", partial_output)
 
         active_check = _run_cli(["--require-active"], self.env)
         if active_check.returncode != 0:

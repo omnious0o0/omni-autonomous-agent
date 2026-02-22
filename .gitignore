@@ -1,0 +1,10 @@
+TASK.md
+__pycache__/
+tests/__pycache__/
+.omni-autonomous-agent/__pycache__/
+*.pyc
+.ruff_cache/
+omni-sandbox/*
+!omni-sandbox/archived/
+omni-sandbox/archived/*
+!omni-sandbox/archived/.gitkeep

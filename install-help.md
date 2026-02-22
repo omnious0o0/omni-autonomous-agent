@@ -1,0 +1,184 @@
+# Install Help & Hook Setup (AI Self-Check)
+
+This file is the post-install self-check for `omni-autonomous-agent`.
+
+If installation succeeded, the CLI exists and bootstrap already ran once. You still must verify hooks/wrappers before starting autonomous work.
+
+---
+
+## 1) Verify the CLI is reachable
+
+```bash
+omni-autonomous-agent --status
+```
+
+Expected result: `No active session.` (or active session details).
+
+If command is missing, run:
+
+```bash
+bash .omni-autonomous-agent/install.sh
+```
+
+The installer output prints the exact install path and PATH export line.
+
+---
+
+## 2) Re-run bootstrap explicitly (required self-check)
+
+```bash
+omni-autonomous-agent --bootstrap
+```
+
+Important behavior:
+
+- Bootstrap is idempotent.
+- Bootstrap returns non-zero if a required integration step fails.
+- Invalid JSON config files are quarantined to `*.invalid.<token>` and rebuilt safely.
+
+---
+
+## 3) What bootstrap configures automatically
+
+### Native-hook agents
+
+- Claude Code: `~/.claude/settings.json`
+  - Stop hook: `omni-autonomous-agent --hook-stop`
+  - PreCompact hook: `omni-autonomous-agent --hook-precompact`
+- Gemini CLI: `~/.gemini/settings.json`
+  - AfterAgent hook: `omni-autonomous-agent --hook-stop`
+  - PreCompress hook: `omni-autonomous-agent --hook-precompact`
+- OpenCode: `~/.config/opencode/plugins/omni-hook.ts`
+  - `session.idle` -> `--hook-stop`
+  - `experimental.session.compacting` -> `--hook-precompact`
+- OpenClaw: `~/.openclaw/hooks/omni-recovery/`
+  - `HOOK.md` + `handler.ts` managed by bootstrap
+  - bootstrap enables `omni-recovery` and `session-memory`
+
+### Wrapper-based agents
+
+Bootstrap creates wrappers in `~/.local/bin`:
+
+- Universal wrapper: `omni-agent-wrap`
+- Agent wrappers (when detected): `omni-wrap-<agent>`
+  - built-in candidates: `codex`, `aider`, `goose`, `plandex`, `amp`, `crush`, `kiro`, `roo`, `cline`
+
+You can force wrappers for future agents:
+
+```bash
+OMNI_AGENT_EXTRA_WRAPPERS="myagent,anotheragent" omni-autonomous-agent --bootstrap
+```
+
+---
+
+## 4) Wrapper semantics (strict)
+
+Wrappers are not simple EXIT traps.
+
+They enforce:
+
+1. **Active-session preflight**
+   - Calls `omni-autonomous-agent --require-active`
+   - If no active session: exits with code `3`
+2. **Stop-prevention loop**
+   - Runs wrapped agent command
+   - Calls `omni-autonomous-agent --hook-stop`
+   - If hook exits `2`, wrapper continues looping (no premature stop)
+   - Wrapper exits only when hook allows stop
+
+Quick preflight check:
+
+```bash
+~/.local/bin/omni-agent-wrap true
+```
+
+Expected (without active session): non-zero and message
+`[omni] no active session. run omni-autonomous-agent --add first.`
+
+---
+
+## 5) Functional hook verification
+
+### Register a test task (dynamic)
+
+```bash
+omni-autonomous-agent --add -R "verification run"
+```
+
+Expected:
+
+- Session registration output
+- Immediate status output
+- Duration defaults to `dynamic` when `-D` is omitted
+
+### Stop must be blocked while still active
+
+```bash
+omni-autonomous-agent --hook-stop
+```
+
+Expected:
+
+- JSON payload on stdout
+- exit code `2`
+- `"continue": true`
+
+### Precompact must checkpoint report
+
+```bash
+omni-autonomous-agent --hook-precompact
+```
+
+Expected:
+
+- JSON payload
+- checkpoint appended to `REPORT.md`
+
+### Mark report complete and allow stop
+
+Set `### 🚦 Status` to `COMPLETE` (or `PARTIAL`) in sandbox `REPORT.md`, then run:
+
+```bash
+omni-autonomous-agent --hook-stop
+```
+
+Expected:
+
+- exit code `0`
+- state file removed
+- sandbox moved to `omni-sandbox/archived/`
+- finalized report contains real completion timestamp + actual worked duration
+
+---
+
+## 6) OpenClaw verification
+
+```bash
+openclaw hooks list
+```
+
+Expected:
+
+- `omni-recovery` ready
+- `session-memory` ready
+
+---
+
+## 7) Kill-switch behavior
+
+```bash
+omni-autonomous-agent --cancel
+```
+
+- Immediately clears active state
+- Archives sandbox if present
+- If state file is corrupted, it is quarantined as `state.invalid.<timestamp>.json`
+
+---
+
+## 8) Notes for autonomous runs
+
+- Always register first: `omni-autonomous-agent --add -R "..." -D <minutes|dynamic>`
+- Always rely on hook output, not assumptions.
+- If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
+- For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.

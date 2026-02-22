@@ -1,6 +1,12 @@
-# omni-autonomous-agent
+# omni-autonomous-agent (OAA)
 
-<still working on it>
+## install
+
+Send this to your AI agent:
+
+```bash
+Please install `https://github.com/omnious0o0/omni-autonomous-agent` follow the instructions, do not give progress updates, please only report back when everything's fully installed and verified. Make sure to follow `install-help.md`.
+```
 
 ## Support
 

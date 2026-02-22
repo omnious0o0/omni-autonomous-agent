@@ -250,6 +250,36 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotIn("await_user_deadline", state_after)
         self.assertNotIn("await_user_question", state_after)
 
+    def test_status_shows_wait_window_and_clears_expired_window(self) -> None:
+        added = _run_cli(["--add", "-R", "await-user-status"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        status_waiting = _run_cli(["--status"], self.env)
+        self.assertEqual(status_waiting.returncode, 0)
+        self.assertIn("User response", status_waiting.stdout)
+        self.assertIn("waiting", status_waiting.stdout)
+
+        state = self._read_state()
+        state["await_user_started_at"] = "1999-12-31T00:00:00+00:00"
+        state["await_user_deadline"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        status_expired = _run_cli(["--status"], self.env)
+        self.assertEqual(status_expired.returncode, 0)
+        self.assertIn("window expired", status_expired.stdout)
+        self.assertIn("proceeding with defaults", status_expired.stdout)
+
+        state_after = self._read_state()
+        self.assertNotIn("await_user_started_at", state_after)
+        self.assertNotIn("await_user_deadline", state_after)
+        self.assertNotIn("await_user_question", state_after)
+
     def test_require_active_guard(self) -> None:
         before = _run_cli(["--require-active"], self.env)
         self.assertNotEqual(before.returncode, 0)

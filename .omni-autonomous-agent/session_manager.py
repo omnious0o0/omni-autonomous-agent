@@ -919,6 +919,31 @@ def cmd_status() -> None:
         log_target = _required_log_checkpoints(snapshot["elapsed_seconds"])
         _row("Duration", state["duration_input"])
         _row("Report status", _read_report_status(state))
+
+        await_deadline = _await_user_deadline(state)
+        if await_deadline is not None:
+            await_question = str(state.get("await_user_question", "") or "(none)")
+            if now < await_deadline:
+                await_remaining = (await_deadline - now).total_seconds()
+                _row("User response", c(YELLOW, "waiting"))
+                _row("Await question", await_question)
+                _row("Response deadline", _fmt_dt(await_deadline))
+                _row("Wait remaining", _fmt_remaining(await_remaining))
+            else:
+                _clear_await_user_fields(state)
+                _save(state)
+                _append_log(
+                    state,
+                    "User response window expired",
+                    details=[
+                        "No response received in configured window.",
+                        "Proceeding with autonomous defaults.",
+                    ],
+                )
+                _row("User response", c(YELLOW, "window expired"))
+                _row("Await question", await_question)
+                _row("Autonomous mode", "proceeding with defaults")
+
         _row("Log checkpoints", f"{log_count} (target >= {log_target})")
         _row("Sandbox", state["sandbox_dir"])
         print(SEP)

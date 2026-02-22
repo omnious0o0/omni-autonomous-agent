@@ -23,6 +23,7 @@ required_paths=(
   ".gitignore"
   "tests/test_autonomous_agent.py"
   "tests/docker_smoke.sh"
+  "tests/native_agent_check.sh"
   "tests/host_agent_check.sh"
   "tests/launch_gate.sh"
   ".omni-autonomous-agent/install.ps1"

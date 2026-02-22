@@ -20,6 +20,12 @@ If command is missing, run:
 bash .omni-autonomous-agent/install.sh
 ```
 
+On Windows PowerShell, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\.omni-autonomous-agent\install.ps1
+```
+
 The installer output prints the exact install path and PATH export line.
 
 ---

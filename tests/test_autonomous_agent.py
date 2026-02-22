@@ -464,6 +464,14 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("bootstrap did not complete successfully", result.stderr)
 
+    def test_windows_installer_script_exists_and_bootstraps(self) -> None:
+        install_ps1 = PROJECT_ROOT / ".omni-autonomous-agent" / "install.ps1"
+        self.assertTrue(install_ps1.exists())
+
+        text = install_ps1.read_text(encoding="utf-8")
+        self.assertIn("$destName.cmd", text)
+        self.assertIn("--bootstrap", text)
+
 
 if __name__ == "__main__":
     unittest.main()

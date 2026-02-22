@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -94,10 +96,40 @@ def _build_parser() -> argparse.ArgumentParser:
 def _run_install_script() -> None:
     script_dir = Path(__file__).resolve().parent
     install_sh = script_dir / "install.sh"
+    install_ps1 = script_dir / "install.ps1"
+
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell and install_ps1.exists():
+            subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(install_ps1),
+                ],
+                check=True,
+            )
+            return
+
+        bash_bin = shutil.which("bash")
+        if bash_bin and install_sh.exists():
+            subprocess.run([bash_bin, str(install_sh)], check=True)
+            return
+
+        sys.exit(
+            "error: no compatible installer found for Windows. "
+            "Install PowerShell (pwsh/powershell) or Git Bash."
+        )
+
     if not install_sh.exists():
         sys.exit(f"error: install.sh not found at {install_sh}")
-
-    subprocess.run(["bash", str(install_sh)], check=True)
+    bash_bin = shutil.which("bash")
+    if bash_bin is None:
+        sys.exit("error: bash is required for --install on this platform")
+    subprocess.run([bash_bin, str(install_sh)], check=True)
 
 
 def main() -> None:

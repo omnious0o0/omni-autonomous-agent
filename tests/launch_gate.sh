@@ -25,6 +25,7 @@ required_paths=(
   "tests/docker_smoke.sh"
   "tests/host_agent_check.sh"
   "tests/launch_gate.sh"
+  ".omni-autonomous-agent/install.ps1"
 )
 
 for path in "${required_paths[@]}"; do
@@ -64,6 +65,7 @@ files = [
     root / ".omni-autonomous-agent" / "bootstrap.py",
     root / ".omni-autonomous-agent" / "updater.py",
     root / ".omni-autonomous-agent" / "install.sh",
+    root / ".omni-autonomous-agent" / "install.ps1",
     root / "tests" / "test_autonomous_agent.py",
     root / "tests" / "docker_smoke.sh",
     root / "tests" / "host_agent_check.sh",

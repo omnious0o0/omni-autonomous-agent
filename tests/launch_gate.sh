@@ -12,6 +12,7 @@ required_paths=(
   ".omni-autonomous-agent/templates"
   ".omni-autonomous-agent/templates/stop-blocked.md"
   ".omni-autonomous-agent/templates/precompact-handoff.md"
+  ".omni-autonomous-agent/templates/user-timeout-continue.md"
   "omni-sandbox"
   "omni-sandbox/archived"
   "main.py"
@@ -112,8 +113,12 @@ required_flags = [
     '--require-active',
     '--update',
     '--install',
+    '--await-user',
+    '--user-responded',
     '-R',
     '-D',
+    '--wait-minutes',
+    '--response-note',
 ]
 
 missing = [flag for flag in required_flags if flag not in help_result.stdout]

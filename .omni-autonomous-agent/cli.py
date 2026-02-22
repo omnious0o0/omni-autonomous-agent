@@ -8,12 +8,14 @@ from pathlib import Path
 
 from .session_manager import (
     cmd_add,
+    cmd_await_user,
     cmd_cancel,
     cmd_dummy,
     cmd_hook_precompact,
     cmd_hook_stop,
     cmd_require_active,
     cmd_status,
+    cmd_user_responded,
 )
 from .updater import cmd_update, maybe_auto_update
 
@@ -41,6 +43,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Auto-configure hooks and wrappers with no manual setup",
     )
+    group.add_argument(
+        "--await-user",
+        action="store_true",
+        help="Open a bounded user-response window before autonomous fallback",
+    )
+    group.add_argument(
+        "--user-responded",
+        action="store_true",
+        help="Register that user provided new information during await-user window",
+    )
     group.add_argument("--dummy", action="store_true", help="Register a test session")
 
     parser.add_argument(
@@ -56,6 +68,25 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES_OR_DYNAMIC",
         type=str,
         help="Duration in minutes or 'dynamic' (required with --add)",
+    )
+    parser.add_argument(
+        "-Q",
+        "--question",
+        metavar="QUESTION",
+        type=str,
+        help="Question text used with --await-user",
+    )
+    parser.add_argument(
+        "--wait-minutes",
+        metavar="MINUTES",
+        type=str,
+        help="User response window in minutes for --await-user (default: 2)",
+    )
+    parser.add_argument(
+        "--response-note",
+        metavar="NOTE",
+        type=str,
+        help="Free-form note captured with --user-responded",
     )
     return parser
 
@@ -80,6 +111,8 @@ def main() -> None:
         or args.hook_precompact
         or args.require_active
         or args.bootstrap
+        or args.await_user
+        or args.user_responded
     ):
         maybe_auto_update()
 
@@ -126,6 +159,15 @@ def main() -> None:
     if args.bootstrap:
         module = importlib.import_module(f"{__package__}.bootstrap")
         module.cmd_bootstrap()
+        return
+
+    if args.await_user:
+        wait_minutes = args.wait_minutes if args.wait_minutes is not None else "2"
+        cmd_await_user(args.question or "", wait_minutes)
+        return
+
+    if args.user_responded:
+        cmd_user_responded(args.response_note or "")
         return
 
     if args.dummy:

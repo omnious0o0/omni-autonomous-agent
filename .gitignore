@@ -1,7 +1,6 @@
 TASK.md
 __pycache__/
-tests/
-__pycache__/
+tests/__pycache__/
 .omni-autonomous-agent/__pycache__/
 *.pyc
 .ruff_cache/

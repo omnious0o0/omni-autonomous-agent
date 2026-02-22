@@ -155,6 +155,92 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertFalse(bool(stop_payload.get("continue")))
         self.assertFalse(self._state_file().exists())
 
+    def test_await_user_window_times_out_to_autonomous_continue(self) -> None:
+        added = _run_cli(["--add", "-R", "await-user"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            [
+                "--await-user",
+                "-Q",
+                "Need goal and duration confirmation",
+                "--wait-minutes",
+                "1",
+            ],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+        waiting_payload = _json_output(waiting)
+        self.assertTrue(bool(waiting_payload.get("waiting_for_user")))
+        self.assertTrue(bool(waiting_payload.get("block")))
+        self.assertEqual(waiting_payload.get("hook"), "await-user")
+
+        state = self._read_state()
+        state["await_user_started_at"] = "1999-12-31T00:00:00+00:00"
+        state["await_user_deadline"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        timeout = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(timeout.returncode, 2)
+        timeout_payload = _json_output(timeout)
+        self.assertTrue(bool(timeout_payload.get("user_response_timed_out")))
+        self.assertEqual(timeout_payload.get("template_id"), "user-timeout-continue")
+        self.assertIn(
+            "did not respond", str(timeout_payload.get("message", "")).lower()
+        )
+
+        state_after = self._read_state()
+        self.assertNotIn("await_user_started_at", state_after)
+        self.assertNotIn("await_user_deadline", state_after)
+        self.assertNotIn("await_user_question", state_after)
+
+    def test_await_user_default_wait_is_two_minutes(self) -> None:
+        added = _run_cli(["--add", "-R", "await-user-default"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Please confirm remaining priorities"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+        waiting_payload = _json_output(waiting)
+        self.assertEqual(waiting_payload.get("wait_minutes"), 2)
+        self.assertTrue(bool(waiting_payload.get("waiting_for_user")))
+
+        state = self._read_state()
+        started = state.get("await_user_started_at")
+        deadline = state.get("await_user_deadline")
+        self.assertIsInstance(started, str)
+        self.assertIsInstance(deadline, str)
+
+    def test_user_responded_clears_wait_window(self) -> None:
+        added = _run_cli(["--add", "-R", "await-user-resume"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        responded = _run_cli(
+            [
+                "--user-responded",
+                "--response-note",
+                "User returned with new constraints",
+            ],
+            self.env,
+        )
+        self.assertEqual(responded.returncode, 0)
+        responded_payload = _json_output(responded)
+        self.assertTrue(bool(responded_payload.get("user_response_registered")))
+        self.assertFalse(bool(responded_payload.get("waiting_for_user")))
+
+        state_after = self._read_state()
+        self.assertNotIn("await_user_started_at", state_after)
+        self.assertNotIn("await_user_deadline", state_after)
+        self.assertNotIn("await_user_question", state_after)
+
     def test_require_active_guard(self) -> None:
         before = _run_cli(["--require-active"], self.env)
         self.assertNotEqual(before.returncode, 0)

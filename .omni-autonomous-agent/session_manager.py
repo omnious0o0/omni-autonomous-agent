@@ -198,6 +198,25 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
         if deadline is not None:
             return False
 
+    await_started = state.get("await_user_started_at")
+    await_deadline = state.get("await_user_deadline")
+    await_question = state.get("await_user_question")
+
+    if any(
+        value is not None for value in (await_started, await_deadline, await_question)
+    ):
+        if not isinstance(await_started, str) or not isinstance(await_deadline, str):
+            return False
+        try:
+            started_dt = datetime.fromisoformat(await_started)
+            deadline_dt = datetime.fromisoformat(await_deadline)
+        except ValueError:
+            return False
+        if deadline_dt < started_dt:
+            return False
+        if await_question is not None and not isinstance(await_question, str):
+            return False
+
     return True
 
 
@@ -395,6 +414,34 @@ def _hook_template_context(
         "log_path": str(_log_path(state)),
         "report_status": _read_report_status(state),
     }
+
+
+def _clear_await_user_fields(state: dict[str, Any]) -> None:
+    state.pop("await_user_started_at", None)
+    state.pop("await_user_deadline", None)
+    state.pop("await_user_question", None)
+
+
+def _await_user_deadline(state: dict[str, Any]) -> datetime | None:
+    raw = state.get("await_user_deadline")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _parse_positive_minutes(raw: str, flag: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"error: {flag} must be a positive integer in minutes")
+    if value <= 0:
+        sys.exit(f"error: {flag} must be a positive integer in minutes")
+    return value
 
 
 def _status_snapshot(state: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -713,6 +760,102 @@ def cmd_dummy() -> None:
     cmd_add("Dummy autonomous session", "60")
 
 
+def cmd_await_user(question: str, wait_minutes: str) -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+
+        minutes = _parse_positive_minutes(wait_minutes.strip(), "--wait-minutes")
+        now = _now()
+        deadline = now + timedelta(minutes=minutes)
+
+        state["await_user_started_at"] = now.isoformat()
+        state["await_user_deadline"] = deadline.isoformat()
+        state["await_user_question"] = question.strip()
+        _save(state)
+
+        _append_log(
+            state,
+            "User response window opened",
+            details=[
+                f"Window: {minutes} minute(s)",
+                f"Deadline: {_fmt_dt(deadline)}",
+                f"Question: {question.strip() or '(none)'}",
+            ],
+        )
+
+        _emit_hook_payload(
+            False,
+            "Waiting for user response within configured window.",
+            hook="await-user",
+            active=True,
+            block=True,
+            waiting_for_user=True,
+            wait_minutes=minutes,
+            response_deadline=_fmt_dt(deadline),
+            question=question.strip(),
+        )
+
+
+def cmd_user_responded(response_note: str) -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+
+        note = response_note.strip()
+        had_wait_window = _await_user_deadline(state) is not None
+        if had_wait_window:
+            _clear_await_user_fields(state)
+            _save(state)
+            _append_log(
+                state,
+                "User response registered",
+                details=[
+                    f"Response note: {note or '(none)'}",
+                    "Await-user window cleared.",
+                ],
+            )
+            _emit_hook_payload(
+                False,
+                "User response registered. Continue autonomous work with new information.",
+                hook="user-responded",
+                active=True,
+                waiting_for_user=False,
+                user_response_registered=True,
+                response_note=note,
+            )
+            return
+
+        _append_log(
+            state,
+            "User response recorded without active wait window",
+            details=[f"Response note: {note or '(none)'}"],
+        )
+        _emit_hook_payload(
+            False,
+            "No active user-response window. Continue autonomous execution.",
+            hook="user-responded",
+            active=True,
+            waiting_for_user=False,
+            user_response_registered=False,
+            response_note=note,
+        )
+
+
 def cmd_require_active() -> None:
     with _state_lock():
         state, state_error = _load_with_error()
@@ -914,6 +1057,64 @@ def cmd_hook_stop() -> None:
             now = _now()
             snapshot = _status_snapshot(state, now)
             report_status = _read_report_status(state)
+
+            await_deadline = _await_user_deadline(state)
+            if await_deadline is not None:
+                if now < await_deadline:
+                    wait_remaining = (await_deadline - now).total_seconds()
+                    remaining_text = _fmt_remaining(wait_remaining)
+                    template_context = _hook_template_context(state, snapshot, now)
+                    template_text = render_template("stop-blocked", template_context)
+                    _append_log(
+                        state,
+                        "Stop attempt blocked by user response window",
+                        details=[
+                            f"Response deadline: {_fmt_dt(await_deadline)}",
+                            f"Remaining: {remaining_text}",
+                            f"Question: {state.get('await_user_question', '') or '(none)'}",
+                        ],
+                    )
+                    _emit_hook_payload(
+                        True,
+                        (
+                            "Waiting for user response window to close. "
+                            f"Time remaining: {remaining_text}."
+                        ),
+                        hook="stop",
+                        active=True,
+                        block=True,
+                        waiting_for_user=True,
+                        response_deadline=_fmt_dt(await_deadline),
+                        template_id="stop-blocked",
+                        template=template_text,
+                    )
+                    sys.exit(2)
+
+                template_context = _hook_template_context(state, snapshot, now)
+                template_text = render_template(
+                    "user-timeout-continue", template_context
+                )
+                _clear_await_user_fields(state)
+                _save(state)
+                _append_log(
+                    state,
+                    "User response window expired",
+                    details=[
+                        "No response received in configured window.",
+                        "Proceeding with autonomous defaults.",
+                    ],
+                )
+                _emit_hook_payload(
+                    True,
+                    "User did not respond within configured window. Proceeding autonomously with available information.",
+                    hook="stop",
+                    active=True,
+                    block=True,
+                    user_response_timed_out=True,
+                    template_id="user-timeout-continue",
+                    template=template_text,
+                )
+                sys.exit(2)
 
             if snapshot["dynamic"]:
                 should_block = report_status not in {"COMPLETE", "PARTIAL"}

@@ -45,6 +45,37 @@ WRAP_CODE=$?
 set -e
 test "$WRAP_CODE" -eq 3
 
+AWAIT_ADD_OUTPUT="$($CLI --add -R "docker await user" -D dynamic)"
+printf "%s\n" "$AWAIT_ADD_OUTPUT" | grep -q "omni-autonomous-agent - active"
+
+AWAIT_OUTPUT="$($CLI --await-user -Q "Need confirmation")"
+printf "%s\n" "$AWAIT_OUTPUT" > /tmp/await-user-output.txt
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+lines = [line for line in Path('/tmp/await-user-output.txt').read_text(encoding='utf-8').splitlines() if line.strip()]
+payload = json.loads(lines[-1])
+assert payload['hook'] == 'await-user'
+assert payload['wait_minutes'] == 2
+assert payload['waiting_for_user'] is True
+PY
+
+RESPONDED_OUTPUT="$($CLI --user-responded --response-note "user answered")"
+printf "%s\n" "$RESPONDED_OUTPUT" > /tmp/user-responded-output.txt
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+lines = [line for line in Path('/tmp/user-responded-output.txt').read_text(encoding='utf-8').splitlines() if line.strip()]
+payload = json.loads(lines[-1])
+assert payload['hook'] == 'user-responded'
+assert payload['user_response_registered'] is True
+assert payload['waiting_for_user'] is False
+PY
+
+"$CLI" --cancel
+
 AGENT="futureagent" "$CLI" --bootstrap
 test -f "$HOME/.local/bin/omni-wrap-futureagent"
 

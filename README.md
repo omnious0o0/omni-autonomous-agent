@@ -1,6 +1,6 @@
 # omni-autonomous-agent (OAA)
 
-## install
+## install (automatic)
 
 Send this to your AI agent:
 

@@ -410,6 +410,20 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         wrapper = self.home_dir / ".local" / "bin" / "omni-wrap-soonagent"
         self.assertTrue(wrapper.exists())
 
+    def test_bootstrap_respects_wrapper_bin_override(self) -> None:
+        self._write_fake_binary("codex")
+        custom_bin = Path(self._temp_dir.name) / "custom-wrapper-bin"
+
+        env = self.env.copy()
+        env["OMNI_AGENT_WRAPPER_BIN"] = str(custom_bin)
+
+        bootstrap = _run_cli(["--bootstrap"], env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        suffix = ".cmd" if os.name == "nt" else ""
+        self.assertTrue((custom_bin / f"omni-agent-wrap{suffix}").exists())
+        self.assertTrue((custom_bin / f"omni-wrap-codex{suffix}").exists())
+
     def test_bootstrap_skips_unsafe_wrapper_token(self) -> None:
         self.env["OMNI_AGENT_EXTRA_WRAPPERS"] = "bad;token"
 

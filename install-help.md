@@ -57,7 +57,13 @@ Important behavior:
 
 ### Wrapper-based agents
 
-Bootstrap creates wrappers in `~/.local/bin`:
+Bootstrap creates wrappers in a platform-aware bin directory:
+
+- Linux/macOS default: `~/.local/bin`
+- Windows default: `%LOCALAPPDATA%\\omni-autonomous-agent\\bin`
+- Override on any OS: `OMNI_AGENT_WRAPPER_BIN=/custom/path`
+
+Wrapper names:
 
 - Universal wrapper: `omni-agent-wrap`
 - Agent wrappers (when detected): `omni-wrap-<agent>`

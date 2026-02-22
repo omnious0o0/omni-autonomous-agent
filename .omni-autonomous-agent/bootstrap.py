@@ -27,6 +27,30 @@ KNOWN_WRAPPER_AGENTS: dict[str, str] = {
 }
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _wrapper_bin_dir() -> Path:
+    override = os.environ.get("OMNI_AGENT_WRAPPER_BIN", "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    if _is_windows():
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data).expanduser() / "omni-autonomous-agent" / "bin"
+        return Path.home() / "AppData" / "Local" / "omni-autonomous-agent" / "bin"
+
+    return Path.home() / ".local" / "bin"
+
+
+def _wrapper_filename(base_name: str) -> str:
+    if _is_windows():
+        return f"{base_name}.cmd"
+    return base_name
+
+
 def _header(title: str) -> None:
     print(SEP)
     print(f"  {c(BOLD, title)}")
@@ -253,10 +277,32 @@ def _configure_opencode() -> tuple[bool, Path]:
     return changed, plugin_path
 
 
-def _configure_universal_wrapper() -> tuple[bool, Path]:
-    wrapper_path = Path.home() / ".local" / "bin" / "omni-agent-wrap"
-    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-    desired = """#!/usr/bin/env bash
+def _universal_wrapper_script() -> str:
+    if _is_windows():
+        return """@echo off
+setlocal
+
+omni-autonomous-agent --require-active >nul 2>&1
+if errorlevel 1 (
+  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.
+  exit /b 3
+)
+
+:loop
+%*
+set CMD_STATUS=%ERRORLEVEL%
+
+omni-autonomous-agent --hook-stop
+set HOOK_STATUS=%ERRORLEVEL%
+
+if "%HOOK_STATUS%"=="2" goto loop
+if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%
+
+>&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.
+exit /b %HOOK_STATUS%
+"""
+
+    return """#!/usr/bin/env bash
 set -euo pipefail
 
 if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
@@ -293,23 +339,35 @@ while true; do
   exit "$hook_status"
 done
 """
-    current = (
-        wrapper_path.read_text(encoding="utf-8") if wrapper_path.exists() else None
-    )
-    changed = current != desired
-    if changed:
-        wrapper_path.write_text(desired, encoding="utf-8")
-    mode = wrapper_path.stat().st_mode
-    wrapper_path.chmod(mode | 0o111)
-    return changed, wrapper_path
 
 
-def _configure_specific_wrapper(
-    wrapper_name: str, agent_command: str
-) -> tuple[bool, Path]:
-    wrapper_path = Path.home() / ".local" / "bin" / f"omni-wrap-{wrapper_name}"
-    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-    desired = (
+def _specific_wrapper_script(agent_command: str) -> str:
+    if _is_windows():
+        return (
+            "@echo off\n"
+            "setlocal\n"
+            "\n"
+            "omni-autonomous-agent --require-active >nul 2>&1\n"
+            "if errorlevel 1 (\n"
+            "  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.\n"
+            "  exit /b 3\n"
+            ")\n"
+            "\n"
+            ":loop\n"
+            f"{agent_command} %*\n"
+            "set CMD_STATUS=%ERRORLEVEL%\n"
+            "\n"
+            "omni-autonomous-agent --hook-stop\n"
+            "set HOOK_STATUS=%ERRORLEVEL%\n"
+            "\n"
+            'if "%HOOK_STATUS%"=="2" goto loop\n'
+            'if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%\n'
+            "\n"
+            ">&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.\n"
+            "exit /b %HOOK_STATUS%\n"
+        )
+
+    return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "\n"
@@ -347,14 +405,39 @@ def _configure_specific_wrapper(
         '  exit "$hook_status"\n'
         "done\n"
     )
+
+
+def _configure_universal_wrapper() -> tuple[bool, Path]:
+    wrapper_path = _wrapper_bin_dir() / _wrapper_filename("omni-agent-wrap")
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    desired = _universal_wrapper_script()
     current = (
         wrapper_path.read_text(encoding="utf-8") if wrapper_path.exists() else None
     )
     changed = current != desired
     if changed:
         wrapper_path.write_text(desired, encoding="utf-8")
-    mode = wrapper_path.stat().st_mode
-    wrapper_path.chmod(mode | 0o111)
+    if not _is_windows():
+        mode = wrapper_path.stat().st_mode
+        wrapper_path.chmod(mode | 0o111)
+    return changed, wrapper_path
+
+
+def _configure_specific_wrapper(
+    wrapper_name: str, agent_command: str
+) -> tuple[bool, Path]:
+    wrapper_path = _wrapper_bin_dir() / _wrapper_filename(f"omni-wrap-{wrapper_name}")
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    desired = _specific_wrapper_script(agent_command)
+    current = (
+        wrapper_path.read_text(encoding="utf-8") if wrapper_path.exists() else None
+    )
+    changed = current != desired
+    if changed:
+        wrapper_path.write_text(desired, encoding="utf-8")
+    if not _is_windows():
+        mode = wrapper_path.stat().st_mode
+        wrapper_path.chmod(mode | 0o111)
     return changed, wrapper_path
 
 

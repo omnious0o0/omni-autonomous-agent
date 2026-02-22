@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import tempfile
+from collections import UserDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,48 @@ from .constants import (
     YELLOW,
     c,
 )
+
+
+TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+
+class _SafeFormatMap(UserDict[str, str]):
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
+def _fallback_template(template_id: str) -> str:
+    if template_id == "stop-blocked":
+        return (
+            "[OAA STOP BLOCK]\n"
+            "Do not stop. Continue autonomous execution now.\n"
+            "Request: {request}\n"
+            "Time remaining: {time_remaining}\n"
+            "Report status: {report_status}\n"
+            "Sandbox: {sandbox_dir}\n"
+        )
+
+    if template_id == "precompact-handoff":
+        return (
+            "[OAA PRECOMPACT]\n"
+            "Prepare deep handoff for next model now.\n"
+            "Include: completed work, failed attempts, file changes, open risks, and exact next actions.\n"
+            "Request: {request}\n"
+            "Elapsed: {elapsed}\n"
+            "Report: {report_path}\n"
+            "Log: {log_path}\n"
+        )
+
+    return ""
+
+
+def render_template(template_id: str, context: dict[str, str]) -> str:
+    template_path = TEMPLATE_DIR / f"{template_id}.md"
+    if template_path.exists():
+        raw = template_path.read_text(encoding="utf-8")
+    else:
+        raw = _fallback_template(template_id)
+    return raw.format_map(_SafeFormatMap(context))
 
 
 def _now() -> datetime:
@@ -333,6 +376,25 @@ def _append_log(
         lines.extend([f"- {detail}" for detail in details])
     with log.open("a", encoding="utf-8") as f:
         f.write("\n" + "\n".join(lines) + "\n")
+
+
+def _hook_template_context(
+    state: dict[str, Any], snapshot: dict[str, Any], now: datetime
+) -> dict[str, str]:
+    deadline_text = (
+        "dynamic" if snapshot["deadline"] is None else _fmt_dt(snapshot["deadline"])
+    )
+    return {
+        "request": str(state.get("request", "")),
+        "now": _fmt_dt(now),
+        "deadline": deadline_text,
+        "time_remaining": _fmt_remaining(snapshot["remaining_seconds"]),
+        "elapsed": _fmt_elapsed(float(snapshot["elapsed_seconds"])),
+        "sandbox_dir": str(state.get("sandbox_dir", "")),
+        "report_path": str(_report_path(state)),
+        "log_path": str(_log_path(state)),
+        "report_status": _read_report_status(state),
+    }
 
 
 def _status_snapshot(state: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -779,6 +841,9 @@ def cmd_hook_precompact() -> None:
 
         try:
             now = _now()
+            snapshot = _status_snapshot(state, now)
+            template_context = _hook_template_context(state, snapshot, now)
+            template_text = render_template("precompact-handoff", template_context)
             _append_report_checkpoint(state, "precompact", now)
             _append_log(
                 state,
@@ -795,6 +860,8 @@ def cmd_hook_precompact() -> None:
                 active=True,
                 report=str(_report_path(state)),
                 log=str(_log_path(state)),
+                template_id="precompact-handoff",
+                template=template_text,
             )
         except Exception as exc:
             _emit_hook_payload(
@@ -811,6 +878,17 @@ def cmd_hook_stop() -> None:
     with _state_lock():
         state, state_error = _load_with_error()
         if state_error:
+            template_text = render_template(
+                "stop-blocked",
+                {
+                    "request": "unknown",
+                    "now": _fmt_dt(_now()),
+                    "deadline": "unknown",
+                    "time_remaining": "unknown",
+                    "report_status": "UNKNOWN",
+                    "sandbox_dir": "unknown",
+                },
+            )
             _emit_hook_payload(
                 True,
                 (
@@ -821,6 +899,8 @@ def cmd_hook_stop() -> None:
                 hook="stop",
                 active=True,
                 block=True,
+                template_id="stop-blocked",
+                template=template_text,
             )
             sys.exit(2)
 
@@ -844,6 +924,8 @@ def cmd_hook_stop() -> None:
 
             if should_block:
                 remaining_text = _fmt_remaining(snapshot["remaining_seconds"])
+                template_context = _hook_template_context(state, snapshot, now)
+                template_text = render_template("stop-blocked", template_context)
                 message = (
                     "Autonomous session is still active. Keep working. "
                     f"Time remaining: {remaining_text}. "
@@ -857,7 +939,15 @@ def cmd_hook_stop() -> None:
                         f"Report status: {report_status}",
                     ],
                 )
-                _emit_hook_payload(True, message, hook="stop", active=True, block=True)
+                _emit_hook_payload(
+                    True,
+                    message,
+                    hook="stop",
+                    active=True,
+                    block=True,
+                    template_id="stop-blocked",
+                    template=template_text,
+                )
                 sys.exit(2)
 
             _append_log(
@@ -879,6 +969,8 @@ def cmd_hook_stop() -> None:
                     "Stop hook failed while archiving sandbox",
                     details=[str(exc)],
                 )
+                template_context = _hook_template_context(state, snapshot, now)
+                template_text = render_template("stop-blocked", template_context)
                 _emit_hook_payload(
                     True,
                     (
@@ -889,6 +981,8 @@ def cmd_hook_stop() -> None:
                     hook="stop",
                     active=True,
                     block=True,
+                    template_id="stop-blocked",
+                    template=template_text,
                 )
                 sys.exit(2)
 
@@ -903,11 +997,24 @@ def cmd_hook_stop() -> None:
                 archived_sandbox=str(archived) if archived else None,
             )
         except Exception as exc:
+            template_text = render_template(
+                "stop-blocked",
+                {
+                    "request": str(state.get("request", "unknown")),
+                    "now": _fmt_dt(_now()),
+                    "deadline": "unknown",
+                    "time_remaining": "unknown",
+                    "report_status": _read_report_status(state),
+                    "sandbox_dir": str(state.get("sandbox_dir", "unknown")),
+                },
+            )
             _emit_hook_payload(
                 True,
                 f"Stop hook failed and continuation is required: {exc}",
                 hook="stop",
                 active=True,
                 block=True,
+                template_id="stop-blocked",
+                template=template_text,
             )
             sys.exit(2)

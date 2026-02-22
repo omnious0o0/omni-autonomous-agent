@@ -9,6 +9,9 @@ export PYTHONPYCACHEPREFIX="/tmp/omni-pycache"
 
 required_paths=(
   ".omni-autonomous-agent"
+  ".omni-autonomous-agent/templates"
+  ".omni-autonomous-agent/templates/stop-blocked.md"
+  ".omni-autonomous-agent/templates/precompact-handoff.md"
   "omni-sandbox"
   "omni-sandbox/archived"
   "main.py"

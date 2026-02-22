@@ -106,11 +106,17 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         stop_payload = _json_output(stop)
         self.assertTrue(bool(stop_payload.get("continue")))
         self.assertTrue(bool(stop_payload.get("block")))
+        self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
+        self.assertIn("Do not stop", str(stop_payload.get("template", "")))
 
         precompact = _run_cli(["--hook-precompact"], self.env)
         self.assertEqual(precompact.returncode, 0)
         precompact_payload = _json_output(precompact)
         self.assertFalse(bool(precompact_payload.get("continue")))
+        self.assertEqual(precompact_payload.get("template_id"), "precompact-handoff")
+        self.assertIn(
+            "deep handoff", str(precompact_payload.get("template", "")).lower()
+        )
         report_text = (sandbox_dir / "REPORT.md").read_text(encoding="utf-8")
         self.assertIn("Checkpoint (precompact)", report_text)
 
@@ -129,6 +135,11 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
 
         stop_early = _run_cli(["--hook-stop"], self.env)
         self.assertEqual(stop_early.returncode, 2)
+        stop_payload = _json_output(stop_early)
+        self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
+        self.assertIn(
+            "continue autonomous", str(stop_payload.get("template", "")).lower()
+        )
 
         state = self._read_state()
         report_path = Path(str(state["sandbox_dir"])) / "REPORT.md"

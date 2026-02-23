@@ -9,10 +9,58 @@ function Write-Section($title) {
 $scriptSourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $rootDir = Resolve-Path (Join-Path $scriptSourceDir "..")
 $mainScript = Join-Path $rootDir "main.py"
+$repoUrl = "https://github.com/omnious0o0/omni-autonomous-agent.git"
+$installDir = $env:OMNI_AGENT_INSTALL_DIR
+if (-not $installDir -or -not $installDir.Trim()) {
+  $installDir = Join-Path $HOME ".omni-autonomous-agent"
+}
+
+$repoGitDir = Join-Path $installDir ".git"
+$installScript = Join-Path $installDir ".omni-autonomous-agent\install.ps1"
 
 if (-not (Test-Path $mainScript)) {
-  Write-Error "main.py not found at $mainScript"
-  exit 1
+  Write-Section "Bootstrapping repository"
+
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  if (-not $git) {
+    Write-Error "git is required for install."
+    exit 1
+  }
+
+  if (Test-Path $repoGitDir) {
+    Write-Output "  Repository:  $installDir (existing, pulling latest)"
+    & $git.Source -C $installDir pull --ff-only
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "failed to pull latest repository at $installDir"
+      exit 1
+    }
+  }
+  elseif (Test-Path $installDir) {
+    Write-Error "$installDir exists but is not a git repository. Remove it manually or set OMNI_AGENT_INSTALL_DIR to a clean location."
+    exit 1
+  }
+  else {
+    Write-Output "  Repository:  Cloning to $installDir"
+    & $git.Source clone $repoUrl $installDir
+    if ($LASTEXITCODE -ne 0) {
+      Write-Error "failed to clone repository to $installDir"
+      exit 1
+    }
+  }
+
+  if (-not (Test-Path $installScript)) {
+    Write-Error "install script not found at $installScript after bootstrap"
+    exit 1
+  }
+
+  $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+  if ($pwsh) {
+    & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $installScript
+  }
+  else {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $installScript
+  }
+  exit $LASTEXITCODE
 }
 
 $destName = "omni-autonomous-agent"
@@ -55,12 +103,15 @@ exit 1
 $runnerCmdBody = @"
 @echo off
 setlocal
-powershell -NoProfile -ExecutionPolicy Bypass -File "$runnerPs1" %*
+set "PS_EXE=pwsh"
+where pwsh >nul 2>&1 || set "PS_EXE=powershell"
+%PS_EXE% -NoProfile -ExecutionPolicy Bypass -File "$runnerPs1" %*
 exit /b %ERRORLEVEL%
 "@
 
-Set-Content -Path $runnerPs1 -Value $runnerPs1Body -Encoding ascii
-Set-Content -Path $runnerCmd -Value $runnerCmdBody -Encoding ascii
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($runnerPs1, $runnerPs1Body, $utf8NoBom)
+[System.IO.File]::WriteAllText($runnerCmd, $runnerCmdBody, $utf8NoBom)
 
 Write-Section "Installed"
 Write-Output "  Source:      $mainScript"

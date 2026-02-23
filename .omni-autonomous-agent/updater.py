@@ -18,6 +18,19 @@ def _header(title: str) -> None:
     print(SEP)
 
 
+def _command_timeout_seconds(default_seconds: int) -> int:
+    raw = os.environ.get("OMNI_AGENT_COMMAND_TIMEOUT", "").strip()
+    if not raw:
+        return default_seconds
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default_seconds
+    if parsed <= 0:
+        return default_seconds
+    return parsed
+
+
 def _git(repo_root: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -25,6 +38,7 @@ def _git(repo_root: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        timeout=_command_timeout_seconds(30),
     )
     return (result.stdout or "").strip()
 
@@ -41,7 +55,10 @@ def _is_git_worktree(repo_root: Path) -> bool:
             check=False,
             capture_output=True,
             text=True,
+            timeout=_command_timeout_seconds(30),
         )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("git rev-parse timed out") from exc
     except FileNotFoundError:
         return False
     return result.returncode == 0 and (result.stdout or "").strip() == "true"
@@ -99,7 +116,10 @@ def maybe_auto_update() -> None:
         return
 
     repo_root = _repo_root()
-    if not _is_git_worktree(repo_root):
+    try:
+        if not _is_git_worktree(repo_root):
+            return
+    except RuntimeError:
         return
 
     now = datetime.now().astimezone()
@@ -129,6 +149,7 @@ def maybe_auto_update() -> None:
 
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GCM_INTERACTIVE"] = "never"
         result = subprocess.run(
             ["git", "pull", "--ff-only"],
             cwd=repo_root,
@@ -136,6 +157,7 @@ def maybe_auto_update() -> None:
             capture_output=True,
             text=True,
             env=env,
+            timeout=_command_timeout_seconds(120),
         )
         if result.returncode == 0:
             next_state["last_result"] = "updated"
@@ -158,7 +180,12 @@ def cmd_update() -> None:
     if shutil.which("git") is None:
         sys.exit("error: git is required for --update")
 
-    if not _is_git_worktree(repo_root):
+    try:
+        is_worktree = _is_git_worktree(repo_root)
+    except RuntimeError as exc:
+        sys.exit(f"error: update precheck failed: {exc}")
+
+    if not is_worktree:
         sys.exit(
             f"error: {repo_root} is not a git repository. "
             "The --update command works only for git-cloned installs."
@@ -169,6 +196,8 @@ def cmd_update() -> None:
 
     try:
         dirty = _git(repo_root, "status", "--porcelain")
+    except subprocess.TimeoutExpired as exc:
+        sys.exit(f"error: update precheck failed: git status timed out: {exc}")
     except subprocess.CalledProcessError as exc:
         details = (exc.stderr or exc.stdout or "git status failed").strip()
         sys.exit(f"error: update precheck failed: {details}")
@@ -181,6 +210,8 @@ def cmd_update() -> None:
 
     try:
         branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
+    except subprocess.TimeoutExpired as exc:
+        sys.exit(f"error: update precheck failed: git rev-parse timed out: {exc}")
     except subprocess.CalledProcessError as exc:
         details = (exc.stderr or exc.stdout or "git rev-parse failed").strip()
         sys.exit(f"error: update precheck failed: {details}")
@@ -193,6 +224,10 @@ def cmd_update() -> None:
 
     print(f"  {c(DIM, 'Pulling latest changes from remote...')}")
 
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+
     try:
         result = subprocess.run(
             ["git", "pull", "--ff-only"],
@@ -200,7 +235,11 @@ def cmd_update() -> None:
             check=True,
             capture_output=True,
             text=True,
+            env=env,
+            timeout=_command_timeout_seconds(120),
         )
+    except subprocess.TimeoutExpired as exc:
+        sys.exit(f"error: update failed: git pull timed out: {exc}")
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         stdout = (exc.stdout or "").strip()

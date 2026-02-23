@@ -6,6 +6,8 @@ import os
 import sys
 from types import ModuleType
 
+sys.dont_write_bytecode = True
+
 
 def _load_package(pkg_name: str, pkg_path: str) -> ModuleType:
     init_path = os.path.join(pkg_path, "__init__.py")
@@ -51,6 +53,7 @@ def main() -> None:
         "__init__.py",
         "constants.py",
         "session_manager.py",
+        "bootstrap.py",
         "updater.py",
         "cli.py",
     ]

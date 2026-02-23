@@ -14,6 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/ma
 ### Self-Check (DO NOT SKIP)
 
 Analyze `install-help.md` for instructions to configure and set up hooks so you don't fill up your context window or stop prematurely.
+If bootstrap or hooks fail, follow the "AI self-setup playbook (non-scripted fallback)" and official references in `install-help.md` before retrying.
 
 ## Get started
 

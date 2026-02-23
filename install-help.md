@@ -4,6 +4,8 @@ This file is the post-install self-check for `omni-autonomous-agent`.
 
 If installation succeeded, the CLI exists and bootstrap already ran once. You still must verify hooks/wrappers before starting autonomous work.
 
+Goal of this guide: let an AI agent recover and complete setup independently, even when the default scripted flow partially fails.
+
 ---
 
 ## 1) Verify the CLI is reachable
@@ -34,6 +36,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.omni-autonomous-agen
 
 The installer output prints the exact install path and PATH export line.
 
+If the CLI is still not found after install, do a direct binary discovery before retrying scripts:
+
+```bash
+command -v omni-autonomous-agent || true
+ls -la ~/.local/bin/omni-autonomous-agent 2>/dev/null || true
+ls -la ~/.omni-autonomous-agent/bin/omni-autonomous-agent 2>/dev/null || true
+python3 -c 'import os; print(os.environ.get("PATH", ""))'
+```
+
+Use that output to fix PATH in the current shell first, then rerun bootstrap.
+
 ---
 
 ## 2) Re-run bootstrap explicitly (required self-check)
@@ -47,6 +60,16 @@ Important behavior:
 - Bootstrap is idempotent.
 - Bootstrap returns non-zero if a required integration step fails.
 - Invalid JSON config files are quarantined to `*.invalid.<token>` and rebuilt safely.
+
+If bootstrap fails, inspect and fix the first failing integration instead of repeatedly rerunning full install:
+
+```bash
+omni-autonomous-agent --bootstrap
+openclaw hooks check
+openclaw hooks info omni-recovery
+```
+
+Then verify each agent config path directly (examples are below).
 
 ---
 
@@ -76,6 +99,23 @@ Optional path overrides for non-default environments:
 - `OMNI_AGENT_GEMINI_SETTINGS`
 - `OMNI_AGENT_OPENCODE_PLUGIN`
 - `OMNI_AGENT_OPENCLAW_HOOK_DIR`
+
+Direct config inspection commands (useful when setup was done by another process):
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+targets = {
+    'claude': Path.home() / '.claude' / 'settings.json',
+    'gemini': Path.home() / '.gemini' / 'settings.json',
+    'openclaw_hook_md': Path.home() / '.openclaw' / 'hooks' / 'omni-recovery' / 'HOOK.md',
+    'openclaw_handler': Path.home() / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts',
+}
+for name, path in targets.items():
+    print(f"{name}: {'OK' if path.exists() else 'MISSING'} -> {path}")
+PY
+```
 
 ### Wrapper-based agents
 
@@ -251,6 +291,14 @@ Expected events:
 - `gateway:startup`
 - `message:received`
 
+Eligibility and registration check:
+
+```bash
+openclaw hooks check
+```
+
+If `session-memory` is unavailable, OAA still works with `omni-recovery` as long as check/info output is healthy.
+
 ---
 
 ## 8) Kill-switch behavior
@@ -276,3 +324,37 @@ omni-autonomous-agent --cancel
 - OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
 - Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
 - If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.
+
+---
+
+## 10) AI self-setup playbook (non-scripted fallback)
+
+Use this exact order when onboarding fails midway:
+
+1. Confirm runtime tools are callable (`python3`, `omni-autonomous-agent`, agent CLI binaries).
+2. Rebuild OAA integrations only: `omni-autonomous-agent --bootstrap`.
+3. Validate generated config files exist and contain expected hook commands.
+4. Run one dynamic session (`--add ... -D dynamic`), verify stop-block behavior (`--hook-stop` exit `2`), then mark report COMPLETE and verify clean stop (`--hook-stop` exit `0`).
+5. Verify OpenClaw hook discovery (`openclaw hooks list`, `openclaw hooks info omni-recovery`, `openclaw hooks check`).
+6. Verify wrapper preflight blocks without active session (exit `3`) and loop semantics under active session.
+
+This sequence is faster and safer than re-running full install repeatedly.
+
+---
+
+## 11) Official references and troubleshooting resources
+
+- OpenClaw hooks docs: `https://docs.openclaw.ai/automation/hooks`
+- OpenClaw hooks troubleshooting: `https://docs.openclaw.ai/automation/hooks#troubleshooting`
+- Gemini CLI authentication: `https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html`
+- Gemini CLI repo/docs root: `https://github.com/google-gemini/gemini-cli`
+- Claude Code hooks reference: `https://code.claude.com/docs/en/hooks`
+- OAA issue tracker: `https://github.com/omnious0o0/omni-autonomous-agent/issues`
+
+When reporting issues, include:
+
+- exact command run
+- exit code
+- stderr/stdout snippet
+- OS + shell
+- whether you used default paths or env overrides

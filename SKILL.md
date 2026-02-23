@@ -1,9 +1,9 @@
 ---
-name: omni-autonomous-agent
+name: omni-autonomous-agent (OAA)
 description: Makes an AI agent autonomous and able to work for a long time, or a fixed duration without interruptions. Use this skill when the user asks you to work autonomously (e.g., "Work overnight," "I'll be gone for a few hours, work on this," "keep working on this until it's done," etc.). Basically any task that could take longer than usual. (3+ minutes)
 ---
 
-# omni-autonomous-agent
+# omni-autonomous-agent (OAA)
 
 ## One-time install
 
@@ -36,6 +36,18 @@ Before starting, ask the user:
 
 NOTE: Skip questions that are already answered. Adapt phrasing to the user's situation and task. If questions go unanswered, default to fully autonomous, careful, chores-focused mode.
 
+If critical questions remain unanswered and you need a bounded wait window, use:
+
+```bash
+omni-autonomous-agent --await-user -Q "<question>" [--wait-minutes <minutes>]
+```
+
+Default wait window is 2 minutes. If the user later replies, register it with:
+
+```bash
+omni-autonomous-agent --user-responded --response-note "<what the user clarified>"
+```
+
 
 ## Activation (MANDATORY STEP)
 
@@ -47,6 +59,11 @@ omni-autonomous-agent --add -R "<user_request>" [-D <duration_in_minutes|dynamic
 
 This is non-negotiable. Do not proceed to any other step until this command has
 been executed and returns successfully. Do not simulate or skip this step.
+
+Duration behavior:
+- Omit `-D` for dynamic mode (default).
+- Use `-D <minutes>` for a fixed-duration session.
+- Use `-D dynamic` explicitly when you want dynamic mode shown in command history.
 
 After `--add` succeeds, status is printed automatically. Run this when you want a refreshed view:
 
@@ -64,6 +81,17 @@ When you notice stop conditions are near, start concluding your work and prepare
 - Fixed session: stop is allowed once deadline is reached.
 - Dynamic session: stop is allowed after report status is `COMPLETE` or `PARTIAL`.
 
+## Command quick reference
+
+- Start session: `omni-autonomous-agent --add -R "<request>" [-D <minutes|dynamic>]`
+- Refresh status: `omni-autonomous-agent --status`
+- Open user-response window: `omni-autonomous-agent --await-user -Q "<question>" [--wait-minutes <minutes>]`
+- Register user reply: `omni-autonomous-agent --user-responded --response-note "<note>"`
+- Write checkpoint before compaction: `omni-autonomous-agent --hook-precompact`
+- Evaluate stop gate: `omni-autonomous-agent --hook-stop`
+- Emergency stop (kill-switch): `omni-autonomous-agent --cancel`
+- Reconfigure hooks/wrappers: `omni-autonomous-agent --bootstrap`
+
 ## Execution Rules
 
 ### What you MUST do
@@ -71,8 +99,8 @@ When you notice stop conditions are near, start concluding your work and prepare
 - Make **real, measurable progress** every step. So, no filler, no stalling
 - Track your own time by checking the system clock periodically
 - Log each timestamp, and draft your report as you go.
-- Prioritize quality, you got all the time you need, no need to rush anything.
-- Use your sandbox to its fullest extent. Do not treat it as just a dump folder for you to draft in, treat it as your workspace, create your own tools, your own environment, be creative!
+- Prioritize quality. You have the full time budget; do not rush low-quality work.
+- Use your sandbox as your real workspace. Create scripts/tools, run experiments, and keep structured progress artifacts.
 
 ### What you MUST NOT do
 | Forbidden | Why |
@@ -104,7 +132,7 @@ Everything happens inside that folder. Use it to:
 
 Go all-in. This space exists so you can think out loud, try things, and
 iterate without restraint. A rich sandbox is a sign of good autonomous work, not
-clutter. Be creative and resourceful. Use every tool at your disposal, be creative and have freedom.
+clutter. Be creative and resourceful. Use every tool at your disposal.
 
 **IMPORTANT:** Do not manually move the sandbox. O.A.A archives it automatically when stop is allowed or when cancelled.
 
@@ -136,7 +164,7 @@ Be completely honest and transparent.
 
 ## Notes
 
-- When a user uses this skill, 99% of the time they're away. Do not try to communicate with them. Work with what you have; be creative and resourceful.
 - If there's no duration, use `-D dynamic` instead of `-D [duration]`
 - Kill-switch: To cancel a session mid-way (DON'T DO IT WITHOUT A REASON), run `omni-autonomous-agent --cancel`. Stop all work immediately and skip the end-of-session report. Only do this if user explicitly asks/approves.
 - Scope management is your responsibility. If the task is larger than the time budget, prioritize the highest-value work and note what you couldn't finish in your report.
+- Wrapper note: `omni-agent-wrap` and `omni-wrap-*` enforce `--require-active` and `--hook-stop` automatically. Do not replace this with simple EXIT traps.

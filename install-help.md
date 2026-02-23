@@ -65,7 +65,7 @@ Important behavior:
   - `experimental.session.compacting` -> `--hook-precompact`
 - OpenClaw: `~/.openclaw/hooks/omni-recovery/`
   - `HOOK.md` + `handler.ts` managed by bootstrap
-  - Bootstrap enables `omni-recovery` and `session-memory`
+  - Bootstrap enables `omni-recovery` and attempts `session-memory` (warning-only on failure)
   - `omni-recovery` listens to `gateway:startup` and `message:received`
   - On startup with an active OAA session, it queues a resume ping turn
   - On inbound messages, it auto-registers user responses when OAA is waiting
@@ -238,7 +238,7 @@ openclaw hooks list
 Expected:
 
 - `omni-recovery` ready
-- `session-memory` ready
+- `session-memory` ready (recommended, optional)
 
 Optional deep check:
 

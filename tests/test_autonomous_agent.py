@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 
+sys.dont_write_bytecode = True
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAIN_SCRIPT = PROJECT_ROOT / "main.py"
@@ -97,10 +99,32 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         binary.chmod(0o755)
 
+    def _write_openclaw_partial_binary(self) -> None:
+        binary = self.bin_dir / "openclaw"
+        binary.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "hooks" && "${2:-}" == "enable" && "${3:-}" == "omni-recovery" ]]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${1:-}" == "hooks" && "${2:-}" == "enable" && "${3:-}" == "session-memory" ]]; then\n'
+            "  exit 42\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+
     def test_fixed_session_lifecycle(self) -> None:
         status = _run_cli(["--status"], self.env)
         self.assertEqual(status.returncode, 0)
         self.assertIn("No active session", status.stdout)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        empty_payload = json.loads(status_json.stdout)
+        self.assertTrue(bool(empty_payload.get("ok")))
+        self.assertFalse(bool(empty_payload.get("active")))
 
         added = _run_cli(["--add", "-R", "fixed lifecycle", "-D", "1"], self.env)
         self.assertEqual(added.returncode, 0)
@@ -128,6 +152,14 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         report_text = (sandbox_dir / "REPORT.md").read_text(encoding="utf-8")
         self.assertIn("Checkpoint (precompact)", report_text)
+
+        active_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(active_json.returncode, 0)
+        active_payload = json.loads(active_json.stdout)
+        self.assertTrue(bool(active_payload.get("ok")))
+        self.assertTrue(bool(active_payload.get("active")))
+        self.assertFalse(bool(active_payload.get("dynamic")))
+        self.assertEqual(active_payload.get("request"), "fixed lifecycle")
 
         cancel = _run_cli(["--cancel"], self.env)
         self.assertEqual(cancel.returncode, 0)
@@ -410,6 +442,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
 
         openclaw_hook_text = openclaw_hook.read_text(encoding="utf-8")
         openclaw_handler_text = openclaw_handler.read_text(encoding="utf-8")
+        opencode_plugin_text = opencode_plugin.read_text(encoding="utf-8")
         self.assertIn(
             'events: ["gateway:startup", "message:received"]', openclaw_hook_text
         )
@@ -417,6 +450,13 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("--user-responded", openclaw_handler_text)
         self.assertIn("openclaw', ['agent', '--message'", openclaw_handler_text)
         self.assertIn("event.context?.from", openclaw_handler_text)
+        self.assertIn("['--status', '--json']", openclaw_handler_text)
+        self.assertIn("STARTUP_WAKE_COOLDOWN_MS", openclaw_handler_text)
+        self.assertIn('runHook(["--hook-stop"])', opencode_plugin_text)
+        self.assertIn('runHook(["--hook-precompact"])', opencode_plugin_text)
+        self.assertNotIn(
+            'console.error("[omni] hook-stop blocked idle:"', opencode_plugin_text
+        )
 
         wrapper_result = subprocess.run(
             [str(codex_wrapper), "--exit-code", "7"],
@@ -662,6 +702,13 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(bootstrap.returncode, 2)
         self.assertIn("OpenClaw hooks failed", bootstrap.stdout)
 
+    def test_bootstrap_warns_when_session_memory_enable_fails(self) -> None:
+        self._write_openclaw_partial_binary()
+
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+        self.assertIn("OpenClaw optional hook", bootstrap.stdout)
+
     def test_installer_fails_when_bootstrap_fails(self) -> None:
         self._write_openclaw_failing_binary()
 
@@ -717,6 +764,16 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         text = install_ps1.read_text(encoding="utf-8")
         self.assertIn("$destName.cmd", text)
         self.assertIn("--bootstrap", text)
+        self.assertIn('set "PS_EXE=pwsh"', text)
+        self.assertIn("OMNI_AGENT_INSTALL_DIR", text)
+        self.assertIn("clone $repoUrl $installDir", text)
+        self.assertIn("UTF8Encoding($false)", text)
+        self.assertIn("WriteAllText", text)
+
+    def test_json_flag_requires_status(self) -> None:
+        invalid = _run_cli(["--cancel", "--json"], self.env)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("--json is only supported with --status", invalid.stderr)
 
     def test_update_fails_cleanly_without_git(self) -> None:
         env = self.env.copy()
@@ -746,11 +803,47 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not a git repository", result.stderr)
 
+    def test_update_times_out_cleanly(self) -> None:
+        fake_git = self.bin_dir / "git"
+        fake_git.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "rev-parse" && "${2:-}" == "--is-inside-work-tree" ]]; then\n'
+            '  printf "true\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${1:-}" == "status" ]]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${1:-}" == "rev-parse" && "${2:-}" == "--abbrev-ref" ]]; then\n'
+            '  printf "main\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${1:-}" == "pull" ]]; then\n'
+            "  sleep 2\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+
+        env = self.env.copy()
+        env["OMNI_AGENT_COMMAND_TIMEOUT"] = "1"
+
+        result = _run_cli(["--update"], env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("git pull timed out", result.stderr)
+
     def test_cli_help_reflects_dynamic_duration_default(self) -> None:
         help_out = _run_cli(["--help"], self.env)
         self.assertEqual(help_out.returncode, 0)
         self.assertIn("defaults to dynamic", help_out.stdout)
         self.assertIn("with --add", help_out.stdout)
+
+    def test_main_preflight_includes_bootstrap_module(self) -> None:
+        main_text = (PROJECT_ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertIn('"bootstrap.py"', main_text)
 
 
 if __name__ == "__main__":

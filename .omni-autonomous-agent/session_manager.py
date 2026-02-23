@@ -480,7 +480,10 @@ def _read_report_status(state: dict[str, Any]) -> str:
     report = _report_path(state)
     if not report.exists():
         return "UNKNOWN"
-    text = report.read_text(encoding="utf-8")
+    try:
+        text = report.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "UNKNOWN"
     lines = text.splitlines()
     for index, line in enumerate(lines):
         if line.strip().startswith("###") and "status" in line.lower():
@@ -503,7 +506,11 @@ def _count_log_checkpoints(state: dict[str, Any]) -> int:
     if not log.exists():
         return 0
     count = 0
-    for line in log.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = log.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    for line in lines:
         if line.startswith("## "):
             count += 1
     return count
@@ -892,12 +899,62 @@ def cmd_require_active() -> None:
         print("active")
 
 
-def cmd_status() -> None:
+def _status_json_payload(
+    state: dict[str, Any] | None, state_error: str | None, now: datetime
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"timestamp": now.isoformat()}
+
+    if state_error:
+        payload.update({"ok": False, "active": False, "state_error": state_error})
+        return payload
+
+    if not state:
+        payload.update({"ok": True, "active": False, "message": "No active session."})
+        return payload
+
+    snapshot = _status_snapshot(state, now)
+    await_deadline = _await_user_deadline(state)
+    waiting_for_user = bool(await_deadline is not None and now < await_deadline)
+
+    payload.update(
+        {
+            "ok": True,
+            "active": bool(snapshot["active"]),
+            "dynamic": bool(snapshot["dynamic"]),
+            "request": str(state.get("request", "")),
+            "started_at": snapshot["started"].isoformat(),
+            "deadline": snapshot["deadline"].isoformat()
+            if snapshot["deadline"] is not None
+            else None,
+            "time_remaining_seconds": snapshot["remaining_seconds"],
+            "duration_input": str(state.get("duration_input", "")),
+            "report_status": _read_report_status(state),
+            "waiting_for_user": waiting_for_user,
+            "response_deadline": await_deadline.isoformat()
+            if waiting_for_user and await_deadline is not None
+            else None,
+            "await_question": str(state.get("await_user_question", "") or "")
+            if waiting_for_user
+            else None,
+            "sandbox_dir": str(state.get("sandbox_dir", "")),
+            "log_checkpoints": _count_log_checkpoints(state),
+            "required_log_checkpoints": _required_log_checkpoints(
+                snapshot["elapsed_seconds"]
+            ),
+        }
+    )
+    return payload
+
+
+def cmd_status(*, json_output: bool = False) -> None:
     with _state_lock():
         state, state_error = _load_with_error()
         now = _now()
 
         if state_error:
+            if json_output:
+                print(json.dumps(_status_json_payload(None, state_error, now)))
+                return
             _header("omni-autonomous-agent")
             _row("State error", c(RED, state_error))
             _row(
@@ -908,31 +965,36 @@ def cmd_status() -> None:
             return
 
         if not state:
+            if json_output:
+                print(json.dumps(_status_json_payload(None, None, now)))
+                return
             _header("omni-autonomous-agent")
             print("  No active session.")
             print(SEP)
             return
 
         snapshot = _status_snapshot(state, now)
-        active_label = "active" if snapshot["active"] else "deadline reached"
-        color = GREEN if snapshot["active"] else RED
-        _header(f"omni-autonomous-agent - {c(color, active_label)}")
-
-        _row("Request", state["request"])
-        _row("Current date/time", _fmt_dt(now))
-        _row("Started", _fmt_dt(snapshot["started"]))
-
-        if snapshot["dynamic"]:
-            _row("Deadline", c(YELLOW, "dynamic (no fixed deadline)"))
-            _row("Time remaining", "dynamic")
-        else:
-            _row("Deadline", _fmt_dt(snapshot["deadline"]))
-            _row("Time remaining", _fmt_remaining(snapshot["remaining_seconds"]))
-
         log_count = _count_log_checkpoints(state)
         log_target = _required_log_checkpoints(snapshot["elapsed_seconds"])
-        _row("Duration", state["duration_input"])
-        _row("Report status", _read_report_status(state))
+
+        if not json_output:
+            active_label = "active" if snapshot["active"] else "deadline reached"
+            color = GREEN if snapshot["active"] else RED
+            _header(f"omni-autonomous-agent - {c(color, active_label)}")
+
+            _row("Request", state["request"])
+            _row("Current date/time", _fmt_dt(now))
+            _row("Started", _fmt_dt(snapshot["started"]))
+
+            if snapshot["dynamic"]:
+                _row("Deadline", c(YELLOW, "dynamic (no fixed deadline)"))
+                _row("Time remaining", "dynamic")
+            else:
+                _row("Deadline", _fmt_dt(snapshot["deadline"]))
+                _row("Time remaining", _fmt_remaining(snapshot["remaining_seconds"]))
+
+            _row("Duration", state["duration_input"])
+            _row("Report status", _read_report_status(state))
 
         await_deadline = _await_user_deadline(state)
         if await_deadline is not None:
@@ -953,10 +1015,11 @@ def cmd_status() -> None:
             await_question = str(state.get("await_user_question", "") or "(none)")
             if now < await_deadline:
                 await_remaining = (await_deadline - now).total_seconds()
-                _row("User response", c(YELLOW, "waiting"))
-                _row("Await question", await_question)
-                _row("Response deadline", _fmt_dt(await_deadline))
-                _row("Wait remaining", _fmt_remaining(await_remaining))
+                if not json_output:
+                    _row("User response", c(YELLOW, "waiting"))
+                    _row("Await question", await_question)
+                    _row("Response deadline", _fmt_dt(await_deadline))
+                    _row("Wait remaining", _fmt_remaining(await_remaining))
             else:
                 _clear_await_user_fields(state)
                 _save(state)
@@ -968,9 +1031,14 @@ def cmd_status() -> None:
                         "Proceeding with autonomous defaults.",
                     ],
                 )
-                _row("User response", c(YELLOW, "window expired"))
-                _row("Await question", await_question)
-                _row("Autonomous mode", "proceeding with defaults")
+                if not json_output:
+                    _row("User response", c(YELLOW, "window expired"))
+                    _row("Await question", await_question)
+                    _row("Autonomous mode", "proceeding with defaults")
+
+        if json_output:
+            print(json.dumps(_status_json_payload(state, None, now)))
+            return
 
         _row("Log checkpoints", f"{log_count} (target >= {log_target})")
         _row("Sandbox", state["sandbox_dir"])

@@ -72,6 +72,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Duration in minutes or 'dynamic' (defaults to dynamic with --add)",
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Machine-readable output for --status",
+    )
+    parser.add_argument(
         "-Q",
         "--question",
         metavar="QUESTION",
@@ -97,6 +102,13 @@ def _run_install_script() -> None:
     script_dir = Path(__file__).resolve().parent
     install_sh = script_dir / "install.sh"
     install_ps1 = script_dir / "install.ps1"
+    raw_timeout = os.environ.get("OMNI_AGENT_INSTALL_TIMEOUT", "900").strip()
+    try:
+        install_timeout = int(raw_timeout)
+    except ValueError:
+        install_timeout = 900
+    if install_timeout <= 0:
+        install_timeout = 900
 
     if os.name == "nt":
         powershell = shutil.which("pwsh") or shutil.which("powershell")
@@ -111,12 +123,15 @@ def _run_install_script() -> None:
                     str(install_ps1),
                 ],
                 check=True,
+                timeout=install_timeout,
             )
             return
 
         bash_bin = shutil.which("bash")
         if bash_bin and install_sh.exists():
-            subprocess.run([bash_bin, str(install_sh)], check=True)
+            subprocess.run(
+                [bash_bin, str(install_sh)], check=True, timeout=install_timeout
+            )
             return
 
         sys.exit(
@@ -129,12 +144,15 @@ def _run_install_script() -> None:
     bash_bin = shutil.which("bash")
     if bash_bin is None:
         sys.exit("error: bash is required for --install on this platform")
-    subprocess.run([bash_bin, str(install_sh)], check=True)
+    subprocess.run([bash_bin, str(install_sh)], check=True, timeout=install_timeout)
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.json and not args.status:
+        parser.error("--json is only supported with --status")
 
     if not (
         args.update
@@ -161,7 +179,7 @@ def main() -> None:
         return
 
     if args.status:
-        cmd_status()
+        cmd_status(json_output=args.json)
         return
 
     if args.require_active:

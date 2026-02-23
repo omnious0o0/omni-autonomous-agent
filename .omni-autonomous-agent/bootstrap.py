@@ -252,30 +252,50 @@ def _configure_gemini() -> tuple[bool, Path]:
 
 def _opencode_plugin_content() -> str:
     return """import type { Plugin } from \"@opencode-ai/plugin\";
-import { execSync } from \"child_process\";
+import { execFileSync } from \"child_process\";
 
-function errorMessage(error: unknown): string {
+function toText(value: unknown): string {
+  if (typeof value === \"string\") {
+    return value.trim();
+  }
+  if (value instanceof Buffer) {
+    return value.toString(\"utf-8\").trim();
+  }
+  return \"\";
+}
+
+function commandOutput(error: unknown): string {
+  if (typeof error === \"object\" && error !== null) {
+    const details = error as { stdout?: Buffer | string; stderr?: Buffer | string };
+    const output = [toText(details.stdout), toText(details.stderr)].filter(Boolean).join(\"\\n\");
+    if (output) {
+      return output;
+    }
+  }
   if (error instanceof Error) {
     return error.message;
   }
   return String(error);
 }
 
+function runHook(args: string[]): void {
+  try {
+    execFileSync(\"omni-autonomous-agent\", args, {
+      stdio: [\"ignore\", \"pipe\", \"pipe\"],
+      encoding: \"utf-8\",
+    });
+  } catch (error: unknown) {
+    throw new Error(commandOutput(error));
+  }
+}
+
 export const OmniHook: Plugin = async () => {
   return {
     \"session.idle\": async () => {
-      try {
-        execSync(\"omni-autonomous-agent --hook-stop\", { stdio: \"pipe\" });
-      } catch (error: unknown) {
-        console.error(\"[omni] hook-stop blocked idle:\", errorMessage(error));
-      }
+      runHook([\"--hook-stop\"]);
     },
     \"experimental.session.compacting\": async () => {
-      try {
-        execSync(\"omni-autonomous-agent --hook-precompact\", { stdio: \"pipe\" });
-      } catch (error: unknown) {
-        console.error(\"[omni] precompact hook error:\", errorMessage(error));
-      }
+      runHook([\"--hook-precompact\"]);
     },
   };
 };
@@ -536,9 +556,17 @@ Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 def _openclaw_handler_ts() -> str:
     return """import { spawn, spawnSync } from 'child_process';
 
-const ACTIVE_MARKER = 'omni-autonomous-agent - active';
-const WAITING_ROW_MARKER = 'User response';
-const WAITING_STATE_MARKER = 'waiting';
+type StatusPayload = {
+  active?: boolean;
+  waiting_for_user?: boolean;
+  request?: string;
+  dynamic?: boolean;
+  deadline?: string | null;
+  report_status?: string;
+};
+
+const STARTUP_WAKE_COOLDOWN_MS = 15_000;
+let lastStartupWakeMs = 0;
 
 const runOaa = (args: string[]) => {
   const result = spawnSync('omni-autonomous-agent', args, {
@@ -551,22 +579,33 @@ const runOaa = (args: string[]) => {
   };
 };
 
-const isActiveStatus = (text: string) => text.includes(ACTIVE_MARKER);
-const isWaitingForUser = (text: string) =>
-  text.includes(WAITING_ROW_MARKER) && text.includes(WAITING_STATE_MARKER);
+const readStatusPayload = (): StatusPayload | null => {
+  const status = runOaa(['--status', '--json']);
+  if (!status.ok || !status.output) return null;
+  try {
+    return JSON.parse(status.output) as StatusPayload;
+  } catch {
+    return null;
+  }
+};
 
-const queueResumePing = (status: string) => {
+const queueResumePing = (status: StatusPayload) => {
+  const request = status.request ?? '(unknown)';
+  const deadline = status.dynamic ? 'dynamic' : (status.deadline ?? 'unknown');
+  const reportStatus = status.report_status ?? 'UNKNOWN';
   const prompt = [
     '[omni] Gateway restarted and an autonomous session is still active.',
     'Resume autonomous execution now.',
-    '',
-    status,
+    `Request: ${request}`,
+    `Deadline: ${deadline}`,
+    `Report status: ${reportStatus}`,
   ].join('\\n');
 
   const child = spawn('openclaw', ['agent', '--message', prompt], {
     detached: true,
     stdio: 'ignore',
   });
+  child.on('error', () => {});
   child.unref();
 };
 
@@ -575,8 +614,8 @@ const handler = async (event: any) => {
     const from = typeof event.context?.from === 'string' ? event.context.from.trim() : '';
     if (!from || from.toLowerCase() === 'system') return;
 
-    const status = runOaa(['--status']);
-    if (!status.ok || !isActiveStatus(status.output) || !isWaitingForUser(status.output)) return;
+    const status = readStatusPayload();
+    if (!status?.active || !status.waiting_for_user) return;
 
     const raw = typeof event.context?.content === 'string' ? event.context.content : '';
     const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
@@ -586,10 +625,12 @@ const handler = async (event: any) => {
 
   if (event.type !== 'gateway' || event.action !== 'startup') return;
   if (process.env.OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE === '1') return;
+  if (Date.now() - lastStartupWakeMs < STARTUP_WAKE_COOLDOWN_MS) return;
 
-  const status = runOaa(['--status']);
-  if (!status.ok || !isActiveStatus(status.output)) return;
-  queueResumePing(status.output);
+  const status = readStatusPayload();
+  if (!status?.active || status.waiting_for_user) return;
+  lastStartupWakeMs = Date.now();
+  queueResumePing(status);
 };
 
 export default handler;
@@ -621,20 +662,36 @@ def _configure_openclaw() -> tuple[bool, Path]:
         handler_ts.write_text(handler_content, encoding="utf-8")
         changed = True
 
-    commands = [
-        ["openclaw", "hooks", "enable", "omni-recovery"],
-        ["openclaw", "hooks", "enable", "session-memory"],
-    ]
-    failures: list[str] = []
-    for command in commands:
-        result = subprocess.run(command, check=False, capture_output=True, text=True)
-        if result.returncode != 0:
-            command_text = " ".join(command)
-            details = (result.stderr or result.stdout or "command failed").strip()
-            failures.append(f"{command_text}: {details}")
+    def _run_openclaw_enable(command: list[str]) -> tuple[bool, str]:
+        command_text = " ".join(command)
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"{command_text}: timed out after 30 seconds"
 
-    if failures:
-        raise RuntimeError("; ".join(failures))
+        if result.returncode == 0:
+            return True, ""
+
+        details = (result.stderr or result.stdout or "command failed").strip()
+        return False, f"{command_text}: {details}"
+
+    recovery_ok, recovery_error = _run_openclaw_enable(
+        ["openclaw", "hooks", "enable", "omni-recovery"]
+    )
+    if not recovery_ok:
+        raise RuntimeError(recovery_error)
+
+    session_memory_ok, session_memory_error = _run_openclaw_enable(
+        ["openclaw", "hooks", "enable", "session-memory"]
+    )
+    if not session_memory_ok:
+        _row("Warning", c(YELLOW, f"OpenClaw optional hook: {session_memory_error}"))
 
     return changed, hook_dir
 

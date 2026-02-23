@@ -115,15 +115,22 @@ def maybe_auto_update() -> None:
     if shutil.which("git") is None:
         return
 
+    now = datetime.now().astimezone()
+    interval = timedelta(minutes=_parse_interval_minutes())
+
     repo_root = _repo_root()
     try:
         if not _is_git_worktree(repo_root):
             return
-    except RuntimeError:
+    except RuntimeError as exc:
+        _save_auto_update_state(
+            {
+                "last_checked": now.isoformat(),
+                "last_result": "precheck_failed",
+                "last_output": str(exc),
+            }
+        )
         return
-
-    now = datetime.now().astimezone()
-    interval = timedelta(minutes=_parse_interval_minutes())
 
     state = _load_auto_update_state()
     last_checked_raw = state.get("last_checked")

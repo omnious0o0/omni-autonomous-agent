@@ -112,8 +112,18 @@ if not openclaw_hook_md.exists() or not openclaw_handler.exists():
 openclaw_handler_text = openclaw_handler.read_text(encoding='utf-8')
 if 'OMNI_AGENT_OPENCLAW_BIN' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_BIN override support')
+if 'OMNI_AGENT_OPENCLAW_AGENT_ID' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_AGENT_ID override support')
+if 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing sensitive-context toggle support')
 if '.npm-global' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
+if "'--agent', targetAgentId" not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing explicit --agent startup wake routing')
+if 'Request: [redacted]' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
+if 'startup wake queued for agent=' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake queue log line')
 if 'failed to launch startup wake ping' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing startup wake launch error logging')
 

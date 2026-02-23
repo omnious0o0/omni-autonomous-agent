@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import tempfile
+import hashlib
 from collections import UserDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -42,6 +43,34 @@ TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 class _SafeFormatMap(UserDict[str, str]):
     def __missing__(self, key: str) -> str:
         return ""
+
+
+def _truthy_env(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _include_sensitive_context() -> bool:
+    return _truthy_env("OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT")
+
+
+def _text_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _display_sensitive_text(value: str, *, label: str) -> str:
+    clean = value.strip()
+    if not clean:
+        return "(none)"
+    if _include_sensitive_context():
+        return clean
+    return f"[{label}:{_text_fingerprint(clean)}]"
+
+
+def _display_path(path: Path) -> str:
+    if _include_sensitive_context():
+        return str(path)
+    return path.name or "(path-hidden)"
 
 
 def _fallback_template(template_id: str) -> str:
@@ -97,11 +126,18 @@ def _quarantine_state_file(reason: str) -> Path | None:
     if not STATE_FILE.exists():
         return None
     suffix = _now().strftime("%Y%m%d-%H%M%S")
-    target = STATE_FILE.with_name(f"state.invalid.{suffix}.json")
+    reason_slug = re.sub(r"[^A-Za-z0-9]+", "-", reason).strip("-").lower()[:24]
+    if not reason_slug:
+        reason_slug = "invalid"
+    target = STATE_FILE.with_name(f"state.invalid.{suffix}.{reason_slug}.json")
     try:
         STATE_FILE.rename(target)
     except OSError:
-        return None
+        try:
+            shutil.copy2(STATE_FILE, target)
+            STATE_FILE.unlink()
+        except OSError:
+            return None
     return target
 
 
@@ -348,7 +384,7 @@ def _write_initial_report(state: dict[str, Any]) -> None:
             [
                 "## 🤖 Autonomous Session Report",
                 "",
-                f"**📋 Request:** {state['request']}",
+                f"**📋 Request:** {_display_sensitive_text(str(state['request']), label='request')}",
                 f"**⏱️ Duration:** {duration_text} (started {started})",
                 "**🕐 Completed at:** in progress",
                 "",
@@ -381,7 +417,7 @@ def _write_initial_log(state: dict[str, Any]) -> None:
             [
                 "# Autonomous Session Log",
                 "",
-                f"- Request: {state['request']}",
+                f"- Request: {_display_sensitive_text(str(state['request']), label='request')}",
                 f"- Started: {started}",
                 "",
             ]
@@ -409,15 +445,23 @@ def _hook_template_context(
     deadline_text = (
         "dynamic" if snapshot["deadline"] is None else _fmt_dt(snapshot["deadline"])
     )
+
+    sandbox_raw = str(state.get("sandbox_dir", "")).strip()
+    sandbox_path = Path(sandbox_raw) if sandbox_raw else Path("sandbox")
+    report_path = _report_path(state)
+    log_path = _log_path(state)
+
     return {
-        "request": str(state.get("request", "")),
+        "request": _display_sensitive_text(
+            str(state.get("request", "")), label="request"
+        ),
         "now": _fmt_dt(now),
         "deadline": deadline_text,
         "time_remaining": _fmt_remaining(snapshot["remaining_seconds"]),
         "elapsed": _fmt_elapsed(float(snapshot["elapsed_seconds"])),
-        "sandbox_dir": str(state.get("sandbox_dir", "")),
-        "report_path": str(_report_path(state)),
-        "log_path": str(_log_path(state)),
+        "sandbox_dir": _display_path(sandbox_path),
+        "report_path": _display_path(report_path),
+        "log_path": _display_path(log_path),
         "report_status": _read_report_status(state),
     }
 
@@ -621,10 +665,10 @@ def _append_report_checkpoint(
         [
             "",
             f"### 🔄 Checkpoint ({trigger}) - {_fmt_dt(now)}",
-            f"- Request: {state['request']}",
+            f"- Request: {_display_sensitive_text(str(state['request']), label='request')}",
             f"- Deadline: {deadline_text}",
             f"- Time remaining: {remaining_text}",
-            f"- Sandbox: {state['sandbox_dir']}",
+            f"- Sandbox: {_display_path(Path(str(state['sandbox_dir'])))}",
             "",
         ]
     )
@@ -808,7 +852,7 @@ def cmd_await_user(question: str, wait_minutes: str) -> None:
             details=[
                 f"Window: {minutes} minute(s)",
                 f"Deadline: {_fmt_dt(deadline)}",
-                f"Question: {question.strip() or '(none)'}",
+                f"Question: {_display_sensitive_text(question, label='question')}",
             ],
         )
 
@@ -821,7 +865,7 @@ def cmd_await_user(question: str, wait_minutes: str) -> None:
             waiting_for_user=True,
             wait_minutes=minutes,
             response_deadline=_fmt_dt(deadline),
-            question=question.strip(),
+            question=_display_sensitive_text(question, label="question"),
         )
 
 
@@ -846,7 +890,7 @@ def cmd_user_responded(response_note: str) -> None:
                 state,
                 "User response registered",
                 details=[
-                    f"Response note: {note or '(none)'}",
+                    f"Response note: {_display_sensitive_text(note, label='response')}",
                     "Await-user window cleared.",
                 ],
             )
@@ -857,14 +901,16 @@ def cmd_user_responded(response_note: str) -> None:
                 active=True,
                 waiting_for_user=False,
                 user_response_registered=True,
-                response_note=note,
+                response_note=_display_sensitive_text(note, label="response"),
             )
             return
 
         _append_log(
             state,
             "User response recorded without active wait window",
-            details=[f"Response note: {note or '(none)'}"],
+            details=[
+                f"Response note: {_display_sensitive_text(note, label='response')}"
+            ],
         )
         _emit_hook_payload(
             False,
@@ -873,7 +919,7 @@ def cmd_user_responded(response_note: str) -> None:
             active=True,
             waiting_for_user=False,
             user_response_registered=False,
-            response_note=note,
+            response_note=_display_sensitive_text(note, label="response"),
         )
 
 
@@ -1050,12 +1096,20 @@ def cmd_cancel() -> None:
         state, state_error = _load_with_error()
         if state_error:
             quarantined = _quarantine_state_file(state_error)
-            _header(f"{c(YELLOW, 'Session cancelled')}")
+            if quarantined is not None:
+                _header(f"{c(YELLOW, 'Session cancelled')}")
+                _row("Cancelled at", _fmt_dt(_now()))
+                _row("Reason", "State file was corrupted and quarantined")
+                _row("Quarantined state", str(quarantined))
+                print(SEP)
+                return
+
+            _header(f"{c(RED, 'Session cancellation failed')}")
             _row("Cancelled at", _fmt_dt(_now()))
-            _row("Reason", "State file was corrupted and quarantined")
-            _row("Quarantined state", str(quarantined) if quarantined else "(none)")
+            _row("Reason", "State file is corrupted and could not be quarantined")
+            _row("Recovery", f"Manually move or delete {STATE_FILE} and retry --cancel")
             print(SEP)
-            return
+            sys.exit(1)
 
         if not state:
             print("No active session to cancel.")
@@ -1208,7 +1262,11 @@ def cmd_hook_stop() -> None:
                         details=[
                             f"Response deadline: {_fmt_dt(await_deadline)}",
                             f"Remaining: {remaining_text}",
-                            f"Question: {state.get('await_user_question', '') or '(none)'}",
+                            "Question: "
+                            + _display_sensitive_text(
+                                str(state.get("await_user_question", "")),
+                                label="question",
+                            ),
                         ],
                     )
                     _emit_hook_payload(

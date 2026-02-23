@@ -126,20 +126,7 @@ def _ensure_list(mapping: dict[str, Any], key: str) -> list[Any]:
     return mapping[key]
 
 
-def _has_nested_command(entries: list[Any], command: str) -> bool:
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        hooks = entry.get("hooks")
-        if not isinstance(hooks, list):
-            continue
-        for hook in hooks:
-            if isinstance(hook, dict) and hook.get("command") == command:
-                return True
-    return False
-
-
-def _has_named_command(entries: list[Any], command: str) -> bool:
+def _has_hook_command(entries: list[Any], command: str) -> bool:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -166,7 +153,7 @@ def _configure_claude() -> tuple[bool, Path]:
     changed = False
     stop_entries = _ensure_list(hooks, "Stop")
     stop_command = "omni-autonomous-agent --hook-stop"
-    if not _has_nested_command(stop_entries, stop_command):
+    if not _has_hook_command(stop_entries, stop_command):
         stop_entries.append(
             {
                 "hooks": [
@@ -181,7 +168,7 @@ def _configure_claude() -> tuple[bool, Path]:
 
     precompact_entries = _ensure_list(hooks, "PreCompact")
     precompact_command = "omni-autonomous-agent --hook-precompact"
-    if not _has_nested_command(precompact_entries, precompact_command):
+    if not _has_hook_command(precompact_entries, precompact_command):
         precompact_entries.append(
             {
                 "hooks": [
@@ -213,7 +200,7 @@ def _configure_gemini() -> tuple[bool, Path]:
     changed = False
     after_agent = _ensure_list(hooks, "AfterAgent")
     stop_command = "omni-autonomous-agent --hook-stop"
-    if not _has_named_command(after_agent, stop_command):
+    if not _has_hook_command(after_agent, stop_command):
         after_agent.append(
             {
                 "hooks": [
@@ -230,7 +217,7 @@ def _configure_gemini() -> tuple[bool, Path]:
 
     precompress = _ensure_list(hooks, "PreCompress")
     precompact_command = "omni-autonomous-agent --hook-precompact"
-    if not _has_named_command(precompress, precompact_command):
+    if not _has_hook_command(precompress, precompact_command):
         precompress.append(
             {
                 "hooks": [
@@ -569,6 +556,7 @@ type StatusPayload = {
 
 const STARTUP_WAKE_COOLDOWN_MS = 15_000;
 let lastStartupWakeMs = 0;
+const includeSensitiveContext = process.env.OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT === '1';
 
 const buildRuntimeEnv = () => {
   const env = { ...process.env };
@@ -584,14 +572,22 @@ const buildRuntimeEnv = () => {
 
   addEntries(process.env.PATH);
 
-  const home = process.env.HOME?.trim();
+  const home = (process.env.HOME ?? process.env.USERPROFILE ?? '').trim();
   if (home) {
     pathEntries.push(join(home, '.local', 'bin'));
     pathEntries.push(join(home, '.npm-global', 'bin'));
     pathEntries.push(join(home, '.pnpm-global', 'bin'));
+    if (process.platform === 'win32') {
+      pathEntries.push(join(home, 'AppData', 'Roaming', 'npm'));
+      pathEntries.push(join(home, 'AppData', 'Local', 'omni-autonomous-agent', 'bin'));
+    }
   }
 
-  pathEntries.push('/usr/local/bin', '/usr/bin', '/bin');
+  if (process.platform === 'win32') {
+    pathEntries.push('C:/Program Files/nodejs', 'C:/Program Files (x86)/nodejs');
+  } else {
+    pathEntries.push('/usr/local/bin', '/usr/bin', '/bin');
+  }
 
   const deduped: string[] = [];
   const seen = new Set<string>();
@@ -611,14 +607,27 @@ const resolveOpenclawBinary = () => {
   const override = process.env.OMNI_AGENT_OPENCLAW_BIN?.trim();
   if (override) return override;
 
-  const home = process.env.HOME?.trim();
+  const home = (process.env.HOME ?? process.env.USERPROFILE ?? '').trim();
   const candidates: string[] = [];
   if (home) {
-    candidates.push(join(home, '.npm-global', 'bin', 'openclaw'));
-    candidates.push(join(home, '.local', 'bin', 'openclaw'));
-    candidates.push(join(home, '.pnpm-global', 'bin', 'openclaw'));
+    if (process.platform === 'win32') {
+      candidates.push(join(home, 'AppData', 'Roaming', 'npm', 'openclaw.cmd'));
+      candidates.push(join(home, 'AppData', 'Roaming', 'npm', 'openclaw.exe'));
+      candidates.push(join(home, 'AppData', 'Local', 'Programs', 'openclaw', 'openclaw.exe'));
+      candidates.push(join(home, '.local', 'bin', 'openclaw.cmd'));
+      candidates.push(join(home, '.local', 'bin', 'openclaw.exe'));
+    } else {
+      candidates.push(join(home, '.npm-global', 'bin', 'openclaw'));
+      candidates.push(join(home, '.local', 'bin', 'openclaw'));
+      candidates.push(join(home, '.pnpm-global', 'bin', 'openclaw'));
+    }
   }
-  candidates.push('/usr/local/bin/openclaw', '/usr/bin/openclaw');
+  if (process.platform === 'win32') {
+    candidates.push('C:/Program Files/nodejs/openclaw.cmd');
+    candidates.push('C:/Program Files/nodejs/openclaw.exe');
+  } else {
+    candidates.push('/usr/local/bin/openclaw', '/usr/bin/openclaw');
+  }
 
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
@@ -661,19 +670,37 @@ const readStatusPayload = (): StatusPayload | null => {
   }
 };
 
-const queueResumePing = (status: StatusPayload) => {
+const resolveTargetAgentId = (event: any): string => {
+  const override = process.env.OMNI_AGENT_OPENCLAW_AGENT_ID?.trim();
+  if (override) return override;
+
+  const sessionKey = typeof event?.sessionKey === 'string' ? event.sessionKey.trim() : '';
+  if (sessionKey.startsWith('agent:')) {
+    const parts = sessionKey.split(':');
+    const candidate = parts[1]?.trim();
+    if (candidate) return candidate;
+  }
+
+  return 'main';
+};
+
+const queueResumePing = (status: StatusPayload, event: any) => {
+  const targetAgentId = resolveTargetAgentId(event);
   const request = status.request ?? '(unknown)';
   const deadline = status.dynamic ? 'dynamic' : (status.deadline ?? 'unknown');
   const reportStatus = status.report_status ?? 'UNKNOWN';
+  const requestLine = includeSensitiveContext ? `Request: ${request}` : 'Request: [redacted]';
   const prompt = [
     '[omni] Gateway restarted and an autonomous session is still active.',
     'Resume autonomous execution now.',
-    `Request: ${request}`,
+    requestLine,
     `Deadline: ${deadline}`,
     `Report status: ${reportStatus}`,
   ].join('\\n');
 
-  const child = spawn(openclawBin, ['agent', '--message', prompt], {
+  console.log(`[omni-recovery] startup wake queued for agent=${targetAgentId}`);
+
+  const child = spawn(openclawBin, ['agent', '--agent', targetAgentId, '--message', prompt], {
     detached: true,
     stdio: 'ignore',
     env: runtimeEnv,
@@ -708,7 +735,7 @@ const handler = async (event: any) => {
   const status = readStatusPayload();
   if (!status?.active || status.waiting_for_user) return;
   lastStartupWakeMs = Date.now();
-  queueResumePing(status);
+  queueResumePing(status, event);
 };
 
 export default handler;

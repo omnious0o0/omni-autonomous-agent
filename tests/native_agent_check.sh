@@ -161,7 +161,12 @@ PY
 test -f "${HOME}/.openclaw/hooks/omni-recovery/HOOK.md"
 test -f "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 grep -q 'OMNI_AGENT_OPENCLAW_BIN' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q 'OMNI_AGENT_OPENCLAW_AGENT_ID' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 grep -q '.npm-global' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q "'--agent', targetAgentId" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q 'Request: \[redacted\]' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q 'startup wake queued for agent=' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 grep -q 'failed to launch startup wake ping' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 
 for wrapper in omni-wrap-codex omni-agent-wrap; do

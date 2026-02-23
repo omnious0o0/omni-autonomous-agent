@@ -26,7 +26,10 @@ row() {
   printf "  %b%-20s%b %s\n" "${DIM}" "${label}:" "${RESET}" "${value}"
 }
 
-SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd || true)"
+SCRIPT_SOURCE_DIR=""
+if ! SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"; then
+  SCRIPT_SOURCE_DIR=""
+fi
 if [[ -z "${SCRIPT_SOURCE_DIR}" || ! -f "${SCRIPT_SOURCE_DIR}/../main.py" ]]; then
   header "Bootstrapping repository"
   if ! command -v git >/dev/null 2>&1; then
@@ -58,13 +61,20 @@ SYSTEM_BIN="${SYSTEM_BIN_OVERRIDE_RAW:-/usr/local/bin}"
 TARGET_DIR=""
 SUDO_CMD=()
 
-mkdir -p "${LOCAL_BIN}" || true
+LOCAL_BIN_CREATE_ERROR=""
+if ! mkdir -p "${LOCAL_BIN}" >/dev/null 2>&1; then
+  LOCAL_BIN_CREATE_ERROR="could not create ${LOCAL_BIN}"
+fi
 if [[ -w "${LOCAL_BIN}" ]]; then
   TARGET_DIR="${LOCAL_BIN}"
 fi
 
 if [[ -z "${TARGET_DIR}" && -n "${SYSTEM_BIN_OVERRIDE_RAW}" && ! -d "${SYSTEM_BIN}" ]]; then
-  mkdir -p "${SYSTEM_BIN}" >/dev/null 2>&1 || true
+  if ! mkdir -p "${SYSTEM_BIN}" >/dev/null 2>&1; then
+    printf "%berror:%b OMNI_AGENT_SYSTEM_BIN path could not be created: %s\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
+    printf "       Ensure the path is creatable and writable, then retry.\n" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${TARGET_DIR}" ]]; then
@@ -90,6 +100,9 @@ if [[ -z "${TARGET_DIR}" ]]; then
   else
     printf "%berror:%b no writable install target found.\n" "${RED}" "${RESET}" >&2
     printf "       Set OMNI_AGENT_LOCAL_BIN or OMNI_AGENT_SYSTEM_BIN to a writable path.\n" >&2
+    if [[ -n "${LOCAL_BIN_CREATE_ERROR}" ]]; then
+      printf "       Local bin detail: %s\n" "${LOCAL_BIN_CREATE_ERROR}" >&2
+    fi
     exit 1
   fi
 fi
@@ -111,16 +124,59 @@ else
   ln -s "${MAIN_SCRIPT}" "${DEST}"
 fi
 
+BOOTSTRAP_TIMEOUT_RAW="${OMNI_AGENT_BOOTSTRAP_TIMEOUT:-120}"
+BOOTSTRAP_TIMEOUT="120"
+if [[ "${BOOTSTRAP_TIMEOUT_RAW}" =~ ^[1-9][0-9]*$ ]]; then
+  BOOTSTRAP_TIMEOUT="${BOOTSTRAP_TIMEOUT_RAW}"
+fi
+
+run_bootstrap_with_timeout() {
+  local cli_path="$1"
+  local timeout_seconds="$2"
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${timeout_seconds}" "${cli_path}" --bootstrap
+    return $?
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "${timeout_seconds}" "${cli_path}" <<'PY'
+import subprocess
+import sys
+
+timeout_seconds = int(sys.argv[1])
+cli_path = sys.argv[2]
+
+try:
+    completed = subprocess.run([cli_path, "--bootstrap"], check=False, timeout=timeout_seconds)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+except FileNotFoundError:
+    sys.exit(127)
+
+sys.exit(completed.returncode)
+PY
+    return $?
+  fi
+
+  "${cli_path}" --bootstrap
+}
+
 header "Installed"
 row "Source" "${MAIN_SCRIPT}"
 row "Link" "${DEST}"
 row "Self-check" "Read ${ROOT_DIR}/install-help.md"
 
-if "${DEST}" --bootstrap >/dev/null 2>&1; then
+if run_bootstrap_with_timeout "${DEST}" "${BOOTSTRAP_TIMEOUT}" >/dev/null 2>&1; then
   row "Bootstrap" "Completed automatic hook/setup bootstrap"
 else
+  bootstrap_code=$?
   row "Bootstrap" "Automatic bootstrap failed"
-  printf "%berror:%b bootstrap did not complete successfully.\n" "${RED}" "${RESET}" >&2
+  if [[ "${bootstrap_code}" -eq 124 ]]; then
+    printf "%berror:%b bootstrap timed out after %ss.\n" "${RED}" "${RESET}" "${BOOTSTRAP_TIMEOUT}" >&2
+  else
+    printf "%berror:%b bootstrap did not complete successfully.\n" "${RED}" "${RESET}" >&2
+  fi
   printf "       Run '%s --bootstrap' and fix reported warnings before autonomous use.\n" "${DEST}" >&2
   exit 1
 fi

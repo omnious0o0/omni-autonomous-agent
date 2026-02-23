@@ -118,10 +118,50 @@ Write-Output "  Source:      $mainScript"
 Write-Output "  Command:     $runnerCmd"
 Write-Output "  Self-check:  Read $rootDir\install-help.md"
 
-& $runnerCmd --bootstrap *> $null
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "bootstrap did not complete successfully. Run '$runnerCmd --bootstrap' and fix reported warnings before autonomous use."
-  exit 1
+$bootstrapTimeoutRaw = [string]$env:OMNI_AGENT_BOOTSTRAP_TIMEOUT
+$bootstrapTimeout = 120
+$parsedBootstrapTimeout = 0
+if ($bootstrapTimeoutRaw -and [int]::TryParse($bootstrapTimeoutRaw, [ref]$parsedBootstrapTimeout) -and $parsedBootstrapTimeout -gt 0) {
+  $bootstrapTimeout = $parsedBootstrapTimeout
+}
+
+$bootstrapStdout = [System.IO.Path]::GetTempFileName()
+$bootstrapStderr = [System.IO.Path]::GetTempFileName()
+
+try {
+  $bootstrapProcess = Start-Process `
+    -FilePath $env:ComSpec `
+    -ArgumentList "/d", "/c", "`"$runnerCmd`" --bootstrap" `
+    -NoNewWindow `
+    -PassThru `
+    -RedirectStandardOutput $bootstrapStdout `
+    -RedirectStandardError $bootstrapStderr
+
+  Wait-Process -Id $bootstrapProcess.Id -Timeout $bootstrapTimeout -ErrorAction SilentlyContinue
+  $bootstrapProcess.Refresh()
+
+  if (-not $bootstrapProcess.HasExited) {
+    Stop-Process -Id $bootstrapProcess.Id -Force -ErrorAction SilentlyContinue
+    Write-Error "bootstrap timed out after ${bootstrapTimeout}s. Run '$runnerCmd --bootstrap' and fix reported warnings before autonomous use."
+    exit 1
+  }
+
+  if ($bootstrapProcess.ExitCode -ne 0) {
+    $stderr = (Get-Content $bootstrapStderr -Raw -ErrorAction SilentlyContinue)
+    $stdout = (Get-Content $bootstrapStdout -Raw -ErrorAction SilentlyContinue)
+    $details = ($stderr + "`n" + $stdout).Trim()
+    if ($details) {
+      Write-Error "bootstrap did not complete successfully: $details"
+    }
+    else {
+      Write-Error "bootstrap did not complete successfully. Run '$runnerCmd --bootstrap' and fix reported warnings before autonomous use."
+    }
+    exit 1
+  }
+}
+finally {
+  Remove-Item $bootstrapStdout -ErrorAction SilentlyContinue
+  Remove-Item $bootstrapStderr -ErrorAction SilentlyContinue
 }
 
 Write-Output "  Bootstrap:   Completed automatic hook/setup bootstrap"

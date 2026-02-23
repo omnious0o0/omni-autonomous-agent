@@ -141,6 +141,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(bool(stop_payload.get("block")))
         self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
         self.assertIn("Do not stop", str(stop_payload.get("template", "")))
+        self.assertNotIn("fixed lifecycle", str(stop_payload.get("template", "")))
 
         precompact = _run_cli(["--hook-precompact"], self.env)
         self.assertEqual(precompact.returncode, 0)
@@ -247,6 +248,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         waiting_payload = _json_output(waiting)
         self.assertEqual(waiting_payload.get("wait_minutes"), 2)
         self.assertTrue(bool(waiting_payload.get("waiting_for_user")))
+        self.assertTrue(
+            str(waiting_payload.get("question", "")).startswith("[question:")
+        )
 
         state = self._read_state()
         started = state.get("await_user_started_at")
@@ -276,6 +280,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         responded_payload = _json_output(responded)
         self.assertTrue(bool(responded_payload.get("user_response_registered")))
         self.assertFalse(bool(responded_payload.get("waiting_for_user")))
+        self.assertTrue(
+            str(responded_payload.get("response_note", "")).startswith("[response:")
+        )
 
         state_after = self._read_state()
         self.assertNotIn("await_user_started_at", state_after)
@@ -448,9 +455,16 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         self.assertIn("OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_BIN", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_AGENT_ID", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT", openclaw_handler_text)
         self.assertIn("--user-responded", openclaw_handler_text)
         self.assertIn(".npm-global", openclaw_handler_text)
-        self.assertIn("['agent', '--message', prompt]", openclaw_handler_text)
+        self.assertIn(
+            "['agent', '--agent', targetAgentId, '--message', prompt]",
+            openclaw_handler_text,
+        )
+        self.assertIn("Request: [redacted]", openclaw_handler_text)
+        self.assertIn("startup wake queued for agent=", openclaw_handler_text)
         self.assertIn("failed to launch startup wake ping", openclaw_handler_text)
         self.assertIn("event.context?.from", openclaw_handler_text)
         self.assertIn("['--status', '--json']", openclaw_handler_text)
@@ -772,6 +786,16 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("clone $repoUrl $installDir", text)
         self.assertIn("UTF8Encoding($false)", text)
         self.assertIn("WriteAllText", text)
+        self.assertIn("OMNI_AGENT_BOOTSTRAP_TIMEOUT", text)
+        self.assertIn("Wait-Process", text)
+
+    def test_installer_script_contains_bootstrap_timeout_guard(self) -> None:
+        install_sh = PROJECT_ROOT / ".omni-autonomous-agent" / "install.sh"
+        self.assertTrue(install_sh.exists())
+
+        text = install_sh.read_text(encoding="utf-8")
+        self.assertIn("OMNI_AGENT_BOOTSTRAP_TIMEOUT", text)
+        self.assertIn("run_bootstrap_with_timeout", text)
 
     def test_json_flag_requires_status(self) -> None:
         invalid = _run_cli(["--cancel", "--json"], self.env)

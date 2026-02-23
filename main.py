@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import traceback
 from types import ModuleType
 
 sys.dont_write_bytecode = True
@@ -75,8 +76,24 @@ def main() -> None:
         _load_module(pkg_name, "updater", pkg_dir)
         cli = _load_module(pkg_name, "cli", pkg_dir)
         cli.main()
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr)
+        sys.exit(130)
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        debug_enabled = os.environ.get("OMNI_AGENT_DEBUG", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if debug_enabled:
+            traceback.print_exc()
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+            print(
+                "hint: set OMNI_AGENT_DEBUG=1 for a full traceback.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
 

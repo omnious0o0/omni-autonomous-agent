@@ -84,6 +84,17 @@ def _fallback_template(template_id: str) -> str:
             "Sandbox: {sandbox_dir}\n"
         )
 
+    if template_id == "stop-blocked-fixed":
+        return (
+            "[OAA STOP BLOCK - FIXED SESSION]\n"
+            "Do not stop. Continue autonomous execution until the fixed deadline is reached.\n"
+            "Request: {request}\n"
+            "Deadline: {deadline}\n"
+            "Time remaining: {time_remaining}\n"
+            "Report status: {report_status}\n"
+            "Sandbox: {sandbox_dir}\n"
+        )
+
     if template_id == "precompact-handoff":
         return (
             "[OAA PRECOMPACT]\n"
@@ -951,16 +962,43 @@ def _status_json_payload(
     payload: dict[str, Any] = {"timestamp": now.isoformat()}
 
     if state_error:
-        payload.update({"ok": False, "active": False, "state_error": state_error})
+        payload.update(
+            {
+                "ok": False,
+                "active": False,
+                "state_error": state_error,
+                "session_registered": False,
+                "lifecycle_state": "state_error",
+                "closure_pending": False,
+            }
+        )
         return payload
 
     if not state:
-        payload.update({"ok": True, "active": False, "message": "No active session."})
+        payload.update(
+            {
+                "ok": True,
+                "active": False,
+                "message": "No active session.",
+                "session_registered": False,
+                "lifecycle_state": "none",
+                "closure_pending": False,
+            }
+        )
         return payload
 
     snapshot = _status_snapshot(state, now)
     await_deadline = _await_user_deadline(state)
     waiting_for_user = bool(await_deadline is not None and now < await_deadline)
+    report_status = _read_report_status(state)
+    closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
+    report_status_effective = report_status
+    if closure_pending and report_status_effective not in {"COMPLETE", "PARTIAL"}:
+        report_status_effective = "PARTIAL"
+
+    lifecycle_state = "active"
+    if closure_pending:
+        lifecycle_state = "deadline_reached_waiting_closure"
 
     payload.update(
         {
@@ -974,7 +1012,11 @@ def _status_json_payload(
             else None,
             "time_remaining_seconds": snapshot["remaining_seconds"],
             "duration_input": str(state.get("duration_input", "")),
-            "report_status": _read_report_status(state),
+            "report_status": report_status,
+            "report_status_effective": report_status_effective,
+            "session_registered": True,
+            "lifecycle_state": lifecycle_state,
+            "closure_pending": closure_pending,
             "waiting_for_user": waiting_for_user,
             "response_deadline": await_deadline.isoformat()
             if waiting_for_user and await_deadline is not None
@@ -1039,8 +1081,16 @@ def cmd_status(*, json_output: bool = False) -> None:
                 _row("Deadline", _fmt_dt(snapshot["deadline"]))
                 _row("Time remaining", _fmt_remaining(snapshot["remaining_seconds"]))
 
+            report_status = _read_report_status(state)
+            closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
+            report_display = report_status
+            if closure_pending and report_status not in {"COMPLETE", "PARTIAL"}:
+                report_display = f"{report_status} (closure pending)"
+
             _row("Duration", state["duration_input"])
-            _row("Report status", _read_report_status(state))
+            _row("Report status", report_display)
+            if closure_pending:
+                _row("Closure", c(YELLOW, "pending stop/cancel after fixed deadline"))
 
         await_deadline = _await_user_deadline(state)
         if await_deadline is not None:
@@ -1323,12 +1373,21 @@ def cmd_hook_stop() -> None:
             if should_block:
                 remaining_text = _fmt_remaining(snapshot["remaining_seconds"])
                 template_context = _hook_template_context(state, snapshot, now)
-                template_text = render_template("stop-blocked", template_context)
-                message = (
-                    "Autonomous session is still active. Keep working. "
-                    f"Time remaining: {remaining_text}. "
-                    "For dynamic sessions, set report status to COMPLETE or PARTIAL before stopping."
-                )
+                if snapshot["dynamic"]:
+                    template_id = "stop-blocked"
+                    template_text = render_template(template_id, template_context)
+                    message = (
+                        "Autonomous session is still active. Keep working. "
+                        f"Time remaining: {remaining_text}. "
+                        "For dynamic sessions, set report status to COMPLETE or PARTIAL before stopping."
+                    )
+                else:
+                    template_id = "stop-blocked-fixed"
+                    template_text = render_template(template_id, template_context)
+                    message = (
+                        "Autonomous fixed session is still active. Keep working until the fixed deadline is reached. "
+                        f"Time remaining: {remaining_text}."
+                    )
                 _append_log(
                     state,
                     "Stop attempt blocked",
@@ -1344,7 +1403,7 @@ def cmd_hook_stop() -> None:
                     active=True,
                     block=True,
                     retry_immediately=True,
-                    template_id="stop-blocked",
+                    template_id=template_id,
                     template=template_text,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))

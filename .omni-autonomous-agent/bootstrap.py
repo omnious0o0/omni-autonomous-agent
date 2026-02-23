@@ -541,8 +541,8 @@ Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 
 
 def _openclaw_handler_ts() -> str:
-    return """import { existsSync } from 'fs';
-import { delimiter, join } from 'path';
+    return """import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { delimiter, dirname, join } from 'path';
 import { spawn, spawnSync } from 'child_process';
 
 type StatusPayload = {
@@ -552,11 +552,32 @@ type StatusPayload = {
   dynamic?: boolean;
   deadline?: string | null;
   report_status?: string;
+  started_at?: string;
+};
+
+type SessionRoute = {
+  sessionKey: string;
+  sessionId: string;
+  channel?: string;
+  to?: string;
+  accountId?: string;
 };
 
 const STARTUP_WAKE_COOLDOWN_MS = 15_000;
 let lastStartupWakeMs = 0;
 const includeSensitiveContext = process.env.OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT === '1';
+const deliverStartupWake = process.env.OMNI_AGENT_OPENCLAW_WAKE_DELIVER !== '0';
+
+const parsePositiveInt = (raw: string | undefined, fallback: number): number => {
+  const value = Number.parseInt((raw ?? '').trim(), 10);
+  if (Number.isFinite(value) && value > 0) return value;
+  return fallback;
+};
+
+const STARTUP_WAKE_PERSISTED_DEDUPE_MS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS,
+  60_000,
+);
 
 const buildRuntimeEnv = () => {
   const env = { ...process.env };
@@ -603,11 +624,91 @@ const buildRuntimeEnv = () => {
 
 const runtimeEnv = buildRuntimeEnv();
 
+const resolveHome = (): string => (process.env.HOME ?? process.env.USERPROFILE ?? '').trim();
+
+const resolveWakeDedupeFile = (): string | null => {
+  const configOverride = process.env.OMNI_AGENT_CONFIG_DIR?.trim();
+  if (configOverride) return join(configOverride, 'openclaw-startup-wake.json');
+  const home = resolveHome();
+  if (!home) return null;
+  return join(home, '.config', 'omni-autonomous-agent', 'openclaw-startup-wake.json');
+};
+
+const readJsonObject = (path: string): Record<string, unknown> | null => {
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+};
+
+const acquireDedupeLock = (lockDir: string): boolean => {
+  try {
+    mkdirSync(lockDir);
+    return true;
+  } catch {
+    try {
+      const lockStat = statSync(lockDir);
+      if (Date.now() - lockStat.mtimeMs > 30_000) {
+        rmSync(lockDir, { recursive: true, force: true });
+        mkdirSync(lockDir);
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+};
+
+const rememberStartupWake = (dedupeKey: string): boolean => {
+  const dedupeFile = resolveWakeDedupeFile();
+  if (!dedupeFile) return true;
+
+  const lockDir = `${dedupeFile}.lock`;
+  if (!acquireDedupeLock(lockDir)) {
+    return false;
+  }
+
+  try {
+    const now = Date.now();
+    const existing = readJsonObject(dedupeFile);
+    const entriesRaw = existing?.entries;
+    const entries: Record<string, number> = {};
+
+    if (entriesRaw && typeof entriesRaw === 'object' && !Array.isArray(entriesRaw)) {
+      for (const [key, value] of Object.entries(entriesRaw as Record<string, unknown>)) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+        if (now - value > STARTUP_WAKE_PERSISTED_DEDUPE_MS) continue;
+        entries[key] = value;
+      }
+    }
+
+    const seenAt = entries[dedupeKey];
+    if (typeof seenAt === 'number' && now - seenAt < STARTUP_WAKE_PERSISTED_DEDUPE_MS) {
+      return false;
+    }
+
+    entries[dedupeKey] = now;
+    mkdirSync(dirname(dedupeFile), { recursive: true });
+    writeFileSync(dedupeFile, JSON.stringify({ entries }, null, 2), 'utf-8');
+  } catch {
+    return true;
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+
+  return true;
+};
+
 const resolveOpenclawBinary = () => {
   const override = process.env.OMNI_AGENT_OPENCLAW_BIN?.trim();
   if (override) return override;
 
-  const home = (process.env.HOME ?? process.env.USERPROFILE ?? '').trim();
+  const home = resolveHome();
   const candidates: string[] = [];
   if (home) {
     if (process.platform === 'win32') {
@@ -638,8 +739,40 @@ const resolveOpenclawBinary = () => {
 
 const openclawBin = resolveOpenclawBinary();
 
+const resolveOaaBinary = () => {
+  const override = process.env.OMNI_AGENT_OAA_BIN?.trim();
+  if (override) return override;
+
+  const home = resolveHome();
+  const candidates: string[] = [];
+  if (home) {
+    if (process.platform === 'win32') {
+      candidates.push(join(home, 'AppData', 'Local', 'omni-autonomous-agent', 'bin', 'omni-autonomous-agent.cmd'));
+      candidates.push(join(home, '.local', 'bin', 'omni-autonomous-agent.cmd'));
+      candidates.push(join(home, '.local', 'bin', 'omni-autonomous-agent.exe'));
+    } else {
+      candidates.push(join(home, '.local', 'bin', 'omni-autonomous-agent'));
+      candidates.push(join(home, '.npm-global', 'bin', 'omni-autonomous-agent'));
+    }
+  }
+
+  if (process.platform === 'win32') {
+    candidates.push('C:/Program Files/omni-autonomous-agent/omni-autonomous-agent.cmd');
+  } else {
+    candidates.push('/usr/local/bin/omni-autonomous-agent', '/usr/bin/omni-autonomous-agent');
+  }
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return 'omni-autonomous-agent';
+};
+
+const oaaBin = resolveOaaBinary();
+
 const runOaa = (args: string[]) => {
-  const result = spawnSync('omni-autonomous-agent', args, {
+  const result = spawnSync(oaaBin, args, {
     stdio: 'pipe',
     encoding: 'utf-8',
     env: runtimeEnv,
@@ -670,11 +803,19 @@ const readStatusPayload = (): StatusPayload | null => {
   }
 };
 
-const resolveTargetAgentId = (event: any): string => {
+const requireActiveSession = (): boolean => {
+  const active = runOaa(['--require-active']);
+  return active.ok;
+};
+
+const readEventSessionKey = (event: any): string =>
+  typeof event?.sessionKey === 'string' ? event.sessionKey.trim() : '';
+
+const resolveTargetAgentId = (event: any): string | null => {
   const override = process.env.OMNI_AGENT_OPENCLAW_AGENT_ID?.trim();
   if (override) return override;
 
-  const sessionKey = typeof event?.sessionKey === 'string' ? event.sessionKey.trim() : '';
+  const sessionKey = readEventSessionKey(event);
   if (sessionKey.startsWith('agent:')) {
     const parts = sessionKey.split(':');
     const candidate = parts[1]?.trim();
@@ -684,11 +825,93 @@ const resolveTargetAgentId = (event: any): string => {
   return 'main';
 };
 
+const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | null => {
+  const explicitSessionKey = process.env.OMNI_AGENT_OPENCLAW_SESSION_KEY?.trim();
+  const eventSessionKey = readEventSessionKey(event);
+  const eventAgentSessionKey = eventSessionKey.startsWith('agent:') ? eventSessionKey : '';
+  const fallbackSessionKey = `agent:${targetAgentId}:main`;
+  const routeSessionKey = eventAgentSessionKey || explicitSessionKey || fallbackSessionKey;
+
+  const overrideSessionId = process.env.OMNI_AGENT_OPENCLAW_SESSION_ID?.trim();
+  if (overrideSessionId) return { sessionKey: routeSessionKey, sessionId: overrideSessionId };
+
+  const home = resolveHome();
+  if (!home) return null;
+
+  const sessionsPath = join(home, '.openclaw', 'agents', targetAgentId, 'sessions', 'sessions.json');
+  const sessions = readJsonObject(sessionsPath);
+  if (!sessions) return null;
+
+  const entry = sessions[routeSessionKey];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+
+  const record = entry as Record<string, unknown>;
+  const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+  if (!sessionId) return null;
+
+  const deliveryContext =
+    record.deliveryContext && typeof record.deliveryContext === 'object' && !Array.isArray(record.deliveryContext)
+      ? (record.deliveryContext as Record<string, unknown>)
+      : null;
+
+  const channel =
+    deliveryContext && typeof deliveryContext.channel === 'string'
+      ? deliveryContext.channel.trim()
+      : '';
+  const to =
+    deliveryContext && typeof deliveryContext.to === 'string' ? deliveryContext.to.trim() : '';
+  const accountId =
+    deliveryContext && typeof deliveryContext.accountId === 'string'
+      ? deliveryContext.accountId.trim()
+      : '';
+
+  return {
+    sessionKey: routeSessionKey,
+    sessionId,
+    channel: channel || undefined,
+    to: to || undefined,
+    accountId: accountId || undefined,
+  };
+};
+
+const startupWakeDedupeKey = (event: any, status: StatusPayload, route: SessionRoute): string => {
+  const startedAt = typeof status.started_at === 'string' ? status.started_at.trim() : '';
+  return ['startup', route.sessionKey, route.sessionId, startedAt].join('|');
+};
+
 const queueResumePing = (status: StatusPayload, event: any) => {
   const targetAgentId = resolveTargetAgentId(event);
-  const request = status.request ?? '(unknown)';
-  const deadline = status.dynamic ? 'dynamic' : (status.deadline ?? 'unknown');
-  const reportStatus = status.report_status ?? 'UNKNOWN';
+  if (!targetAgentId) {
+    console.warn('[omni-recovery] startup wake skipped: unresolved target agent id');
+    return;
+  }
+
+  const route = resolveSessionRoute(event, targetAgentId);
+  if (!route) {
+    console.warn('[omni-recovery] startup wake skipped: unresolved session route');
+    return;
+  }
+
+  const latestStatus = readStatusPayload();
+  if (!latestStatus?.active || latestStatus.waiting_for_user) {
+    console.log('[omni-recovery] startup wake skipped: session no longer active');
+    return;
+  }
+
+  if (!requireActiveSession()) {
+    console.log('[omni-recovery] startup wake skipped: --require-active failed');
+    return;
+  }
+
+  const dedupeKey = startupWakeDedupeKey(event, latestStatus, route);
+  if (!rememberStartupWake(dedupeKey)) {
+    console.log('[omni-recovery] startup wake skipped: duplicate restart event');
+    return;
+  }
+
+  const request = latestStatus.request ?? '(unknown)';
+  const deadline = latestStatus.dynamic ? 'dynamic' : (latestStatus.deadline ?? 'unknown');
+  const reportStatus = latestStatus.report_status ?? 'UNKNOWN';
   const requestLine = includeSensitiveContext ? `Request: ${request}` : 'Request: [redacted]';
   const prompt = [
     '[omni] Gateway restarted and an autonomous session is still active.',
@@ -698,9 +921,17 @@ const queueResumePing = (status: StatusPayload, event: any) => {
     `Report status: ${reportStatus}`,
   ].join('\\n');
 
-  console.log(`[omni-recovery] startup wake queued for agent=${targetAgentId}`);
+  const args = ['agent', '--agent', targetAgentId, '--session-id', route.sessionId, '--message', prompt];
+  if (deliverStartupWake) {
+    args.push('--deliver');
+    if (route.channel) args.push('--reply-channel', route.channel);
+    if (route.to) args.push('--reply-to', route.to);
+    if (route.accountId) args.push('--reply-account', route.accountId);
+  }
 
-  const child = spawn(openclawBin, ['agent', '--agent', targetAgentId, '--message', prompt], {
+  console.log(`[omni-recovery] startup wake queued for agent=${targetAgentId} key=${route.sessionKey} session=${route.sessionId}`);
+
+  const child = spawn(openclawBin, args, {
     detached: true,
     stdio: 'ignore',
     env: runtimeEnv,
@@ -733,7 +964,11 @@ const handler = async (event: any) => {
   if (Date.now() - lastStartupWakeMs < STARTUP_WAKE_COOLDOWN_MS) return;
 
   const status = readStatusPayload();
-  if (!status?.active || status.waiting_for_user) return;
+  if (!status) {
+    console.warn('[omni-recovery] startup wake skipped: unable to read OAA status');
+    return;
+  }
+  if (!status.active || status.waiting_for_user) return;
   lastStartupWakeMs = Date.now();
   queueResumePing(status, event);
 };

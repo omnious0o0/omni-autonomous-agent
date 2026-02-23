@@ -14,6 +14,17 @@ export OMNI_AGENT_SANDBOX_ROOT="${WORK_DIR}/host-sandbox"
 export OMNI_AGENT_REPO_ROOT="${ROOT_DIR}"
 export OMNI_AGENT_DISABLE_AUTO_UPDATE=1
 
+HAS_CLAUDE=0
+if command -v claude >/dev/null 2>&1; then
+  HAS_CLAUDE=1
+fi
+
+HAS_OPENCODE=0
+if command -v opencode >/dev/null 2>&1; then
+  HAS_OPENCODE=1
+fi
+export HAS_CLAUDE HAS_OPENCODE
+
 rm -rf "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
 mkdir -p "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
 
@@ -34,10 +45,22 @@ fi
 
 python3 - <<'PY'
 import json
+import os
 import subprocess
 from pathlib import Path
 
 home = Path.home()
+has_claude = os.environ.get('HAS_CLAUDE') == '1'
+has_opencode = os.environ.get('HAS_OPENCODE') == '1'
+
+claude_hooks = {}
+if has_claude:
+    claude_path = home / '.claude' / 'settings.json'
+    if not claude_path.exists():
+        raise SystemExit('host-agent-check failed: missing ~/.claude/settings.json')
+
+    claude_data = json.loads(claude_path.read_text(encoding='utf-8'))
+    claude_hooks = claude_data.get('hooks', {}) if isinstance(claude_data, dict) else {}
 
 gemini_path = home / '.gemini' / 'settings.json'
 if not gemini_path.exists():
@@ -57,11 +80,28 @@ def has(entries, command):
                 return True
     return False
 
+if has_claude and not has(claude_hooks.get('Stop', []), 'omni-autonomous-agent --hook-stop'):
+    raise SystemExit('host-agent-check failed: claude stop hook missing')
+
+if has_claude and not has(claude_hooks.get('PreCompact', []), 'omni-autonomous-agent --hook-precompact'):
+    raise SystemExit('host-agent-check failed: claude precompact hook missing')
+
 if not has(hooks.get('AfterAgent', []), 'omni-autonomous-agent --hook-stop'):
     raise SystemExit('host-agent-check failed: gemini stop hook missing')
 
 if not has(hooks.get('PreCompress', []), 'omni-autonomous-agent --hook-precompact'):
     raise SystemExit('host-agent-check failed: gemini precompact hook missing')
+
+if has_opencode:
+    opencode_plugin = home / '.config' / 'opencode' / 'plugins' / 'omni-hook.ts'
+    if not opencode_plugin.exists():
+        raise SystemExit('host-agent-check failed: missing OpenCode plugin omni-hook.ts')
+
+    plugin_text = opencode_plugin.read_text(encoding='utf-8')
+    if 'runHook(["--hook-stop"]);' not in plugin_text:
+        raise SystemExit('host-agent-check failed: OpenCode stop hook missing in plugin')
+    if 'runHook(["--hook-precompact"]);' not in plugin_text:
+        raise SystemExit('host-agent-check failed: OpenCode precompact hook missing in plugin')
 
 openclaw_hook_md = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'HOOK.md'
 openclaw_handler = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts'
@@ -97,7 +137,9 @@ if command -v openclaw >/dev/null 2>&1; then
     exit 1
   fi
   printf "%s\n" "${hooks_output}" | grep -q "omni-recovery"
-  printf "%s\n" "${hooks_output}" | grep -q "session-memory"
+  if ! printf "%s\n" "${hooks_output}" | grep -q "session-memory"; then
+    printf "host-agent-check note: session-memory not available; continuing with omni-recovery only\n" >&2
+  fi
 fi
 
 printf "host-agent-check passed\n"

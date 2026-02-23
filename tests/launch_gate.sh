@@ -142,6 +142,21 @@ if missing:
 install_help = (root / 'install-help.md').read_text(encoding='utf-8')
 if "trap 'omni-autonomous-agent --hook-stop' EXIT" in install_help:
     raise SystemExit('launch-gate failed: install-help.md contains outdated trap-only wrapper guidance')
+
+required_install_help_markers = [
+    '## 10) AI self-setup playbook (non-scripted fallback)',
+    '## 11) Official references and troubleshooting resources',
+    'https://docs.openclaw.ai/automation/hooks',
+    'https://docs.openclaw.ai/automation/hooks#troubleshooting',
+    'https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html',
+    'https://code.claude.com/docs/en/hooks',
+]
+missing_markers = [marker for marker in required_install_help_markers if marker not in install_help]
+if missing_markers:
+    raise SystemExit(
+        'launch-gate failed: install-help.md missing required self-setup markers: '
+        + ', '.join(missing_markers)
+    )
 PY
 
 printf "launch-gate passed\n"

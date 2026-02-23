@@ -408,6 +408,16 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(openclaw_hook.exists())
         self.assertTrue(openclaw_handler.exists())
 
+        openclaw_hook_text = openclaw_hook.read_text(encoding="utf-8")
+        openclaw_handler_text = openclaw_handler.read_text(encoding="utf-8")
+        self.assertIn(
+            'events: ["gateway:startup", "message:received"]', openclaw_hook_text
+        )
+        self.assertIn("OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE", openclaw_handler_text)
+        self.assertIn("--user-responded", openclaw_handler_text)
+        self.assertIn("openclaw', ['agent', '--message'", openclaw_handler_text)
+        self.assertIn("event.context?.from", openclaw_handler_text)
+
         wrapper_result = subprocess.run(
             [str(codex_wrapper), "--exit-code", "7"],
             env=self.env,

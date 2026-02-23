@@ -517,32 +517,79 @@ def _forced_wrapper_names() -> set[str]:
 def _openclaw_hook_md() -> str:
     return """---
 name: omni-recovery
-description: \"Re-orients the agent after gateway startup so autonomous sessions can resume\"
+description: \"Auto-resume active autonomous sessions on startup and clear await-user windows on inbound messages\"
 metadata:
   openclaw:
     emoji: \"🔁\"
-    events: [\"gateway:startup\"]
+    events: [\"gateway:startup\", \"message:received\"]
 ---
 # omni-recovery
-Runs omni-autonomous-agent --status on every gateway startup and injects the result
-so the agent knows if a task was in progress and can resume.
+Runs Omni Autonomous Agent recovery flows for OpenClaw events:
+
+- On `gateway:startup`: if an OAA session is active, queue a resume ping turn.
+- On `message:received`: if OAA is waiting for user response, auto-register response.
+
+Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 """
 
 
 def _openclaw_handler_ts() -> str:
-    return """import { execSync } from 'child_process';
+    return """import { spawn, spawnSync } from 'child_process';
+
+const ACTIVE_MARKER = 'omni-autonomous-agent - active';
+const WAITING_ROW_MARKER = 'User response';
+const WAITING_STATE_MARKER = 'waiting';
+
+const runOaa = (args: string[]) => {
+  const result = spawnSync('omni-autonomous-agent', args, {
+    stdio: 'pipe',
+    encoding: 'utf-8',
+  });
+  return {
+    ok: result.status === 0,
+    output: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim(),
+  };
+};
+
+const isActiveStatus = (text: string) => text.includes(ACTIVE_MARKER);
+const isWaitingForUser = (text: string) =>
+  text.includes(WAITING_ROW_MARKER) && text.includes(WAITING_STATE_MARKER);
+
+const queueResumePing = (status: string) => {
+  const prompt = [
+    '[omni] Gateway restarted and an autonomous session is still active.',
+    'Resume autonomous execution now.',
+    '',
+    status,
+  ].join('\\n');
+
+  const child = spawn('openclaw', ['agent', '--message', prompt], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+};
 
 const handler = async (event: any) => {
-  if (event.type !== 'gateway' || event.action !== 'startup') return;
+  if (event.type === 'message' && event.action === 'received') {
+    const from = typeof event.context?.from === 'string' ? event.context.from.trim() : '';
+    if (!from || from.toLowerCase() === 'system') return;
 
-  try {
-    const status = execSync('omni-autonomous-agent --status', { stdio: 'pipe' }).toString().trim();
-    if (status) {
-      event.messages.push(`[omni] Task state on gateway startup:\n${status}`);
-    }
-  } catch {
+    const status = runOaa(['--status']);
+    if (!status.ok || !isActiveStatus(status.output) || !isWaitingForUser(status.output)) return;
+
+    const raw = typeof event.context?.content === 'string' ? event.context.content : '';
+    const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
+    runOaa(['--user-responded', '--response-note', note]);
     return;
   }
+
+  if (event.type !== 'gateway' || event.action !== 'startup') return;
+  if (process.env.OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE === '1') return;
+
+  const status = runOaa(['--status']);
+  if (!status.ok || !isActiveStatus(status.output)) return;
+  queueResumePing(status.output);
 };
 
 export default handler;

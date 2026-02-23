@@ -112,14 +112,38 @@ if not openclaw_hook_md.exists() or not openclaw_handler.exists():
 openclaw_handler_text = openclaw_handler.read_text(encoding='utf-8')
 if 'OMNI_AGENT_OPENCLAW_BIN' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_BIN override support')
+if 'OMNI_AGENT_OAA_BIN' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OAA_BIN override support')
 if 'OMNI_AGENT_OPENCLAW_AGENT_ID' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_AGENT_ID override support')
 if 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing sensitive-context toggle support')
+if 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake dedupe TTL support')
+if 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake delivery toggle support')
+if 'OMNI_AGENT_OPENCLAW_SESSION_KEY' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing session key override support')
+if 'OMNI_AGENT_OPENCLAW_SESSION_ID' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing session override support')
 if '.npm-global' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
-if "'--agent', targetAgentId" not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing explicit --agent startup wake routing')
+if "'--session-id', route.sessionId" not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing explicit --session-id startup wake routing')
+if '--deliver' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake deliver flag support')
+if '--reply-channel' not in openclaw_handler_text or '--reply-to' not in openclaw_handler_text or '--reply-account' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake reply overrides')
+if 'openclaw-startup-wake.json' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing persisted startup wake dedupe storage')
+if 'acquireDedupeLock' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake lock-based dedupe guard')
+if 'startup wake skipped: unresolved session route' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing unresolved-route safety log')
+if 'startup wake skipped: unable to read OAA status' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing status-read failure log')
+if 'startup wake skipped: duplicate restart event' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing duplicate startup wake guard log')
 if 'Request: [redacted]' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
 if 'startup wake queued for agent=' not in openclaw_handler_text:

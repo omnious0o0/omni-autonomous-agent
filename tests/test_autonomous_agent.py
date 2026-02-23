@@ -139,8 +139,11 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         stop_payload = _json_output(stop)
         self.assertTrue(bool(stop_payload.get("continue")))
         self.assertTrue(bool(stop_payload.get("block")))
-        self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
+        self.assertEqual(stop_payload.get("template_id"), "stop-blocked-fixed")
         self.assertIn("Do not stop", str(stop_payload.get("template", "")))
+        self.assertNotIn(
+            "dynamic sessions", str(stop_payload.get("message", "")).lower()
+        )
         self.assertNotIn("fixed lifecycle", str(stop_payload.get("template", "")))
 
         precompact = _run_cli(["--hook-precompact"], self.env)
@@ -179,6 +182,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(stop_early.returncode, 2)
         stop_payload = _json_output(stop_early)
         self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
+        self.assertIn("dynamic sessions", str(stop_payload.get("message", "")).lower())
         self.assertIn(
             "continue autonomous", str(stop_payload.get("template", "")).lower()
         )
@@ -350,6 +354,27 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertFalse(bool(stop_payload.get("continue")))
         self.assertFalse(self._state_file().exists())
 
+    def test_status_json_marks_fixed_deadline_as_closure_pending(self) -> None:
+        added = _run_cli(["--add", "-R", "fixed-expired-status", "-D", "1"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state["deadline"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertTrue(bool(payload.get("ok")))
+        self.assertFalse(bool(payload.get("active")))
+        self.assertTrue(bool(payload.get("session_registered")))
+        self.assertTrue(bool(payload.get("closure_pending")))
+        self.assertEqual(
+            payload.get("lifecycle_state"), "deadline_reached_waiting_closure"
+        )
+        self.assertEqual(payload.get("report_status"), "IN_PROGRESS")
+        self.assertEqual(payload.get("report_status_effective"), "PARTIAL")
+
     def test_timezone_naive_state_is_rejected_without_crash(self) -> None:
         added = _run_cli(["--add", "-R", "timezone-naive", "-D", "5"], self.env)
         self.assertEqual(added.returncode, 0)
@@ -455,13 +480,38 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         self.assertIn("OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_BIN", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OAA_BIN", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_AGENT_ID", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_WAKE_DELIVER", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_KEY", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_ID", openclaw_handler_text)
+        self.assertIn(
+            "eventSessionKey.startsWith('agent:') ? eventSessionKey : ''",
+            openclaw_handler_text,
+        )
         self.assertIn("--user-responded", openclaw_handler_text)
         self.assertIn(".npm-global", openclaw_handler_text)
         self.assertIn(
-            "['agent', '--agent', targetAgentId, '--message', prompt]",
+            "['agent', '--agent', targetAgentId, '--session-id', route.sessionId, '--message', prompt]",
             openclaw_handler_text,
+        )
+        self.assertIn("--deliver", openclaw_handler_text)
+        self.assertIn("--reply-channel", openclaw_handler_text)
+        self.assertIn("--reply-to", openclaw_handler_text)
+        self.assertIn("--reply-account", openclaw_handler_text)
+        self.assertIn("openclaw-startup-wake.json", openclaw_handler_text)
+        self.assertIn("acquireDedupeLock", openclaw_handler_text)
+        self.assertIn("${dedupeFile}.lock", openclaw_handler_text)
+        self.assertIn(
+            "startup wake skipped: unresolved session route", openclaw_handler_text
+        )
+        self.assertIn(
+            "startup wake skipped: unable to read OAA status", openclaw_handler_text
+        )
+        self.assertIn(
+            "startup wake skipped: duplicate restart event", openclaw_handler_text
         )
         self.assertIn("Request: [redacted]", openclaw_handler_text)
         self.assertIn("startup wake queued for agent=", openclaw_handler_text)

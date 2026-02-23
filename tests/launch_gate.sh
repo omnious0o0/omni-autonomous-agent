@@ -14,6 +14,7 @@ required_paths=(
   ".omni-autonomous-agent"
   ".omni-autonomous-agent/templates"
   ".omni-autonomous-agent/templates/stop-blocked.md"
+  ".omni-autonomous-agent/templates/stop-blocked-fixed.md"
   ".omni-autonomous-agent/templates/precompact-handoff.md"
   ".omni-autonomous-agent/templates/user-timeout-continue.md"
   "omni-sandbox"
@@ -69,6 +70,7 @@ files = [
     root / "LICENSE",
     root / "install-help.md",
     root / ".omni-autonomous-agent" / "templates" / "stop-blocked.md",
+    root / ".omni-autonomous-agent" / "templates" / "stop-blocked-fixed.md",
     root / ".omni-autonomous-agent" / "templates" / "precompact-handoff.md",
     root / ".omni-autonomous-agent" / "templates" / "user-timeout-continue.md",
     root / ".omni-autonomous-agent" / "constants.py",

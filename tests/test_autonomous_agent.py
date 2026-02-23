@@ -485,8 +485,12 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_WAKE_DELIVER", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_HOOK_TELEMETRY", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_KEY", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_ID", openclaw_handler_text)
+        self.assertIn("--log-event", openclaw_handler_text)
+        self.assertIn("--event", openclaw_handler_text)
+        self.assertIn("--note", openclaw_handler_text)
         self.assertIn(
             "eventSessionKey.startsWith('agent:') ? eventSessionKey : ''",
             openclaw_handler_text,
@@ -917,6 +921,32 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(help_out.returncode, 0)
         self.assertIn("defaults to dynamic", help_out.stdout)
         self.assertIn("with --add", help_out.stdout)
+
+    def test_log_event_appends_log_and_report_checkpoint(self) -> None:
+        added = _run_cli(["--add", "-R", "telemetry check", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        logged = _run_cli(
+            [
+                "--log-event",
+                "--event",
+                "OpenClaw Startup Wake Queued",
+                "--note",
+                "route=abc session=def",
+            ],
+            self.env,
+        )
+        self.assertEqual(logged.returncode, 0)
+
+        state = self._read_state()
+        sandbox_dir = Path(str(state["sandbox_dir"]))
+        log_text = (sandbox_dir / "LOG.md").read_text(encoding="utf-8")
+        report_text = (sandbox_dir / "REPORT.md").read_text(encoding="utf-8")
+
+        self.assertIn("Hook telemetry", log_text)
+        self.assertIn("Event: openclaw-startup-wake-queued", log_text)
+        self.assertIn("Note: route=abc session=def", log_text)
+        self.assertIn("Checkpoint (hook:openclaw-startup-wake-queued)", report_text)
 
     def test_main_preflight_includes_bootstrap_module(self) -> None:
         main_text = (PROJECT_ROOT / "main.py").read_text(encoding="utf-8")

@@ -131,8 +131,11 @@ required_flags = [
     '--install',
     '--await-user',
     '--user-responded',
+    '--log-event',
     '-R',
     '-D',
+    '--event',
+    '--note',
     '--wait-minutes',
     '--response-note',
 ]

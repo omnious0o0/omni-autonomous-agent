@@ -122,10 +122,14 @@ if 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing startup wake dedupe TTL support')
 if 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing startup wake delivery toggle support')
+if 'OMNI_AGENT_HOOK_TELEMETRY' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing hook telemetry toggle support')
 if 'OMNI_AGENT_OPENCLAW_SESSION_KEY' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing session key override support')
 if 'OMNI_AGENT_OPENCLAW_SESSION_ID' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing session override support')
+if '--log-event' not in openclaw_handler_text or '--event' not in openclaw_handler_text or '--note' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing OAA hook telemetry logging integration')
 if '.npm-global' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
 if "'--session-id', route.sessionId" not in openclaw_handler_text:
@@ -144,6 +148,8 @@ if 'startup wake skipped: unable to read OAA status' not in openclaw_handler_tex
     raise SystemExit('host-agent-check failed: openclaw handler missing status-read failure log')
 if 'startup wake skipped: duplicate restart event' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing duplicate startup wake guard log')
+if 'startup wake skipped: dedupe lock unavailable' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing dedupe lock contention log')
 if 'Request: [redacted]' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
 if 'startup wake queued for agent=' not in openclaw_handler_text:

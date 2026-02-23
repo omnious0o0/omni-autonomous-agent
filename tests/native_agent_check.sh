@@ -79,7 +79,7 @@ for wrapper in omni-wrap-codex omni-agent-wrap; do
   test "${code}" -eq 3
 done
 
-"${CLI}" --add -R "native e2e" -D dynamic >/tmp/omni-native-add.out
+"${CLI}" --add -R "native e2e" -D dynamic >"${WORK_DIR}/native-add.out"
 
 set +e
 timeout 2 "${WRAP_DIR}/omni-wrap-codex" --version >"${WORK_DIR}/loop.out" 2>&1
@@ -115,12 +115,12 @@ set -e
 test "${corrupt_code}" -eq 2
 grep -q "corrupted" "${WORK_DIR}/corrupt-stop.out"
 
-"${CLI}" --cancel >/tmp/omni-native-cancel.out
+"${CLI}" --cancel >"${WORK_DIR}/native-cancel.out"
 "${CLI}" --status | grep -q "No active session"
 
-if openclaw hooks list >/tmp/omni-native-hooks.out 2>/tmp/omni-native-hooks.err; then
-  grep -q "omni-recovery" /tmp/omni-native-hooks.out
-  grep -q "session-memory" /tmp/omni-native-hooks.out
+if openclaw hooks list >"${WORK_DIR}/native-hooks.out" 2>"${WORK_DIR}/native-hooks.err"; then
+  grep -q "omni-recovery" "${WORK_DIR}/native-hooks.out"
+  grep -q "session-memory" "${WORK_DIR}/native-hooks.out"
 fi
 
 printf "native-agent-check passed\n"

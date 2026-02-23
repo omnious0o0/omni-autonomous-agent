@@ -53,31 +53,45 @@ ROOT_DIR="$(cd "${SCRIPT_SOURCE_DIR}/.." >/dev/null 2>&1 && pwd)"
 MAIN_SCRIPT="${ROOT_DIR}/main.py"
 
 LOCAL_BIN="${OMNI_AGENT_LOCAL_BIN:-${HOME}/.local/bin}"
-SYSTEM_BIN="/usr/local/bin"
+SYSTEM_BIN_OVERRIDE_RAW="${OMNI_AGENT_SYSTEM_BIN:-}"
+SYSTEM_BIN="${SYSTEM_BIN_OVERRIDE_RAW:-/usr/local/bin}"
 TARGET_DIR=""
 SUDO_CMD=()
 
 mkdir -p "${LOCAL_BIN}" || true
 if [[ -w "${LOCAL_BIN}" ]]; then
   TARGET_DIR="${LOCAL_BIN}"
-elif [[ -d "${SYSTEM_BIN}" && -w "${SYSTEM_BIN}" ]]; then
-  TARGET_DIR="${SYSTEM_BIN}"
-elif [[ -d "${SYSTEM_BIN}" ]] && command -v sudo >/dev/null 2>&1; then
-  TARGET_DIR="${SYSTEM_BIN}"
-  if [[ -t 0 ]]; then
-    SUDO_CMD=(sudo)
-  else
-    if sudo -n true >/dev/null 2>&1; then
-      SUDO_CMD=(sudo -n)
+fi
+
+if [[ -z "${TARGET_DIR}" && -n "${SYSTEM_BIN_OVERRIDE_RAW}" && ! -d "${SYSTEM_BIN}" ]]; then
+  mkdir -p "${SYSTEM_BIN}" >/dev/null 2>&1 || true
+fi
+
+if [[ -z "${TARGET_DIR}" ]]; then
+  if [[ -d "${SYSTEM_BIN}" && -w "${SYSTEM_BIN}" ]]; then
+    TARGET_DIR="${SYSTEM_BIN}"
+  elif [[ -d "${SYSTEM_BIN}" ]] && command -v sudo >/dev/null 2>&1; then
+    TARGET_DIR="${SYSTEM_BIN}"
+    if [[ -t 0 ]]; then
+      SUDO_CMD=(sudo)
     else
-      printf "%berror:%b non-interactive install requires passwordless sudo for %s.\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
-      printf "       Re-run interactively, add %s to PATH, or set OMNI_AGENT_LOCAL_BIN.\n" "${LOCAL_BIN}" >&2
-      exit 1
+      if sudo -n true >/dev/null 2>&1; then
+        SUDO_CMD=(sudo -n)
+      else
+        printf "%berror:%b non-interactive install requires passwordless sudo for %s.\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
+        printf "       Re-run interactively, add %s to PATH, or set OMNI_AGENT_LOCAL_BIN.\n" "${LOCAL_BIN}" >&2
+        exit 1
+      fi
     fi
+  elif [[ -n "${SYSTEM_BIN_OVERRIDE_RAW}" ]]; then
+    printf "%berror:%b OMNI_AGENT_SYSTEM_BIN path is not writable or could not be created: %s\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
+    printf "       Create it with proper permissions, or unset OMNI_AGENT_SYSTEM_BIN and retry.\n" >&2
+    exit 1
+  else
+    printf "%berror:%b no writable install target found.\n" "${RED}" "${RESET}" >&2
+    printf "       Set OMNI_AGENT_LOCAL_BIN or OMNI_AGENT_SYSTEM_BIN to a writable path.\n" >&2
+    exit 1
   fi
-else
-  printf "%berror:%b no writable install target found.\n" "${RED}" "${RESET}" >&2
-  exit 1
 fi
 
 DEST="${TARGET_DIR}/${DEST_NAME}"

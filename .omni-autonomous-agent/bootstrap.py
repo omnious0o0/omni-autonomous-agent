@@ -51,6 +51,20 @@ def _wrapper_filename(base_name: str) -> str:
     return base_name
 
 
+def _path_override(env_name: str, default_path: Path) -> Path:
+    override = os.environ.get(env_name, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return default_path
+
+
+def _default_opencode_plugin_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if config_home:
+        return Path(config_home).expanduser() / "opencode" / "plugins" / "omni-hook.ts"
+    return Path.home() / ".config" / "opencode" / "plugins" / "omni-hook.ts"
+
+
 def _header(title: str) -> None:
     print(SEP)
     print(f"  {c(BOLD, title)}")
@@ -139,7 +153,9 @@ def _has_named_command(entries: list[Any], command: str) -> bool:
 
 
 def _configure_claude() -> tuple[bool, Path]:
-    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_path = _path_override(
+        "OMNI_AGENT_CLAUDE_SETTINGS", Path.home() / ".claude" / "settings.json"
+    )
     config = _load_json(settings_path)
 
     hooks = config.get("hooks")
@@ -184,7 +200,9 @@ def _configure_claude() -> tuple[bool, Path]:
 
 
 def _configure_gemini() -> tuple[bool, Path]:
-    settings_path = Path.home() / ".gemini" / "settings.json"
+    settings_path = _path_override(
+        "OMNI_AGENT_GEMINI_SETTINGS", Path.home() / ".gemini" / "settings.json"
+    )
     config = _load_json(settings_path)
 
     hooks = config.get("hooks")
@@ -267,7 +285,9 @@ export default OmniHook;
 
 
 def _configure_opencode() -> tuple[bool, Path]:
-    plugin_path = Path.home() / ".config" / "opencode" / "plugins" / "omni-hook.ts"
+    plugin_path = _path_override(
+        "OMNI_AGENT_OPENCODE_PLUGIN", _default_opencode_plugin_path()
+    )
     plugin_path.parent.mkdir(parents=True, exist_ok=True)
     desired = _opencode_plugin_content()
     current = plugin_path.read_text(encoding="utf-8") if plugin_path.exists() else None
@@ -292,10 +312,13 @@ if errorlevel 1 (
 %*
 set CMD_STATUS=%ERRORLEVEL%
 
+set OMNI_AGENT_HOOK_WRAPPER=1
 omni-autonomous-agent --hook-stop
 set HOOK_STATUS=%ERRORLEVEL%
+set OMNI_AGENT_HOOK_WRAPPER=
 
 if "%HOOK_STATUS%"=="2" goto loop
+if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%
 if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%
 
 >&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.
@@ -317,7 +340,7 @@ while true; do
   set -e
 
   set +e
-  hook_output="$(omni-autonomous-agent --hook-stop 2>&1)"
+  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 omni-autonomous-agent --hook-stop 2>&1)"
   hook_status=$?
   set -e
 
@@ -326,6 +349,13 @@ while true; do
       printf '%s\n' "$hook_output" >&2
     fi
     continue
+  fi
+
+  if [[ "$hook_status" -eq 4 ]]; then
+    if [[ -n "$hook_output" ]]; then
+      printf '%s\n' "$hook_output" >&2
+    fi
+    exit "$hook_status"
   fi
 
   if [[ "$hook_status" -eq 0 ]]; then
@@ -357,10 +387,13 @@ def _specific_wrapper_script(agent_command: str) -> str:
             f"{agent_command} %*\n"
             "set CMD_STATUS=%ERRORLEVEL%\n"
             "\n"
+            "set OMNI_AGENT_HOOK_WRAPPER=1\n"
             "omni-autonomous-agent --hook-stop\n"
             "set HOOK_STATUS=%ERRORLEVEL%\n"
+            "set OMNI_AGENT_HOOK_WRAPPER=\n"
             "\n"
             'if "%HOOK_STATUS%"=="2" goto loop\n'
+            'if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%\n'
             'if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%\n'
             "\n"
             ">&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.\n"
@@ -383,7 +416,7 @@ def _specific_wrapper_script(agent_command: str) -> str:
         "  set -e\n"
         "\n"
         "  set +e\n"
-        '  hook_output="$(omni-autonomous-agent --hook-stop 2>&1)"\n'
+        '  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 omni-autonomous-agent --hook-stop 2>&1)"\n'
         "  hook_status=$?\n"
         "  set -e\n"
         "\n"
@@ -392,6 +425,13 @@ def _specific_wrapper_script(agent_command: str) -> str:
         '      printf "%s\\n" "$hook_output" >&2\n'
         "    fi\n"
         "    continue\n"
+        "  fi\n"
+        "\n"
+        '  if [[ "$hook_status" -eq 4 ]]; then\n'
+        '    if [[ -n "$hook_output" ]]; then\n'
+        '      printf "%s\\n" "$hook_output" >&2\n'
+        "    fi\n"
+        '    exit "$hook_status"\n'
         "  fi\n"
         "\n"
         '  if [[ "$hook_status" -eq 0 ]]; then\n'
@@ -510,7 +550,10 @@ export default handler;
 
 
 def _configure_openclaw() -> tuple[bool, Path]:
-    hook_dir = Path.home() / ".openclaw" / "hooks" / "omni-recovery"
+    hook_dir = _path_override(
+        "OMNI_AGENT_OPENCLAW_HOOK_DIR",
+        Path.home() / ".openclaw" / "hooks" / "omni-recovery",
+    )
     hook_dir.mkdir(parents=True, exist_ok=True)
     hook_md = hook_dir / "HOOK.md"
     handler_ts = hook_dir / "handler.ts"

@@ -69,7 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--duration",
         metavar="MINUTES_OR_DYNAMIC",
         type=str,
-        help="Duration in minutes or 'dynamic' (required with --add)",
+        help="Duration in minutes or 'dynamic' (defaults to dynamic with --add)",
     )
     parser.add_argument(
         "-Q",

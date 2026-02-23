@@ -67,6 +67,13 @@ Important behavior:
   - `HOOK.md` + `handler.ts` managed by bootstrap
   - Bootstrap enables `omni-recovery` and `session-memory`
 
+Optional path overrides for non-default environments:
+
+- `OMNI_AGENT_CLAUDE_SETTINGS`
+- `OMNI_AGENT_GEMINI_SETTINGS`
+- `OMNI_AGENT_OPENCODE_PLUGIN`
+- `OMNI_AGENT_OPENCLAW_HOOK_DIR`
+
 ### Wrapper-based agents
 
 Bootstrap creates wrappers in a platform-aware bin directory:
@@ -102,8 +109,9 @@ They enforce:
    - Runs wrapped agent command
    - Calls `omni-autonomous-agent --hook-stop`
    - If hook exits `2`, wrapper continues looping (no premature stop)
+   - If hook exits `4`, wrapper pauses and exits (used for user-response wait windows and corrupted-state recovery)
    - Wrapper exits with command status when hook exits `0`
-   - Wrapper exits with hook error code for non-`0`/`2` hook failures
+   - Wrapper exits with hook error code for other non-`0`/`2`/`4` hook failures
 
 Quick preflight check:
 
@@ -250,3 +258,4 @@ omni-autonomous-agent --cancel
 - Use `--await-user` when you need missing constraints; default window is 2 minutes.
 - If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
 - For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.
+- If you override install destination with `OMNI_AGENT_SYSTEM_BIN`, ensure that path is writable (or creatable) by the installer user.

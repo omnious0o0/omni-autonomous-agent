@@ -33,6 +33,20 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _is_git_worktree(repo_root: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip() == "true"
+
+
 def _auto_update_state_path() -> Path:
     return CONFIG_DIR / "update_state.json"
 
@@ -85,7 +99,7 @@ def maybe_auto_update() -> None:
         return
 
     repo_root = _repo_root()
-    if not (repo_root / ".git").is_dir():
+    if not _is_git_worktree(repo_root):
         return
 
     now = datetime.now().astimezone()
@@ -98,7 +112,7 @@ def maybe_auto_update() -> None:
             last_checked = datetime.fromisoformat(last_checked_raw)
             if now - last_checked < interval:
                 return
-        except ValueError:
+        except (TypeError, ValueError):
             pass
 
     next_state: dict[str, str] = {
@@ -141,7 +155,10 @@ def maybe_auto_update() -> None:
 def cmd_update() -> None:
     repo_root = _repo_root()
 
-    if not (repo_root / ".git").is_dir():
+    if shutil.which("git") is None:
+        sys.exit("error: git is required for --update")
+
+    if not _is_git_worktree(repo_root):
         sys.exit(
             f"error: {repo_root} is not a git repository. "
             "The --update command works only for git-cloned installs."

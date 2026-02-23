@@ -280,6 +280,51 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotIn("await_user_deadline", state_after)
         self.assertNotIn("await_user_question", state_after)
 
+    def test_await_user_rejects_expired_fixed_session(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "await-user-expired-fixed", "-D", "1"], self.env
+        )
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state["deadline"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        waiting = _run_cli(["--await-user", "-Q", "Need more details"], self.env)
+        self.assertNotEqual(waiting.returncode, 0)
+        self.assertIn("deadline already passed", waiting.stderr)
+
+    def test_fixed_stop_allows_closure_even_with_active_wait_window(self) -> None:
+        added = _run_cli(["--add", "-R", "fixed-await-precedence", "-D", "1"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state["deadline"] = "2000-01-01T00:00:00+00:00"
+        state["await_user_started_at"] = "1999-12-31T00:00:00+00:00"
+        state["await_user_deadline"] = "2999-01-01T00:00:00+00:00"
+        state["await_user_question"] = "Still waiting for response"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        stop = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop.returncode, 0)
+        stop_payload = _json_output(stop)
+        self.assertFalse(bool(stop_payload.get("continue")))
+        self.assertFalse(self._state_file().exists())
+
+    def test_timezone_naive_state_is_rejected_without_crash(self) -> None:
+        added = _run_cli(["--add", "-R", "timezone-naive", "-D", "5"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state["started_at"] = "2026-01-01T00:00:00"
+        state["deadline"] = "2026-01-01T01:00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        status = _run_cli(["--status"], self.env)
+        self.assertEqual(status.returncode, 0)
+        self.assertIn("State error", status.stdout)
+        self.assertIn("state file is invalid", status.stdout)
+
     def test_require_active_guard(self) -> None:
         before = _run_cli(["--require-active"], self.env)
         self.assertNotEqual(before.returncode, 0)
@@ -422,6 +467,142 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(wrapper_result.returncode, 7)
         self.assertFalse(self._state_file().exists())
 
+    def test_wrapper_pauses_when_waiting_for_user_response(self) -> None:
+        self._write_fake_binary("codex")
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        wrapper = self.home_dir / ".local" / "bin" / "omni-wrap-codex"
+
+        added = _run_cli(["--add", "-R", "await pause", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        wrapper_result = subprocess.run(
+            [str(wrapper), "--exit-code", "0"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(wrapper_result.returncode, 4)
+        self.assertIn(
+            "waiting_for_user", f"{wrapper_result.stdout}\n{wrapper_result.stderr}"
+        )
+        self.assertTrue(self._state_file().exists())
+
+    def test_wrapper_pauses_instead_of_looping_when_state_corrupts_mid_run(
+        self,
+    ) -> None:
+        codex = self.bin_dir / "codex"
+        codex.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "--corrupt-state" ]]; then\n'
+            '  printf "{bad-json" > "${OMNI_AGENT_CONFIG_DIR}/state.json"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        wrapper = self.home_dir / ".local" / "bin" / "omni-wrap-codex"
+
+        added = _run_cli(
+            ["--add", "-R", "corrupt during wrapper", "-D", "dynamic"], self.env
+        )
+        self.assertEqual(added.returncode, 0)
+
+        wrapper_result = subprocess.run(
+            [str(wrapper), "--corrupt-state"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(wrapper_result.returncode, 4)
+        self.assertIn(
+            "state_corrupted", f"{wrapper_result.stdout}\n{wrapper_result.stderr}"
+        )
+
+    def test_universal_wrapper_pauses_when_waiting_for_user_response(self) -> None:
+        self._write_fake_binary("codex")
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        wrapper = self.home_dir / ".local" / "bin" / "omni-agent-wrap"
+
+        added = _run_cli(
+            ["--add", "-R", "await pause universal", "-D", "dynamic"], self.env
+        )
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        wrapper_result = subprocess.run(
+            [str(wrapper), "codex", "--exit-code", "0"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(wrapper_result.returncode, 4)
+        self.assertIn(
+            "waiting_for_user", f"{wrapper_result.stdout}\n{wrapper_result.stderr}"
+        )
+
+    def test_universal_wrapper_pauses_when_state_corrupts_mid_run(self) -> None:
+        codex = self.bin_dir / "codex"
+        codex.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "--corrupt-state" ]]; then\n'
+            '  printf "{bad-json" > "${OMNI_AGENT_CONFIG_DIR}/state.json"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        wrapper = self.home_dir / ".local" / "bin" / "omni-agent-wrap"
+        added = _run_cli(
+            ["--add", "-R", "corrupt universal", "-D", "dynamic"], self.env
+        )
+        self.assertEqual(added.returncode, 0)
+
+        wrapper_result = subprocess.run(
+            [str(wrapper), "codex", "--corrupt-state"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(wrapper_result.returncode, 4)
+        self.assertIn(
+            "state_corrupted", f"{wrapper_result.stdout}\n{wrapper_result.stderr}"
+        )
+
     def test_bootstrap_supports_future_agent_from_env(self) -> None:
         self.env["AGENT"] = "futureagent"
 
@@ -494,6 +675,31 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("bootstrap did not complete successfully", result.stderr)
 
+    def test_installer_uses_creatable_system_bin_override(self) -> None:
+        local_bin = Path(self._temp_dir.name) / "readonly-local-bin"
+        local_bin.mkdir(parents=True, exist_ok=True)
+        local_bin.chmod(0o555)
+        system_bin = Path(self._temp_dir.name) / "custom-system-bin"
+
+        install_env = self.env.copy()
+        install_env["OMNI_AGENT_LOCAL_BIN"] = str(local_bin)
+        install_env["OMNI_AGENT_SYSTEM_BIN"] = str(system_bin)
+        install_env["OMNI_AGENT_INSTALL_DIR"] = str(
+            Path(self._temp_dir.name) / "install-root"
+        )
+
+        install_script = PROJECT_ROOT / ".omni-autonomous-agent" / "install.sh"
+        result = subprocess.run(
+            ["bash", str(install_script)],
+            cwd=PROJECT_ROOT,
+            env=install_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((system_bin / "omni-autonomous-agent").exists())
+
     def test_windows_installer_script_exists_and_bootstraps(self) -> None:
         install_ps1 = PROJECT_ROOT / ".omni-autonomous-agent" / "install.ps1"
         self.assertTrue(install_ps1.exists())
@@ -501,6 +707,40 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         text = install_ps1.read_text(encoding="utf-8")
         self.assertIn("$destName.cmd", text)
         self.assertIn("--bootstrap", text)
+
+    def test_update_fails_cleanly_without_git(self) -> None:
+        env = self.env.copy()
+        env["PATH"] = str(self.bin_dir)
+
+        result = _run_cli(["--update"], env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("git is required for --update", result.stderr)
+
+    def test_update_reports_non_git_repo_cleanly(self) -> None:
+        fake_git = self.bin_dir / "git"
+        fake_git.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "rev-parse" ]]; then\n'
+            "  exit 1\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+
+        env = self.env.copy()
+        env["PATH"] = str(self.bin_dir)
+
+        result = _run_cli(["--update"], env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not a git repository", result.stderr)
+
+    def test_cli_help_reflects_dynamic_duration_default(self) -> None:
+        help_out = _run_cli(["--help"], self.env)
+        self.assertEqual(help_out.returncode, 0)
+        self.assertIn("defaults to dynamic", help_out.stdout)
+        self.assertIn("with --add", help_out.stdout)
 
 
 if __name__ == "__main__":

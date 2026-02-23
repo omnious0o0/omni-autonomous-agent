@@ -4,8 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
 cd "${ROOT_DIR}"
 
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
+
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPYCACHEPREFIX="/tmp/omni-pycache"
+export PYTHONPYCACHEPREFIX="${WORK_DIR}/pycache"
 
 required_paths=(
   ".omni-autonomous-agent"

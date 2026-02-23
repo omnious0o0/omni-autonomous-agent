@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -142,6 +143,18 @@ def _is_path_inside(root: Path, candidate: Path) -> bool:
     )
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
 def _state_is_valid(state: dict[str, Any]) -> bool:
     required = {
         "request",
@@ -178,19 +191,15 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
     duration_minutes = state.get("duration_minutes")
     deadline = state.get("deadline")
 
-    try:
-        datetime.fromisoformat(state["started_at"])
-    except (TypeError, ValueError):
+    started_dt = _parse_iso_datetime(state.get("started_at"))
+    if started_dt is None:
         return False
 
     if state.get("duration_mode") == "fixed":
         if not isinstance(duration_minutes, int) or duration_minutes <= 0:
             return False
-        if not isinstance(deadline, str):
-            return False
-        try:
-            datetime.fromisoformat(deadline)
-        except ValueError:
+        deadline_dt = _parse_iso_datetime(deadline)
+        if deadline_dt is None:
             return False
     else:
         if duration_minutes is not None:
@@ -205,12 +214,9 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
     if any(
         value is not None for value in (await_started, await_deadline, await_question)
     ):
-        if not isinstance(await_started, str) or not isinstance(await_deadline, str):
-            return False
-        try:
-            started_dt = datetime.fromisoformat(await_started)
-            deadline_dt = datetime.fromisoformat(await_deadline)
-        except ValueError:
+        started_dt = _parse_iso_datetime(await_started)
+        deadline_dt = _parse_iso_datetime(await_deadline)
+        if started_dt is None or deadline_dt is None:
             return False
         if deadline_dt < started_dt:
             return False
@@ -423,15 +429,18 @@ def _clear_await_user_fields(state: dict[str, Any]) -> None:
 
 
 def _await_user_deadline(state: dict[str, Any]) -> datetime | None:
-    raw = state.get("await_user_deadline")
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        return None
-    try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
-        return None
+    return _parse_iso_datetime(state.get("await_user_deadline"))
+
+
+def _in_wrapper_hook_mode() -> bool:
+    raw = os.environ.get("OMNI_AGENT_HOOK_WRAPPER", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _blocked_stop_exit_code(*, retry_immediately: bool) -> int:
+    if _in_wrapper_hook_mode() and not retry_immediately:
+        return 4
+    return 2
 
 
 def _parse_positive_minutes(raw: str, flag: str) -> int:
@@ -774,6 +783,11 @@ def cmd_await_user(question: str, wait_minutes: str) -> None:
 
         minutes = _parse_positive_minutes(wait_minutes.strip(), "--wait-minutes")
         now = _now()
+        snapshot = _status_snapshot(state, now)
+        if not snapshot["dynamic"] and not snapshot["active"]:
+            sys.exit(
+                "error: session deadline already passed; --await-user cannot extend a fixed session. Conclude or register a new session."
+            )
         deadline = now + timedelta(minutes=minutes)
 
         state["await_user_started_at"] = now.isoformat()
@@ -922,6 +936,20 @@ def cmd_status() -> None:
 
         await_deadline = _await_user_deadline(state)
         if await_deadline is not None:
+            if not snapshot["dynamic"] and not snapshot["active"]:
+                _clear_await_user_fields(state)
+                _save(state)
+                _append_log(
+                    state,
+                    "Await-user window cleared at fixed-session deadline",
+                    details=[
+                        "Fixed deadline reached before user response window closed.",
+                        "Stop is now governed by fixed-session completion rules.",
+                    ],
+                )
+                await_deadline = None
+
+        if await_deadline is not None:
             await_question = str(state.get("await_user_question", "") or "(none)")
             if now < await_deadline:
                 await_remaining = (await_deadline - now).total_seconds()
@@ -1067,10 +1095,12 @@ def cmd_hook_stop() -> None:
                 hook="stop",
                 active=True,
                 block=True,
+                retry_immediately=False,
+                state_corrupted=True,
                 template_id="stop-blocked",
                 template=template_text,
             )
-            sys.exit(2)
+            sys.exit(_blocked_stop_exit_code(retry_immediately=False))
 
         if not state:
             _emit_hook_payload(
@@ -1084,6 +1114,20 @@ def cmd_hook_stop() -> None:
             report_status = _read_report_status(state)
 
             await_deadline = _await_user_deadline(state)
+            if await_deadline is not None:
+                if not snapshot["dynamic"] and not snapshot["active"]:
+                    _clear_await_user_fields(state)
+                    _save(state)
+                    _append_log(
+                        state,
+                        "Await-user window cleared at fixed-session deadline",
+                        details=[
+                            "Fixed deadline reached before user response window closed.",
+                            "Stop is now governed by fixed-session completion rules.",
+                        ],
+                    )
+                    await_deadline = None
+
             if await_deadline is not None:
                 if now < await_deadline:
                     wait_remaining = (await_deadline - now).total_seconds()
@@ -1109,11 +1153,12 @@ def cmd_hook_stop() -> None:
                         active=True,
                         block=True,
                         waiting_for_user=True,
+                        retry_immediately=False,
                         response_deadline=_fmt_dt(await_deadline),
                         template_id="stop-blocked",
                         template=template_text,
                     )
-                    sys.exit(2)
+                    sys.exit(_blocked_stop_exit_code(retry_immediately=False))
 
                 template_context = _hook_template_context(state, snapshot, now)
                 template_text = render_template(
@@ -1136,10 +1181,11 @@ def cmd_hook_stop() -> None:
                     active=True,
                     block=True,
                     user_response_timed_out=True,
+                    retry_immediately=True,
                     template_id="user-timeout-continue",
                     template=template_text,
                 )
-                sys.exit(2)
+                sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
             if snapshot["dynamic"]:
                 should_block = report_status not in {"COMPLETE", "PARTIAL"}
@@ -1171,10 +1217,11 @@ def cmd_hook_stop() -> None:
                     hook="stop",
                     active=True,
                     block=True,
+                    retry_immediately=True,
                     template_id="stop-blocked",
                     template=template_text,
                 )
-                sys.exit(2)
+                sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
             _append_log(
                 state,
@@ -1207,10 +1254,11 @@ def cmd_hook_stop() -> None:
                     hook="stop",
                     active=True,
                     block=True,
+                    retry_immediately=True,
                     template_id="stop-blocked",
                     template=template_text,
                 )
-                sys.exit(2)
+                sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
             _clear_state()
 
@@ -1240,7 +1288,8 @@ def cmd_hook_stop() -> None:
                 hook="stop",
                 active=True,
                 block=True,
+                retry_immediately=False,
                 template_id="stop-blocked",
                 template=template_text,
             )
-            sys.exit(2)
+            sys.exit(_blocked_stop_exit_code(retry_immediately=False))

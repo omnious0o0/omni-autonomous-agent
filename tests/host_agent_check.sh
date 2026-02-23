@@ -4,10 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
 cd "${ROOT_DIR}"
 
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
+
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPYCACHEPREFIX="/tmp/omni-pycache"
-export OMNI_AGENT_CONFIG_DIR="/tmp/omni-host-config"
-export OMNI_AGENT_SANDBOX_ROOT="/tmp/omni-host-sandbox"
+export PYTHONPYCACHEPREFIX="${WORK_DIR}/pycache"
+export OMNI_AGENT_CONFIG_DIR="${WORK_DIR}/host-config"
+export OMNI_AGENT_SANDBOX_ROOT="${WORK_DIR}/host-sandbox"
 export OMNI_AGENT_REPO_ROOT="${ROOT_DIR}"
 export OMNI_AGENT_DISABLE_AUTO_UPDATE=1
 
@@ -17,7 +20,7 @@ mkdir -p "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
 CHECK_TIMEOUT="${OMNI_CHECK_TIMEOUT:-120}"
 
 set +e
-OMNI_AGENT_EXTRA_WRAPPERS="codex,soonagent" timeout "${CHECK_TIMEOUT}" python3 "main.py" --bootstrap >/tmp/omni-host-bootstrap.txt 2>&1
+OMNI_AGENT_EXTRA_WRAPPERS="codex,soonagent" timeout "${CHECK_TIMEOUT}" python3 "main.py" --bootstrap >"${WORK_DIR}/host-bootstrap.txt" 2>&1
 BOOTSTRAP_CODE=$?
 set -e
 if [[ "${BOOTSTRAP_CODE}" -eq 124 ]]; then

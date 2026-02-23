@@ -541,7 +541,8 @@ Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 
 
 def _openclaw_handler_ts() -> str:
-    return """import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+    return """import { createHash } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { delimiter, dirname, join } from 'path';
 import { spawn, spawnSync } from 'child_process';
 
@@ -563,15 +564,29 @@ type SessionRoute = {
   accountId?: string;
 };
 
+type DedupeResult = {
+  decision: 'disabled' | 'recorded' | 'duplicate' | 'lock-unavailable' | 'error';
+};
+
 const STARTUP_WAKE_COOLDOWN_MS = 15_000;
 let lastStartupWakeMs = 0;
 const includeSensitiveContext = process.env.OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT === '1';
 const deliverStartupWake = process.env.OMNI_AGENT_OPENCLAW_WAKE_DELIVER !== '0';
+const hookTelemetryEnabled = process.env.OMNI_AGENT_HOOK_TELEMETRY !== '0';
 
 const parsePositiveInt = (raw: string | undefined, fallback: number): number => {
   const value = Number.parseInt((raw ?? '').trim(), 10);
   if (Number.isFinite(value) && value > 0) return value;
   return fallback;
+};
+
+const normalizeTelemetryText = (raw: string, maxLen: number): string =>
+  raw.replace(/\\s+/g, ' ').trim().slice(0, maxLen);
+
+const shortFingerprint = (raw: string | undefined): string => {
+  const value = (raw ?? '').trim();
+  if (!value) return 'none';
+  return createHash('sha256').update(value).digest('hex').slice(0, 12);
 };
 
 const STARTUP_WAKE_PERSISTED_DEDUPE_MS = parsePositiveInt(
@@ -664,13 +679,13 @@ const acquireDedupeLock = (lockDir: string): boolean => {
   }
 };
 
-const rememberStartupWake = (dedupeKey: string): boolean => {
+const rememberStartupWake = (dedupeKey: string): DedupeResult => {
   const dedupeFile = resolveWakeDedupeFile();
-  if (!dedupeFile) return true;
+  if (!dedupeFile) return { decision: 'disabled' };
 
   const lockDir = `${dedupeFile}.lock`;
   if (!acquireDedupeLock(lockDir)) {
-    return false;
+    return { decision: 'lock-unavailable' };
   }
 
   try {
@@ -689,19 +704,47 @@ const rememberStartupWake = (dedupeKey: string): boolean => {
 
     const seenAt = entries[dedupeKey];
     if (typeof seenAt === 'number' && now - seenAt < STARTUP_WAKE_PERSISTED_DEDUPE_MS) {
-      return false;
+      return { decision: 'duplicate' };
     }
 
     entries[dedupeKey] = now;
     mkdirSync(dirname(dedupeFile), { recursive: true });
     writeFileSync(dedupeFile, JSON.stringify({ entries }, null, 2), 'utf-8');
   } catch {
-    return true;
+    return { decision: 'error' };
   } finally {
     rmSync(lockDir, { recursive: true, force: true });
   }
 
-  return true;
+  return { decision: 'recorded' };
+};
+
+const forgetStartupWake = (dedupeKey: string): void => {
+  const dedupeFile = resolveWakeDedupeFile();
+  if (!dedupeFile) return;
+
+  const lockDir = `${dedupeFile}.lock`;
+  if (!acquireDedupeLock(lockDir)) return;
+
+  try {
+    const existing = readJsonObject(dedupeFile);
+    const entriesRaw = existing?.entries;
+    if (!entriesRaw || typeof entriesRaw !== 'object' || Array.isArray(entriesRaw)) return;
+
+    const nextEntries: Record<string, number> = {};
+    for (const [key, value] of Object.entries(entriesRaw as Record<string, unknown>)) {
+      if (key === dedupeKey) continue;
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+      nextEntries[key] = value;
+    }
+
+    mkdirSync(dirname(dedupeFile), { recursive: true });
+    writeFileSync(dedupeFile, JSON.stringify({ entries: nextEntries }, null, 2), 'utf-8');
+  } catch {
+    return;
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
 };
 
 const resolveOpenclawBinary = () => {
@@ -793,6 +836,14 @@ const runOaa = (args: string[]) => {
   };
 };
 
+const recordHookTelemetry = (eventName: string, note: string) => {
+  if (!hookTelemetryEnabled) return;
+  const eventText = normalizeTelemetryText(eventName, 72).toLowerCase();
+  if (!eventText) return;
+  const noteText = normalizeTelemetryText(note, 240) || 'none';
+  runOaa(['--log-event', '--event', eventText, '--note', noteText]);
+};
+
 const readStatusPayload = (): StatusPayload | null => {
   const status = runOaa(['--status', '--json']);
   if (!status.ok || !status.output) return null;
@@ -874,44 +925,87 @@ const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | 
   };
 };
 
-const startupWakeDedupeKey = (event: any, status: StatusPayload, route: SessionRoute): string => {
+const startupWakeDedupeKey = (status: StatusPayload, route: SessionRoute): string => {
   const startedAt = typeof status.started_at === 'string' ? status.started_at.trim() : '';
-  return ['startup', route.sessionKey, route.sessionId, startedAt].join('|');
+  const sessionStartToken = startedAt || `missing-started-at:${shortFingerprint(status.request)}`;
+  return ['startup', route.sessionKey, route.sessionId, sessionStartToken].join('|');
 };
 
 const queueResumePing = (status: StatusPayload, event: any) => {
+  const eventSessionKey = readEventSessionKey(event);
   const targetAgentId = resolveTargetAgentId(event);
   if (!targetAgentId) {
     console.warn('[omni-recovery] startup wake skipped: unresolved target agent id');
+    recordHookTelemetry(
+      'openclaw.startup.target_unresolved',
+      `event_key=${shortFingerprint(eventSessionKey)}`,
+    );
     return;
   }
 
   const route = resolveSessionRoute(event, targetAgentId);
   if (!route) {
     console.warn('[omni-recovery] startup wake skipped: unresolved session route');
+    recordHookTelemetry(
+      'openclaw.startup.route_unresolved',
+      `agent=${targetAgentId} event_key=${shortFingerprint(eventSessionKey)}`,
+    );
     return;
   }
 
   const latestStatus = readStatusPayload();
   if (!latestStatus?.active || latestStatus.waiting_for_user) {
     console.log('[omni-recovery] startup wake skipped: session no longer active');
+    const reason = !latestStatus?.active ? 'inactive' : 'waiting_for_user';
+    recordHookTelemetry(
+      'openclaw.startup.session_ineligible',
+      `reason=${reason} route=${shortFingerprint(route.sessionKey)}`,
+    );
     return;
   }
 
   if (!requireActiveSession()) {
     console.log('[omni-recovery] startup wake skipped: --require-active failed');
+    recordHookTelemetry(
+      'openclaw.startup.require_active_failed',
+      `route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+    );
     return;
   }
 
-  const dedupeKey = startupWakeDedupeKey(event, latestStatus, route);
-  if (!rememberStartupWake(dedupeKey)) {
+  const effectiveStatus = latestStatus ?? status;
+
+  const dedupeKey = startupWakeDedupeKey(effectiveStatus, route);
+  const dedupe = rememberStartupWake(dedupeKey);
+  if (dedupe.decision === 'duplicate') {
     console.log('[omni-recovery] startup wake skipped: duplicate restart event');
+    recordHookTelemetry(
+      'openclaw.startup.duplicate_skip',
+      `key=${shortFingerprint(dedupeKey)} route=${shortFingerprint(route.sessionKey)}`,
+    );
     return;
   }
 
-  const request = latestStatus.request ?? '(unknown)';
-  const deadline = latestStatus.dynamic ? 'dynamic' : (latestStatus.deadline ?? 'unknown');
-  const reportStatus = latestStatus.report_status ?? 'UNKNOWN';
+  if (dedupe.decision === 'lock-unavailable') {
+    console.warn('[omni-recovery] startup wake skipped: dedupe lock unavailable');
+    recordHookTelemetry(
+      'openclaw.startup.dedupe_lock_unavailable',
+      `key=${shortFingerprint(dedupeKey)} route=${shortFingerprint(route.sessionKey)}`,
+    );
+    return;
+  }
+
+  if (dedupe.decision === 'error') {
+    console.warn('[omni-recovery] startup wake dedupe file unavailable; proceeding with in-memory dedupe only');
+    recordHookTelemetry(
+      'openclaw.startup.dedupe_file_error',
+      `key=${shortFingerprint(dedupeKey)} route=${shortFingerprint(route.sessionKey)}`,
+    );
+  }
+
+  const request = effectiveStatus.request ?? '(unknown)';
+  const deadline = effectiveStatus.dynamic ? 'dynamic' : (effectiveStatus.deadline ?? 'unknown');
+  const reportStatus = effectiveStatus.report_status ?? 'UNKNOWN';
   const requestLine = includeSensitiveContext ? `Request: ${request}` : 'Request: [redacted]';
   const prompt = [
     '[omni] Gateway restarted and an autonomous session is still active.',
@@ -929,17 +1023,44 @@ const queueResumePing = (status: StatusPayload, event: any) => {
     if (route.accountId) args.push('--reply-account', route.accountId);
   }
 
-  console.log(`[omni-recovery] startup wake queued for agent=${targetAgentId} key=${route.sessionKey} session=${route.sessionId}`);
+  console.log(
+    `[omni-recovery] startup wake queued for agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+  );
+  recordHookTelemetry(
+    'openclaw.startup.wake_queued',
+    `agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
+  );
 
-  const child = spawn(openclawBin, args, {
-    detached: true,
-    stdio: 'ignore',
-    env: runtimeEnv,
-  });
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(openclawBin, args, {
+      detached: true,
+      stdio: 'ignore',
+      env: runtimeEnv,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (dedupe.decision === 'recorded') {
+      forgetStartupWake(dedupeKey);
+    }
+    console.error(`[omni-recovery] failed to launch startup wake ping: ${message}`);
+    recordHookTelemetry(
+      'openclaw.startup.spawn_failed',
+      `reason=${normalizeTelemetryText(message, 180)} rollback=1`,
+    );
+    return;
+  }
 
   child.on('error', (error) => {
     const message = error instanceof Error ? error.message : String(error);
+    if (dedupe.decision === 'recorded') {
+      forgetStartupWake(dedupeKey);
+    }
     console.error(`[omni-recovery] failed to launch startup wake ping: ${message}`);
+    recordHookTelemetry(
+      'openclaw.startup.spawn_failed',
+      `reason=${normalizeTelemetryText(message, 180)} rollback=1`,
+    );
   });
 
   child.unref();
@@ -956,6 +1077,7 @@ const handler = async (event: any) => {
     const raw = typeof event.context?.content === 'string' ? event.context.content : '';
     const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
     runOaa(['--user-responded', '--response-note', note]);
+    recordHookTelemetry('openclaw.message.user_responded', `from=${shortFingerprint(from)}`);
     return;
   }
 
@@ -966,6 +1088,10 @@ const handler = async (event: any) => {
   const status = readStatusPayload();
   if (!status) {
     console.warn('[omni-recovery] startup wake skipped: unable to read OAA status');
+    recordHookTelemetry(
+      'openclaw.startup.status_unavailable',
+      `event_key=${shortFingerprint(readEventSessionKey(event))}`,
+    );
     return;
   }
   if (!status.active || status.waiting_for_user) return;

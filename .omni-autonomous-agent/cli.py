@@ -15,6 +15,7 @@ from .session_manager import (
     cmd_dummy,
     cmd_hook_precompact,
     cmd_hook_stop,
+    cmd_log_event,
     cmd_require_active,
     cmd_status,
     cmd_user_responded,
@@ -55,6 +56,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Register that user provided new information during await-user window",
     )
+    group.add_argument(
+        "--log-event",
+        action="store_true",
+        help="Append hook telemetry event details to the active session log",
+    )
     group.add_argument("--dummy", action="store_true", help="Register a test session")
 
     parser.add_argument(
@@ -94,6 +100,18 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NOTE",
         type=str,
         help="Free-form note captured with --user-responded",
+    )
+    parser.add_argument(
+        "--event",
+        metavar="EVENT",
+        type=str,
+        help="Event identifier used with --log-event",
+    )
+    parser.add_argument(
+        "--note",
+        metavar="NOTE",
+        type=str,
+        help="Event note used with --log-event",
     )
     return parser
 
@@ -163,6 +181,7 @@ def main() -> None:
         or args.bootstrap
         or args.await_user
         or args.user_responded
+        or args.log_event
     ):
         maybe_auto_update()
 
@@ -218,6 +237,10 @@ def main() -> None:
 
     if args.user_responded:
         cmd_user_responded(args.response_note or "")
+        return
+
+    if args.log_event:
+        cmd_log_event(args.event or "", args.note or "")
         return
 
     if args.dummy:

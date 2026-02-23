@@ -934,6 +934,40 @@ def cmd_user_responded(response_note: str) -> None:
         )
 
 
+def _normalize_hook_event_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "-", value.strip()).strip("-")
+    if not cleaned:
+        return ""
+    return cleaned.lower()[:72]
+
+
+def _normalize_hook_event_note(value: str) -> str:
+    collapsed = re.sub(r"\s+", " ", value).strip()
+    if len(collapsed) > 240:
+        return collapsed[:240]
+    return collapsed
+
+
+def cmd_log_event(event: str, note: str) -> None:
+    event_name = _normalize_hook_event_name(event)
+    if not event_name:
+        sys.exit("error: --log-event requires --event")
+
+    note_text = _normalize_hook_event_note(note)
+
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error or not state:
+            return
+
+        now = _now()
+        details = [f"Event: {event_name}"]
+        if note_text:
+            details.append(f"Note: {note_text}")
+        _append_log(state, "Hook telemetry", details=details)
+        _append_report_checkpoint(state, f"hook:{event_name}", now)
+
+
 def cmd_require_active() -> None:
     with _state_lock():
         state, state_error = _load_with_error()

@@ -66,6 +66,9 @@ Important behavior:
 - OpenClaw: `~/.openclaw/hooks/omni-recovery/`
   - `HOOK.md` + `handler.ts` managed by bootstrap
   - Bootstrap enables `omni-recovery` and `session-memory`
+  - `omni-recovery` listens to `gateway:startup` and `message:received`
+  - On startup with an active OAA session, it queues a resume ping turn
+  - On inbound messages, it auto-registers user responses when OAA is waiting
 
 Optional path overrides for non-default environments:
 
@@ -237,6 +240,17 @@ Expected:
 - `omni-recovery` ready
 - `session-memory` ready
 
+Optional deep check:
+
+```bash
+openclaw hooks info omni-recovery
+```
+
+Expected events:
+
+- `gateway:startup`
+- `message:received`
+
 ---
 
 ## 8) Kill-switch behavior
@@ -259,4 +273,6 @@ omni-autonomous-agent --cancel
 - If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
 - For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.
 - If you override install destination with `OMNI_AGENT_SYSTEM_BIN`, ensure that path is writable (or creatable) by the installer user.
+- OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
+- Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
 - If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.

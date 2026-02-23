@@ -554,7 +554,9 @@ Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 
 
 def _openclaw_handler_ts() -> str:
-    return """import { spawn, spawnSync } from 'child_process';
+    return """import { existsSync } from 'fs';
+import { delimiter, join } from 'path';
+import { spawn, spawnSync } from 'child_process';
 
 type StatusPayload = {
   active?: boolean;
@@ -568,14 +570,84 @@ type StatusPayload = {
 const STARTUP_WAKE_COOLDOWN_MS = 15_000;
 let lastStartupWakeMs = 0;
 
+const buildRuntimeEnv = () => {
+  const env = { ...process.env };
+  const pathEntries: string[] = [];
+
+  const addEntries = (value: string | undefined) => {
+    if (!value) return;
+    for (const rawEntry of value.split(delimiter)) {
+      const entry = rawEntry.trim();
+      if (entry) pathEntries.push(entry);
+    }
+  };
+
+  addEntries(process.env.PATH);
+
+  const home = process.env.HOME?.trim();
+  if (home) {
+    pathEntries.push(join(home, '.local', 'bin'));
+    pathEntries.push(join(home, '.npm-global', 'bin'));
+    pathEntries.push(join(home, '.pnpm-global', 'bin'));
+  }
+
+  pathEntries.push('/usr/local/bin', '/usr/bin', '/bin');
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of pathEntries) {
+    if (seen.has(entry)) continue;
+    seen.add(entry);
+    deduped.push(entry);
+  }
+
+  env.PATH = deduped.join(delimiter);
+  return env;
+};
+
+const runtimeEnv = buildRuntimeEnv();
+
+const resolveOpenclawBinary = () => {
+  const override = process.env.OMNI_AGENT_OPENCLAW_BIN?.trim();
+  if (override) return override;
+
+  const home = process.env.HOME?.trim();
+  const candidates: string[] = [];
+  if (home) {
+    candidates.push(join(home, '.npm-global', 'bin', 'openclaw'));
+    candidates.push(join(home, '.local', 'bin', 'openclaw'));
+    candidates.push(join(home, '.pnpm-global', 'bin', 'openclaw'));
+  }
+  candidates.push('/usr/local/bin/openclaw', '/usr/bin/openclaw');
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return 'openclaw';
+};
+
+const openclawBin = resolveOpenclawBinary();
+
 const runOaa = (args: string[]) => {
   const result = spawnSync('omni-autonomous-agent', args, {
     stdio: 'pipe',
     encoding: 'utf-8',
+    env: runtimeEnv,
   });
+
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  if (result.error) {
+    const reason = result.error instanceof Error ? result.error.message : String(result.error);
+    return {
+      ok: false,
+      output: [output, reason].filter(Boolean).join('\\n').trim(),
+    };
+  }
+
   return {
     ok: result.status === 0,
-    output: `${result.stdout ?? ''}${result.stderr ?? ''}`.trim(),
+    output,
   };
 };
 
@@ -601,11 +673,17 @@ const queueResumePing = (status: StatusPayload) => {
     `Report status: ${reportStatus}`,
   ].join('\\n');
 
-  const child = spawn('openclaw', ['agent', '--message', prompt], {
+  const child = spawn(openclawBin, ['agent', '--message', prompt], {
     detached: true,
     stdio: 'ignore',
+    env: runtimeEnv,
   });
-  child.on('error', () => {});
+
+  child.on('error', (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[omni-recovery] failed to launch startup wake ping: ${message}`);
+  });
+
   child.unref();
 };
 

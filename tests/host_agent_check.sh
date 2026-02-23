@@ -109,6 +109,14 @@ openclaw_handler = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts'
 if not openclaw_hook_md.exists() or not openclaw_handler.exists():
     raise SystemExit('host-agent-check failed: openclaw omni-recovery hook files missing')
 
+openclaw_handler_text = openclaw_handler.read_text(encoding='utf-8')
+if 'OMNI_AGENT_OPENCLAW_BIN' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_BIN override support')
+if '.npm-global' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
+if 'failed to launch startup wake ping' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake launch error logging')
+
 for wrapper_name in ['omni-wrap-codex', 'omni-wrap-soonagent']:
     wrapper = home / '.local' / 'bin' / wrapper_name
     if not wrapper.exists():

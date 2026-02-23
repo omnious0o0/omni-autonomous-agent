@@ -447,8 +447,11 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             'events: ["gateway:startup", "message:received"]', openclaw_hook_text
         )
         self.assertIn("OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE", openclaw_handler_text)
+        self.assertIn("OMNI_AGENT_OPENCLAW_BIN", openclaw_handler_text)
         self.assertIn("--user-responded", openclaw_handler_text)
-        self.assertIn("openclaw', ['agent', '--message'", openclaw_handler_text)
+        self.assertIn(".npm-global", openclaw_handler_text)
+        self.assertIn("['agent', '--message', prompt]", openclaw_handler_text)
+        self.assertIn("failed to launch startup wake ping", openclaw_handler_text)
         self.assertIn("event.context?.from", openclaw_handler_text)
         self.assertIn("['--status', '--json']", openclaw_handler_text)
         self.assertIn("STARTUP_WAKE_COOLDOWN_MS", openclaw_handler_text)

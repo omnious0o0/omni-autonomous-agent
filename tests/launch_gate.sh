@@ -19,6 +19,7 @@ required_paths=(
   "SKILL.md"
   "README.md"
   "TASK.md"
+  "LICENSE"
   "install-help.md"
   ".gitignore"
   "tests/test_autonomous_agent.py"
@@ -59,7 +60,14 @@ import re
 root = Path(".").resolve()
 files = [
     root / "main.py",
+    root / "README.md",
+    root / "SKILL.md",
+    root / "TASK.md",
+    root / "LICENSE",
     root / "install-help.md",
+    root / ".omni-autonomous-agent" / "templates" / "stop-blocked.md",
+    root / ".omni-autonomous-agent" / "templates" / "precompact-handoff.md",
+    root / ".omni-autonomous-agent" / "templates" / "user-timeout-continue.md",
     root / ".omni-autonomous-agent" / "constants.py",
     root / ".omni-autonomous-agent" / "cli.py",
     root / ".omni-autonomous-agent" / "session_manager.py",

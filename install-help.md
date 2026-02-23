@@ -14,16 +14,22 @@ omni-autonomous-agent --status
 
 Expected result: `No active session.` (or active session details).
 
-If command is missing, run:
+If `omni-autonomous-agent` is already reachable, you can rerun install via CLI:
 
 ```bash
-bash .omni-autonomous-agent/install.sh
+omni-autonomous-agent --install
 ```
 
-On Windows PowerShell, run:
+If `omni-autonomous-agent` is not on PATH yet, run the installer directly (default install location):
+
+```bash
+bash ~/.omni-autonomous-agent/.omni-autonomous-agent/install.sh
+```
+
+On Windows PowerShell (default install location):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\.omni-autonomous-agent\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.omni-autonomous-agent\.omni-autonomous-agent\install.ps1"
 ```
 
 The installer output prints the exact install path and PATH export line.
@@ -59,7 +65,7 @@ Important behavior:
   - `experimental.session.compacting` -> `--hook-precompact`
 - OpenClaw: `~/.openclaw/hooks/omni-recovery/`
   - `HOOK.md` + `handler.ts` managed by bootstrap
-  - bootstrap enables `omni-recovery` and `session-memory`
+  - Bootstrap enables `omni-recovery` and `session-memory`
 
 ### Wrapper-based agents
 
@@ -71,8 +77,8 @@ Bootstrap creates wrappers in a platform-aware bin directory:
 
 Wrapper names:
 
-- Universal wrapper: `omni-agent-wrap`
-- Agent wrappers (when detected): `omni-wrap-<agent>`
+- Universal wrapper: `omni-agent-wrap` (Windows: `omni-agent-wrap.cmd`)
+- Agent wrappers (when detected): `omni-wrap-<agent>` (Windows: `.cmd` suffix)
   - built-in candidates: `codex`, `aider`, `goose`, `plandex`, `amp`, `crush`, `kiro`, `roo`, `cline`
 
 You can force wrappers for future agents:
@@ -96,16 +102,25 @@ They enforce:
    - Runs wrapped agent command
    - Calls `omni-autonomous-agent --hook-stop`
    - If hook exits `2`, wrapper continues looping (no premature stop)
-   - Wrapper exits only when hook allows stop
+   - Wrapper exits with command status when hook exits `0`
+   - Wrapper exits with hook error code for non-`0`/`2` hook failures
 
 Quick preflight check:
 
 ```bash
-~/.local/bin/omni-agent-wrap true
+WRAP_BIN="${OMNI_AGENT_WRAPPER_BIN:-$HOME/.local/bin}"
+"$WRAP_BIN/omni-agent-wrap" true
 ```
 
 Expected (without active session): non-zero and message
 `[omni] no active session. run omni-autonomous-agent --add first.`
+
+On Windows PowerShell:
+
+```powershell
+$wrapBin = if ($env:OMNI_AGENT_WRAPPER_BIN) { $env:OMNI_AGENT_WRAPPER_BIN } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "omni-autonomous-agent\bin" } else { Join-Path $HOME "AppData\Local\omni-autonomous-agent\bin" }
+& (Join-Path $wrapBin "omni-agent-wrap.cmd") --version
+```
 
 ---
 
@@ -163,7 +178,47 @@ Expected:
 
 ---
 
-## 6) OpenClaw verification
+## 6) Await-user window verification (2-minute default)
+
+Open the user-response window:
+
+```bash
+omni-autonomous-agent --await-user -Q "Need constraints confirmation"
+```
+
+Expected:
+
+- JSON payload with `"hook": "await-user"`
+- `"waiting_for_user": true`
+- `"wait_minutes": 2` by default
+
+If user returns, clear the wait window:
+
+```bash
+omni-autonomous-agent --user-responded --response-note "User replied with updated priorities"
+```
+
+Expected:
+
+- JSON payload with `"hook": "user-responded"`
+- `"user_response_registered": true`
+- wait window cleared from state
+
+If user does not respond before deadline, stop hook returns timeout guidance:
+
+```bash
+omni-autonomous-agent --hook-stop
+```
+
+Expected:
+
+- exit code `2`
+- `"user_response_timed_out": true`
+- `"template_id": "user-timeout-continue"`
+
+---
+
+## 7) OpenClaw verification
 
 ```bash
 openclaw hooks list
@@ -176,7 +231,7 @@ Expected:
 
 ---
 
-## 7) Kill-switch behavior
+## 8) Kill-switch behavior
 
 ```bash
 omni-autonomous-agent --cancel
@@ -188,9 +243,10 @@ omni-autonomous-agent --cancel
 
 ---
 
-## 8) Notes for autonomous runs
+## 9) Notes for autonomous runs
 
-- Always register first: `omni-autonomous-agent --add -R "..." -D <minutes|dynamic>`
+- Always register first: `omni-autonomous-agent --add -R "..." [-D <minutes|dynamic>]`
 - Always rely on hook output, not assumptions.
+- Use `--await-user` when you need missing constraints; default window is 2 minutes.
 - If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
 - For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.

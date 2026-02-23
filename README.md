@@ -1,11 +1,16 @@
 # omni-autonomous-agent (OAA)
 
-## install (automatic)
+## Install (Quick & easy)
 
-Send this to your AI agent:
+Just send this to your agent:
 
+```text
+Please install `https://github.com/omnious0o0/omni-autonomous-agent` using the official one-time installer command in SKILL.md. Follow `install-help.md`, do not ask questions or give progress updates, and report back only when everything is fully installed and verified please.
+```
+
+> Manual installation isn't recomended, it's very technical, but if you really want to, use this command and make sure to read `install-help.md` first:
 ```bash
-Please install `https://github.com/omnious0o0/omni-autonomous-agent`. Follow all instructions, do not ask questions or give progress updates, please only report back when everything's fully installed and verified. Make sure to follow `install-help.md`.
+curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.sh | bash
 ```
 
 ## Support
@@ -16,7 +21,7 @@ It takes less than a minute and helps a lot ❤️
 ---
 
 
-**RECOMMENDED:** Check out [commands-wrapper](https://github.com/omnious0o0/commands-wrapper) you and your agent will love it!
+**RECOMMENDED:** Check out [commands-wrapper](https://github.com/omnious0o0/commands-wrapper); you and your agent will love it!
 
 ---
 

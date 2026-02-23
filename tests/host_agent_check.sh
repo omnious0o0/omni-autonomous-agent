@@ -6,8 +6,28 @@ cd "${ROOT_DIR}"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPYCACHEPREFIX="/tmp/omni-pycache"
+export OMNI_AGENT_CONFIG_DIR="/tmp/omni-host-config"
+export OMNI_AGENT_SANDBOX_ROOT="/tmp/omni-host-sandbox"
+export OMNI_AGENT_REPO_ROOT="${ROOT_DIR}"
+export OMNI_AGENT_DISABLE_AUTO_UPDATE=1
 
-OMNI_AGENT_EXTRA_WRAPPERS="codex,soonagent" python3 "main.py" --bootstrap >/tmp/omni-host-bootstrap.txt 2>&1
+rm -rf "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
+mkdir -p "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
+
+CHECK_TIMEOUT="${OMNI_CHECK_TIMEOUT:-120}"
+
+set +e
+OMNI_AGENT_EXTRA_WRAPPERS="codex,soonagent" timeout "${CHECK_TIMEOUT}" python3 "main.py" --bootstrap >/tmp/omni-host-bootstrap.txt 2>&1
+BOOTSTRAP_CODE=$?
+set -e
+if [[ "${BOOTSTRAP_CODE}" -eq 124 ]]; then
+  printf "host-agent-check failed: bootstrap timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+  exit 1
+fi
+if [[ "${BOOTSTRAP_CODE}" -ne 0 ]]; then
+  printf "host-agent-check failed: bootstrap returned %s\n" "${BOOTSTRAP_CODE}" >&2
+  exit 1
+fi
 
 python3 - <<'PY'
 import json
@@ -52,13 +72,27 @@ for wrapper_name in ['omni-wrap-codex', 'omni-wrap-soonagent']:
         raise SystemExit(f'host-agent-check failed: missing wrapper {wrapper}')
 
 wrapper = home / '.local' / 'bin' / 'omni-wrap-codex'
-res = subprocess.run([str(wrapper), '--exit-code', '0'], capture_output=True, text=True, check=False)
+try:
+    res = subprocess.run([str(wrapper), '--exit-code', '0'], capture_output=True, text=True, check=False, timeout=30)
+except subprocess.TimeoutExpired as exc:
+    raise SystemExit(f'host-agent-check failed: codex wrapper preflight timed out after {exc.timeout}s')
 if res.returncode != 3:
     raise SystemExit(f'host-agent-check failed: codex wrapper preflight expected 3 got {res.returncode}')
 PY
 
 if command -v openclaw >/dev/null 2>&1; then
-  hooks_output="$(openclaw hooks list)"
+  set +e
+  hooks_output="$(timeout "${CHECK_TIMEOUT}" openclaw hooks list)"
+  hooks_code=$?
+  set -e
+  if [[ "${hooks_code}" -eq 124 ]]; then
+    printf "host-agent-check failed: openclaw hooks list timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ "${hooks_code}" -ne 0 ]]; then
+    printf "host-agent-check failed: openclaw hooks list returned %s\n" "${hooks_code}" >&2
+    exit 1
+  fi
   printf "%s\n" "${hooks_output}" | grep -q "omni-recovery"
   printf "%s\n" "${hooks_output}" | grep -q "session-memory"
 fi

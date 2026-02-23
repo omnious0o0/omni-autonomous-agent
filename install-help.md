@@ -259,3 +259,4 @@ omni-autonomous-agent --cancel
 - If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
 - For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.
 - If you override install destination with `OMNI_AGENT_SYSTEM_BIN`, ensure that path is writable (or creatable) by the installer user.
+- If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.

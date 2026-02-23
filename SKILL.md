@@ -168,3 +168,4 @@ Be completely honest and transparent.
 - Kill-switch: To cancel a session mid-way (DON'T DO IT WITHOUT A REASON), run `omni-autonomous-agent --cancel`. Stop all work immediately and skip the end-of-session report. Only do this if user explicitly asks/approves.
 - Scope management is your responsibility. If the task is larger than the time budget, prioritize the highest-value work and note what you couldn't finish in your report.
 - Wrapper note: `omni-agent-wrap` and `omni-wrap-*` enforce `--require-active` and `--hook-stop` automatically. Do not replace this with simple EXIT traps.
+- If you find a bug or integration issue, report it at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with reproduction steps.

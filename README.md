@@ -18,6 +18,9 @@ curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/ma
 If you found this project useful, please consider starring the repo and dropping me a follow for more stuff like this :)
 It takes less than a minute and helps a lot ❤️
 
+If you find a bug or unexpected behavior, please report it at:
+https://github.com/omnious0o0/omni-autonomous-agent/issues
+
 ---
 
 

@@ -39,9 +39,21 @@ The installer output prints the exact install path and PATH export line.
 If the CLI is still not found after install, do a direct binary discovery before retrying scripts:
 
 ```bash
-command -v omni-autonomous-agent || true
-ls -la ~/.local/bin/omni-autonomous-agent 2>/dev/null || true
-ls -la ~/.omni-autonomous-agent/bin/omni-autonomous-agent 2>/dev/null || true
+if command -v omni-autonomous-agent >/dev/null 2>&1; then
+  command -v omni-autonomous-agent
+else
+  echo "omni-autonomous-agent not on PATH"
+fi
+if [ -e ~/.local/bin/omni-autonomous-agent ]; then
+  ls -la ~/.local/bin/omni-autonomous-agent
+else
+  echo "missing: ~/.local/bin/omni-autonomous-agent"
+fi
+if [ -e ~/.omni-autonomous-agent/bin/omni-autonomous-agent ]; then
+  ls -la ~/.omni-autonomous-agent/bin/omni-autonomous-agent
+else
+  echo "missing: ~/.omni-autonomous-agent/bin/omni-autonomous-agent"
+fi
 python3 -c 'import os; print(os.environ.get("PATH", ""))'
 ```
 
@@ -321,8 +333,10 @@ omni-autonomous-agent --cancel
 - If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
 - For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.
 - If you override install destination with `OMNI_AGENT_SYSTEM_BIN`, ensure that path is writable (or creatable) by the installer user.
+- Use `OMNI_AGENT_BOOTSTRAP_TIMEOUT=<seconds>` to bound installer bootstrap runtime (default: `120`).
 - OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
 - Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
+- Hook/template payloads redact request/path text by default. Set `OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT=1` only when detailed context is explicitly required.
 - If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.
 
 ---

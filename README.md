@@ -2,9 +2,35 @@
 
 ![OAA](https://i.imgur.com/eEAbxoy.png)
 
+## What it does
+
+Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. (e.g., "Work overnight," "work on this for 2 hours," "keep working on this until this's done," etc.). Basically any task that could take longer than usual. (3+ minutes)
+
+Your agent gets its own workspace where it can log its memory, reasoning, plans, timestamps of what it's doing, make its own tools and helpers, etc.
+
+Your agent won't stop until one of the conditions are met based on the task you gave it:
+- Time's up
+- Task is done
+- You manually stop it (e.g. "keep doing chores until I stop you")
+
+Otherwise it won't stop. Even if it goes offline, it will immediately resume when it comes back online.
+And none of the "I will now do..." and end up doing nothing. That's fixed too.
+
+Don't worry about setup, your agent takes care of it. All you have to do is send it this:
+```text
+Please install `https://github.com/omnious0o0/omni-autonomous-agent`. Follow all instructions, do not ask questions or give progress updates, please only report back when everything's fully installed and verified. Make sure to follow `install-help.md`.
+```
 ## Install
 
-Install with the official one-time command:
+### Quick & easy
+Send this to your AI agent:
+
+```text
+Please install `https://github.com/omnious0o0/omni-autonomous-agent`. Follow all instructions, do not ask questions or give progress updates, please only report back when everything's fully installed and verified. Make sure to follow `install-help.md`.
+```
+
+### Manual (not recommended)
+Use this:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.sh | bash
@@ -14,13 +40,6 @@ After install:
 
 1. Run `omni-autonomous-agent --status`
 2. Follow `install-help.md` self-check steps
-
-## What it does
-
-- Registers and tracks autonomous sessions
-- Enforces stop gating to prevent premature termination
-- Maintains autonomous handoff/checkpoint hooks
-- Configures supported agent integrations with `--bootstrap`
 
 ## Support
 

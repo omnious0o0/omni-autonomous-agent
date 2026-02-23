@@ -102,7 +102,7 @@ Then verify each agent config path directly (examples are below).
   - `HOOK.md` + `handler.ts` managed by bootstrap
   - Bootstrap enables `omni-recovery` and attempts `session-memory` (warning-only on failure)
   - `omni-recovery` listens to `gateway:startup` and `message:received`
-  - On startup with an active OAA session, it queues a resume ping turn
+  - On startup with an active OAA session, it resolves the exact OpenClaw session route and queues a resume ping to that same conversation
   - On inbound messages, it auto-registers user responses when OAA is waiting
 
 Optional path overrides for non-default environments:
@@ -336,6 +336,11 @@ omni-autonomous-agent --cancel
 - Use `OMNI_AGENT_BOOTSTRAP_TIMEOUT=<seconds>` to bound installer bootstrap runtime (default: `120`).
 - OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
 - Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
+- Set `OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS=<milliseconds>` to tune restart wake dedupe TTL (default: `60000`).
+- Set `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` to disable immediate channel delivery for startup wakes.
+- Set `OMNI_AGENT_OAA_BIN=/absolute/path/to/omni-autonomous-agent` if gateway hook PATH resolution cannot find the OAA launcher.
+- Set `OMNI_AGENT_OPENCLAW_SESSION_KEY=<key>` only for controlled debugging when session key routing must be forced.
+- Set `OMNI_AGENT_OPENCLAW_SESSION_ID=<id>` only for controlled debugging when you must override session route resolution.
 - Hook/template payloads redact request/path text by default. Set `OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT=1` only when detailed context is explicitly required.
 - If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.
 

@@ -316,6 +316,9 @@ if errorlevel 1 (
 )
 
 :loop
+omni-autonomous-agent --require-active >nul 2>&1
+if errorlevel 1 exit /b 0
+
 %*
 set CMD_STATUS=%ERRORLEVEL%
 
@@ -325,6 +328,12 @@ set HOOK_STATUS=%ERRORLEVEL%
 set OMNI_AGENT_HOOK_WRAPPER=
 
 if "%HOOK_STATUS%"=="2" goto loop
+if "%HOOK_STATUS%"=="5" (
+  timeout /t 30 /nobreak >nul
+  omni-autonomous-agent --require-active >nul 2>&1
+  if errorlevel 1 exit /b %CMD_STATUS%
+  goto loop
+)
 if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%
 if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%
 
@@ -341,6 +350,10 @@ if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
 fi
 
 while true; do
+  if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
+    exit 0
+  fi
+
   set +e
   "$@"
   cmd_status=$?
@@ -354,6 +367,17 @@ while true; do
   if [[ "$hook_status" -eq 2 ]]; then
     if [[ -n "$hook_output" ]]; then
       printf '%s\n' "$hook_output" >&2
+    fi
+    continue
+  fi
+
+  if [[ "$hook_status" -eq 5 ]]; then
+    if [[ -n "$hook_output" ]]; then
+      printf '%s\n' "$hook_output" >&2
+    fi
+    sleep 30
+    if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
+      exit "$cmd_status"
     fi
     continue
   fi
@@ -391,6 +415,9 @@ def _specific_wrapper_script(agent_command: str) -> str:
             ")\n"
             "\n"
             ":loop\n"
+            "omni-autonomous-agent --require-active >nul 2>&1\n"
+            "if errorlevel 1 exit /b 0\n"
+            "\n"
             f"{agent_command} %*\n"
             "set CMD_STATUS=%ERRORLEVEL%\n"
             "\n"
@@ -400,6 +427,12 @@ def _specific_wrapper_script(agent_command: str) -> str:
             "set OMNI_AGENT_HOOK_WRAPPER=\n"
             "\n"
             'if "%HOOK_STATUS%"=="2" goto loop\n'
+            'if "%HOOK_STATUS%"=="5" (\n'
+            "  timeout /t 30 /nobreak >nul\n"
+            "  omni-autonomous-agent --require-active >nul 2>&1\n"
+            "  if errorlevel 1 exit /b %CMD_STATUS%\n"
+            "  goto loop\n"
+            ")\n"
             'if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%\n'
             'if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%\n'
             "\n"
@@ -417,6 +450,10 @@ def _specific_wrapper_script(agent_command: str) -> str:
         "fi\n"
         "\n"
         "while true; do\n"
+        "  if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
+        "    exit 0\n"
+        "  fi\n"
+        "\n"
         "  set +e\n"
         f'  {agent_command} "$@"\n'
         "  cmd_status=$?\n"
@@ -430,6 +467,17 @@ def _specific_wrapper_script(agent_command: str) -> str:
         '  if [[ "$hook_status" -eq 2 ]]; then\n'
         '    if [[ -n "$hook_output" ]]; then\n'
         '      printf "%s\\n" "$hook_output" >&2\n'
+        "    fi\n"
+        "    continue\n"
+        "  fi\n"
+        "\n"
+        '  if [[ "$hook_status" -eq 5 ]]; then\n'
+        '    if [[ -n "$hook_output" ]]; then\n'
+        '      printf "%s\\n" "$hook_output" >&2\n'
+        "    fi\n"
+        "    sleep 30\n"
+        "    if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
+        '      exit "$cmd_status"\n'
         "    fi\n"
         "    continue\n"
         "  fi\n"
@@ -534,7 +582,7 @@ metadata:
 Runs Omni Autonomous Agent recovery flows for OpenClaw events:
 
 - On `gateway:startup`: if an OAA session is active, queue a resume ping turn.
-- On `message:received`: if OAA is waiting for user response, auto-register response.
+- On `message:received`: process cancellation decisions (`...` accept, `..` deny) and auto-register await-user responses.
 
 Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 """
@@ -549,6 +597,7 @@ import { spawn, spawnSync } from 'child_process';
 type StatusPayload = {
   active?: boolean;
   waiting_for_user?: boolean;
+  cancel_request_state?: string;
   request?: string;
   dynamic?: boolean;
   deadline?: string | null;
@@ -574,6 +623,21 @@ const includeSensitiveContext = process.env.OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT
 const deliverStartupWake = process.env.OMNI_AGENT_OPENCLAW_WAKE_DELIVER !== '0';
 const hookTelemetryEnabled = process.env.OMNI_AGENT_HOOK_TELEMETRY !== '0';
 
+const parseAllowedSenders = (raw: string | undefined): Set<string> => {
+  const allowed = new Set<string>();
+  const source = (raw ?? '').trim();
+  if (!source) return allowed;
+  for (const token of source.split(',')) {
+    const value = token.trim().toLowerCase();
+    if (value) allowed.add(value);
+  }
+  return allowed;
+};
+
+const cancelAllowedSenders = parseAllowedSenders(
+  process.env.OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS,
+);
+
 const parsePositiveInt = (raw: string | undefined, fallback: number): number => {
   const value = Number.parseInt((raw ?? '').trim(), 10);
   if (Number.isFinite(value) && value > 0) return value;
@@ -587,6 +651,33 @@ const shortFingerprint = (raw: string | undefined): string => {
   const value = (raw ?? '').trim();
   if (!value) return 'none';
   return createHash('sha256').update(value).digest('hex').slice(0, 12);
+};
+
+const CANCEL_ACCEPT_TOKENS = new Set([
+  '...',
+  '/accept-cancel',
+  '/cancel-accept',
+  'accept cancel',
+  'approve cancel',
+]);
+
+const CANCEL_DENY_TOKENS = new Set([
+  '..',
+  '/deny-cancel',
+  '/cancel-deny',
+  'deny cancel',
+  'reject cancel',
+]);
+
+const normalizeInboundMessage = (raw: string): string =>
+  raw.replace(/\\s+/g, ' ').trim().toLowerCase();
+
+const parseCancelDecision = (raw: string): 'accept' | 'deny' | null => {
+  const normalized = normalizeInboundMessage(raw);
+  if (!normalized) return null;
+  if (CANCEL_ACCEPT_TOKENS.has(normalized)) return 'accept';
+  if (CANCEL_DENY_TOKENS.has(normalized)) return 'deny';
+  return null;
 };
 
 const STARTUP_WAKE_PERSISTED_DEDUPE_MS = parsePositiveInt(
@@ -925,6 +1016,36 @@ const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | 
   };
 };
 
+const readEventAccountId = (event: any): string =>
+  typeof event?.context?.accountId === 'string' ? event.context.accountId.trim() : '';
+
+const senderAuthorizedForCancelDecision = (event: any, from: string): boolean => {
+  const normalizedFrom = from.trim().toLowerCase();
+  if (!normalizedFrom) return false;
+
+  if (cancelAllowedSenders.size > 0) {
+    return cancelAllowedSenders.has(normalizedFrom);
+  }
+
+  const targetAgentId = resolveTargetAgentId(event);
+  if (!targetAgentId) return false;
+  const route = resolveSessionRoute(event, targetAgentId);
+  if (!route) return false;
+
+  if (route.to && route.to.trim().toLowerCase() !== normalizedFrom) {
+    return false;
+  }
+
+  if (route.accountId) {
+    const eventAccountId = readEventAccountId(event);
+    if (!eventAccountId || route.accountId.trim() !== eventAccountId) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
 const startupWakeDedupeKey = (status: StatusPayload, route: SessionRoute): string => {
   const startedAt = typeof status.started_at === 'string' ? status.started_at.trim() : '';
   const sessionStartToken = startedAt || `missing-started-at:${shortFingerprint(status.request)}`;
@@ -1072,10 +1193,36 @@ const handler = async (event: any) => {
     if (!from || from.toLowerCase() === 'system') return;
 
     const status = readStatusPayload();
-    if (!status?.active || !status.waiting_for_user) return;
-
     const raw = typeof event.context?.content === 'string' ? event.context.content : '';
     const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
+
+    if (!status?.active) return;
+
+    if (status.cancel_request_state === 'pending') {
+      const decision = parseCancelDecision(raw);
+      if (decision) {
+        if (!senderAuthorizedForCancelDecision(event, from)) {
+          recordHookTelemetry(
+            'openclaw.message.cancel_decision_unauthorized',
+            `from=${shortFingerprint(from)} account=${shortFingerprint(readEventAccountId(event))}`,
+          );
+          return;
+        }
+
+        if (decision === 'accept') {
+          runOaa(['--cancel-accept', '--decision-note', note]);
+          recordHookTelemetry('openclaw.message.cancel_accept', `from=${shortFingerprint(from)}`);
+          return;
+        }
+
+        runOaa(['--cancel-deny', '--decision-note', note]);
+        recordHookTelemetry('openclaw.message.cancel_deny', `from=${shortFingerprint(from)}`);
+        return;
+      }
+    }
+
+    if (!status.waiting_for_user) return;
+
     runOaa(['--user-responded', '--response-note', note]);
     recordHookTelemetry('openclaw.message.user_responded', `from=${shortFingerprint(from)}`);
     return;

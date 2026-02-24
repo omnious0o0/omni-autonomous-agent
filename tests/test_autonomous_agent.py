@@ -165,8 +165,12 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertFalse(bool(active_payload.get("dynamic")))
         self.assertEqual(active_payload.get("request"), "fixed lifecycle")
 
-        cancel = _run_cli(["--cancel"], self.env)
-        self.assertEqual(cancel.returncode, 0)
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+        self.assertTrue(self._state_file().exists())
+
+        cancel_accept = _run_cli(["--cancel-accept"], self.env)
+        self.assertEqual(cancel_accept.returncode, 0)
         self.assertFalse(self._state_file().exists())
 
         archived_dir = self.sandbox_root / "archived"
@@ -200,6 +204,96 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         stop_payload = _json_output(stop_late)
         self.assertFalse(bool(stop_payload.get("continue")))
         self.assertFalse(self._state_file().exists())
+
+    def test_cancel_request_requires_user_decision_and_pause_window(self) -> None:
+        added = _run_cli(["--add", "-R", "cancel handshake"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+        self.assertIn("Cancellation request sent", cancel_request.stdout)
+
+        state = self._read_state()
+        self.assertEqual(state.get("cancel_request_state"), "pending")
+        self.assertIsInstance(state.get("cancel_pause_until"), str)
+
+        wrapper_env = self.env.copy()
+        wrapper_env["OMNI_AGENT_HOOK_WRAPPER"] = "1"
+        stop_in_pause = _run_cli(["--hook-stop"], wrapper_env)
+        self.assertEqual(stop_in_pause.returncode, 5)
+        pause_payload = _json_output(stop_in_pause)
+        self.assertTrue(bool(pause_payload.get("cancel_request_pending")))
+        self.assertTrue(bool(pause_payload.get("waiting_for_cancel_decision")))
+        self.assertEqual(pause_payload.get("pause_then_resume_seconds"), 30)
+
+        state = self._read_state()
+        state["cancel_requested_at"] = "1999-12-31T00:00:00+00:00"
+        state["cancel_pause_until"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        stop_after_pause = _run_cli(["--hook-stop"], wrapper_env)
+        self.assertEqual(stop_after_pause.returncode, 2)
+        post_pause_payload = _json_output(stop_after_pause)
+        self.assertTrue(bool(post_pause_payload.get("cancel_request_pending")))
+        self.assertTrue(bool(post_pause_payload.get("cancel_pause_elapsed")))
+        self.assertTrue(bool(post_pause_payload.get("waiting_for_cancel_decision")))
+
+    def test_cancel_deny_blocks_until_normal_stop_conditions_met(self) -> None:
+        added = _run_cli(["--add", "-R", "cancel denied"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+
+        cancel_deny = _run_cli(
+            ["--cancel-deny", "--decision-note", "user wants progress to continue"],
+            self.env,
+        )
+        self.assertEqual(cancel_deny.returncode, 0)
+        deny_payload = _json_output(cancel_deny)
+        self.assertTrue(bool(deny_payload.get("cancellation_denied")))
+
+        stop_blocked = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop_blocked.returncode, 2)
+        blocked_payload = _json_output(stop_blocked)
+        self.assertTrue(bool(blocked_payload.get("cancel_request_denied")))
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        status_payload = json.loads(status_json.stdout)
+        denied_note = str(status_payload.get("cancel_denied_note", ""))
+        self.assertTrue(denied_note.startswith("[decision:"))
+        self.assertNotIn("user wants progress to continue", denied_note)
+
+        state = self._read_state()
+        report_path = Path(str(state["sandbox_dir"])) / "REPORT.md"
+        report_text = report_path.read_text(encoding="utf-8")
+        report_path.write_text(
+            report_text.replace("IN_PROGRESS", "COMPLETE", 1),
+            encoding="utf-8",
+        )
+
+        stop_allowed = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop_allowed.returncode, 0)
+        self.assertFalse(self._state_file().exists())
+
+    def test_cancel_accept_immediately_closes_session(self) -> None:
+        added = _run_cli(["--add", "-R", "cancel accepted"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+
+        cancel_accept = _run_cli(
+            ["--cancel-accept", "--decision-note", "approved by user"],
+            self.env,
+        )
+        self.assertEqual(cancel_accept.returncode, 0)
+        self.assertFalse(self._state_file().exists())
+
+        archived_dir = self.sandbox_root / "archived"
+        self.assertTrue(archived_dir.exists())
+        self.assertTrue(any(archived_dir.iterdir()))
 
     def test_await_user_window_times_out_to_autonomous_continue(self) -> None:
         added = _run_cli(["--add", "-R", "await-user"], self.env)
@@ -526,6 +620,8 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         openclaw_hook_text = openclaw_hook.read_text(encoding="utf-8")
         openclaw_handler_text = openclaw_handler.read_text(encoding="utf-8")
         opencode_plugin_text = opencode_plugin.read_text(encoding="utf-8")
+        universal_wrapper_text = universal_wrapper.read_text(encoding="utf-8")
+        codex_wrapper_text = codex_wrapper.read_text(encoding="utf-8")
         self.assertIn(
             'events: ["gateway:startup", "message:received"]', openclaw_hook_text
         )
@@ -539,6 +635,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("OMNI_AGENT_HOOK_TELEMETRY", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_KEY", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_SESSION_ID", openclaw_handler_text)
+        self.assertIn(
+            "OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS", openclaw_handler_text
+        )
         self.assertIn("--log-event", openclaw_handler_text)
         self.assertIn("--event", openclaw_handler_text)
         self.assertIn("--note", openclaw_handler_text)
@@ -547,6 +646,16 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             openclaw_handler_text,
         )
         self.assertIn("--user-responded", openclaw_handler_text)
+        self.assertIn("--cancel-accept", openclaw_handler_text)
+        self.assertIn("--cancel-deny", openclaw_handler_text)
+        self.assertIn("CANCEL_ACCEPT_TOKENS", openclaw_handler_text)
+        self.assertIn("CANCEL_DENY_TOKENS", openclaw_handler_text)
+        self.assertIn("senderAuthorizedForCancelDecision", openclaw_handler_text)
+        self.assertIn("cancel_decision_unauthorized", openclaw_handler_text)
+        self.assertIn("readEventAccountId", openclaw_handler_text)
+        self.assertIn(
+            "status.cancel_request_state === 'pending'", openclaw_handler_text
+        )
         self.assertIn(".npm-global", openclaw_handler_text)
         self.assertIn(
             "['agent', '--agent', targetAgentId, '--session-id', route.sessionId, '--message', prompt]",
@@ -576,6 +685,22 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("STARTUP_WAKE_COOLDOWN_MS", openclaw_handler_text)
         self.assertIn('runHook(["--hook-stop"])', opencode_plugin_text)
         self.assertIn('runHook(["--hook-precompact"])', opencode_plugin_text)
+        self.assertIn('if [[ "$hook_status" -eq 5 ]]', universal_wrapper_text)
+        self.assertIn("sleep 30", universal_wrapper_text)
+        self.assertGreaterEqual(
+            universal_wrapper_text.count(
+                "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then"
+            ),
+            2,
+        )
+        self.assertIn('if [[ "$hook_status" -eq 5 ]]', codex_wrapper_text)
+        self.assertIn("sleep 30", codex_wrapper_text)
+        self.assertGreaterEqual(
+            codex_wrapper_text.count(
+                "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then"
+            ),
+            2,
+        )
         self.assertNotIn(
             'console.error("[omni] hook-stop blocked idle:"', opencode_plugin_text
         )

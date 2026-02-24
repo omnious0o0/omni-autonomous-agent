@@ -40,6 +40,13 @@ from .constants import (
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
+def _resolve_template_dir() -> Path:
+    override = os.environ.get("OMNI_AGENT_TEMPLATE_DIR", "").strip()
+    if not override:
+        return TEMPLATE_DIR
+    return Path(override).expanduser()
+
+
 class _SafeFormatMap(UserDict[str, str]):
     def __missing__(self, key: str) -> str:
         return ""
@@ -128,7 +135,7 @@ def _render_template_text(raw: str, context: dict[str, str]) -> str:
 
 
 def render_template(template_id: str, context: dict[str, str]) -> str:
-    template_path = TEMPLATE_DIR / f"{template_id}.md"
+    template_path = _resolve_template_dir() / f"{template_id}.md"
     if template_path.exists():
         raw = template_path.read_text(encoding="utf-8")
     else:

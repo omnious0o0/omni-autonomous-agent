@@ -224,6 +224,17 @@ Expected:
 - JSON payload
 - checkpoint appended to `REPORT.md`
 
+### Hook telemetry quick check
+
+```bash
+omni-autonomous-agent --log-event --event verification.hook --note "install-help validation"
+```
+
+Expected:
+
+- `LOG.md` gets a `Hook telemetry` entry
+- `REPORT.md` gets a `Checkpoint (hook:verification.hook)` entry
+
 ### Mark report complete and allow stop
 
 Set `### 🚦 Status` to `COMPLETE` (or `PARTIAL`) in sandbox `REPORT.md`, then run:
@@ -336,6 +347,7 @@ omni-autonomous-agent --cancel
 - Use `OMNI_AGENT_BOOTSTRAP_TIMEOUT=<seconds>` to bound installer bootstrap runtime (default: `120`).
 - OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
 - Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
+- Set `OMNI_AGENT_HOOK_TELEMETRY=0` to disable hook telemetry checkpoints in OAA `LOG.md` and `REPORT.md`.
 - Set `OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS=<milliseconds>` to tune restart wake dedupe TTL (default: `60000`).
 - Set `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` to disable immediate channel delivery for startup wakes.
 - Set `OMNI_AGENT_OAA_BIN=/absolute/path/to/omni-autonomous-agent` if gateway hook PATH resolution cannot find the OAA launcher.

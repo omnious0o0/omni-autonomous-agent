@@ -106,7 +106,25 @@ def _fallback_template(template_id: str) -> str:
             "Log: {log_path}\n"
         )
 
+    if template_id == "user-timeout-continue":
+        return (
+            "[OAA USER RESPONSE TIMEOUT]\n"
+            "No user response arrived within the configured waiting window.\n"
+            "Request: {request}\n"
+            "Time remaining: {time_remaining}\n"
+            "Report status: {report_status}\n"
+            "Sandbox: {sandbox_dir}\n"
+            "Proceed with autonomous defaults and keep working until stop conditions are truly satisfied.\n"
+        )
+
     return ""
+
+
+def _render_template_text(raw: str, context: dict[str, str]) -> str:
+    try:
+        return raw.format_map(_SafeFormatMap(context))
+    except ValueError:
+        return ""
 
 
 def render_template(template_id: str, context: dict[str, str]) -> str:
@@ -115,7 +133,18 @@ def render_template(template_id: str, context: dict[str, str]) -> str:
         raw = template_path.read_text(encoding="utf-8")
     else:
         raw = _fallback_template(template_id)
-    return raw.format_map(_SafeFormatMap(context))
+
+    rendered = _render_template_text(raw, context)
+    if rendered.strip():
+        return rendered
+
+    fallback_raw = _fallback_template(template_id)
+    if fallback_raw and fallback_raw != raw:
+        fallback_rendered = _render_template_text(fallback_raw, context)
+        if fallback_rendered.strip():
+            return fallback_rendered
+
+    return rendered
 
 
 def _now() -> datetime:

@@ -240,6 +240,67 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotIn("await_user_deadline", state_after)
         self.assertNotIn("await_user_question", state_after)
 
+    def test_await_user_timeout_uses_fallback_when_template_missing(self) -> None:
+        template_path = (
+            PROJECT_ROOT
+            / ".omni-autonomous-agent"
+            / "templates"
+            / "user-timeout-continue.md"
+        )
+        original_template = template_path.read_text(encoding="utf-8")
+        template_path.unlink()
+
+        try:
+            added = _run_cli(["--add", "-R", "await-user-fallback"], self.env)
+            self.assertEqual(added.returncode, 0)
+
+            waiting = _run_cli(
+                ["--await-user", "-Q", "Need input", "--wait-minutes", "1"],
+                self.env,
+            )
+            self.assertEqual(waiting.returncode, 0)
+
+            state = self._read_state()
+            state["await_user_started_at"] = "1999-12-31T00:00:00+00:00"
+            state["await_user_deadline"] = "2000-01-01T00:00:00+00:00"
+            self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+            timeout = _run_cli(["--hook-stop"], self.env)
+            self.assertEqual(timeout.returncode, 2)
+            timeout_payload = _json_output(timeout)
+            self.assertEqual(
+                timeout_payload.get("template_id"), "user-timeout-continue"
+            )
+            template_text = str(timeout_payload.get("template", ""))
+            self.assertIn("OAA USER RESPONSE TIMEOUT", template_text)
+            self.assertIn("Proceed with autonomous defaults", template_text)
+        finally:
+            template_path.write_text(original_template, encoding="utf-8")
+
+    def test_stop_hook_uses_fallback_when_template_format_is_invalid(self) -> None:
+        template_path = (
+            PROJECT_ROOT / ".omni-autonomous-agent" / "templates" / "stop-blocked.md"
+        )
+        original_template = template_path.read_text(encoding="utf-8")
+        template_path.write_text(
+            "[OAA STOP BLOCK]\nBroken template {\n", encoding="utf-8"
+        )
+
+        try:
+            added = _run_cli(["--add", "-R", "invalid-template-fallback"], self.env)
+            self.assertEqual(added.returncode, 0)
+
+            stop = _run_cli(["--hook-stop"], self.env)
+            self.assertEqual(stop.returncode, 2)
+            stop_payload = _json_output(stop)
+            self.assertEqual(stop_payload.get("template_id"), "stop-blocked")
+
+            template_text = str(stop_payload.get("template", ""))
+            self.assertIn("Do not stop", template_text)
+            self.assertIn("Continue autonomous execution now", template_text)
+        finally:
+            template_path.write_text(original_template, encoding="utf-8")
+
     def test_await_user_default_wait_is_two_minutes(self) -> None:
         added = _run_cli(["--add", "-R", "await-user-default"], self.env)
         self.assertEqual(added.returncode, 0)

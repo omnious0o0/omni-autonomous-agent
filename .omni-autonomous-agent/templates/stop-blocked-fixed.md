@@ -11,4 +11,6 @@ Sandbox: {sandbox_dir}
 Policy:
 - Keep working without interruption.
 - Prioritize measurable progress before the fixed deadline.
+- Keep `REPORT.md` status accurate while work is in progress.
+- If user input is missing, continue with the safest assumptions and log them.
 - Re-attempt stop only after the fixed deadline is reached.

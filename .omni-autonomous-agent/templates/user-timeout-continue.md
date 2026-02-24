@@ -11,4 +11,5 @@ Sandbox: {sandbox_dir}
 Proceed with autonomous defaults:
 - Continue execution without waiting.
 - Use the best safe assumptions from existing context.
+- Record those assumptions in `REPORT.md` and `LOG.md`.
 - Keep working until stop conditions are truly satisfied.

@@ -4,17 +4,17 @@
 
 ## What it does
 
-Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. (e.g., "Work overnight," "work on this for 2 hours," "keep working on this until this's done," etc.). Basically any task that could take longer than usual. (3+ minutes)
+Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. (e.g., "Work overnight," "work on this for 2 hours," "keep working on this until it's done," etc.). Basically any task that could take longer than usual. (3+ minutes)
 
 Your agent gets its own workspace where it can log its memory, reasoning, plans, timestamps of what it's doing, make its own tools and helpers, etc.
 
-Your agent won't stop until one of the conditions are met based on the task you gave it:
+Your agent won't stop until one of the conditions is met based on the task you gave it:
 - Time's up
 - Task is done
 - You manually stop it (e.g. "keep doing chores until I stop you")
 
 Otherwise it won't stop. Even if it goes offline, it will immediately resume when it comes back online.
-And none of the "I will now do..." and end up doing nothing. That's fixed too.
+And none of the "I will now do..." and then doing nothing. That's fixed too.
 
 Don't worry about setup, your agent takes care of it. All you have to do is send it this:
 ```text

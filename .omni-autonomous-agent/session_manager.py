@@ -38,6 +38,8 @@ from .constants import (
 
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+CANCEL_ACCEPT_TOKEN = "..."
+CANCEL_DENY_TOKEN = ".."
 
 
 def _resolve_template_dir() -> Path:
@@ -306,6 +308,56 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
         if await_question is not None and not isinstance(await_question, str):
             return False
 
+    cancel_state = state.get("cancel_request_state")
+    cancel_requested_at = state.get("cancel_requested_at")
+    cancel_pause_until = state.get("cancel_pause_until")
+    cancel_denied_at = state.get("cancel_denied_at")
+    cancel_denied_note = state.get("cancel_denied_note")
+
+    cancel_fields_present = any(
+        value is not None
+        for value in (
+            cancel_state,
+            cancel_requested_at,
+            cancel_pause_until,
+            cancel_denied_at,
+            cancel_denied_note,
+        )
+    )
+
+    if cancel_fields_present:
+        if cancel_state not in {"pending", "denied"}:
+            return False
+        requested_dt = _parse_iso_datetime(cancel_requested_at)
+        if requested_dt is None:
+            return False
+
+        pause_dt = None
+        if cancel_pause_until is not None:
+            pause_dt = _parse_iso_datetime(cancel_pause_until)
+            if pause_dt is None:
+                return False
+
+        if cancel_state == "pending":
+            if pause_dt is None:
+                return False
+            if pause_dt < requested_dt:
+                return False
+            if cancel_denied_at is not None:
+                return False
+            if cancel_denied_note is not None:
+                return False
+        else:
+            denied_dt = _parse_iso_datetime(cancel_denied_at)
+            if denied_dt is None:
+                return False
+            if denied_dt < requested_dt:
+                return False
+            if cancel_denied_note is not None and not isinstance(
+                cancel_denied_note, str
+            ):
+                return False
+
     return True
 
 
@@ -523,6 +575,65 @@ def _await_user_deadline(state: dict[str, Any]) -> datetime | None:
     return _parse_iso_datetime(state.get("await_user_deadline"))
 
 
+def _cancel_pause_seconds() -> int:
+    return 30
+
+
+def _clear_cancel_request_fields(state: dict[str, Any]) -> None:
+    state.pop("cancel_request_state", None)
+    state.pop("cancel_requested_at", None)
+    state.pop("cancel_pause_until", None)
+    state.pop("cancel_denied_at", None)
+    state.pop("cancel_denied_note", None)
+
+
+def _cancel_request_state(state: dict[str, Any]) -> str | None:
+    raw = state.get("cancel_request_state")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"pending", "denied"}:
+        return normalized
+    return None
+
+
+def _cancel_pause_deadline(state: dict[str, Any]) -> datetime | None:
+    return _parse_iso_datetime(state.get("cancel_pause_until"))
+
+
+def _stop_should_block(snapshot: dict[str, Any], report_status: str) -> bool:
+    if snapshot["dynamic"]:
+        return report_status not in {"COMPLETE", "PARTIAL"}
+    return bool(snapshot["remaining_seconds"] and snapshot["remaining_seconds"] > 0)
+
+
+def _cancel_instruction_text() -> str:
+    return (
+        f"Reply {CANCEL_ACCEPT_TOKEN!r} to accept cancellation or {CANCEL_DENY_TOKEN!r} to deny. "
+        "CLI fallback: --cancel-accept / --cancel-deny."
+    )
+
+
+def _sanitize_decision_note(note: str) -> str:
+    cleaned = note.strip()
+    if not cleaned:
+        return ""
+    if _include_sensitive_context():
+        return cleaned
+    return _display_sensitive_text(cleaned, label="decision")
+
+
+def _decision_note_for_output(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    if re.fullmatch(r"\[decision:[0-9a-f]{12}\]", cleaned):
+        return cleaned
+    return _display_sensitive_text(cleaned, label="decision")
+
+
 def _in_wrapper_hook_mode() -> bool:
     raw = os.environ.get("OMNI_AGENT_HOOK_WRAPPER", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -531,6 +642,12 @@ def _in_wrapper_hook_mode() -> bool:
 def _blocked_stop_exit_code(*, retry_immediately: bool) -> int:
     if _in_wrapper_hook_mode() and not retry_immediately:
         return 4
+    return 2
+
+
+def _pause_then_resume_exit_code() -> int:
+    if _in_wrapper_hook_mode():
+        return 5
     return 2
 
 
@@ -1062,6 +1179,15 @@ def _status_json_payload(
     waiting_for_user = bool(await_deadline is not None and now < await_deadline)
     report_status = _read_report_status(state)
     closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
+    cancel_state = _cancel_request_state(state) or "none"
+    cancel_requested_at = _parse_iso_datetime(state.get("cancel_requested_at"))
+    cancel_pause_until = _cancel_pause_deadline(state)
+    cancel_denied_at = _parse_iso_datetime(state.get("cancel_denied_at"))
+    cancel_pause_remaining_seconds: float | None = None
+    if cancel_state == "pending" and cancel_pause_until is not None:
+        cancel_pause_remaining_seconds = max(
+            0.0, (cancel_pause_until - now).total_seconds()
+        )
     report_status_effective = report_status
     if closure_pending and report_status_effective not in {"COMPLETE", "PARTIAL"}:
         report_status_effective = "PARTIAL"
@@ -1095,6 +1221,24 @@ def _status_json_payload(
             if waiting_for_user
             else None,
             "sandbox_dir": str(state.get("sandbox_dir", "")),
+            "cancel_request_state": cancel_state,
+            "cancel_requested_at": cancel_requested_at.isoformat()
+            if cancel_requested_at is not None
+            else None,
+            "cancel_pause_until": cancel_pause_until.isoformat()
+            if cancel_state == "pending" and cancel_pause_until is not None
+            else None,
+            "cancel_pause_remaining_seconds": cancel_pause_remaining_seconds
+            if cancel_state == "pending"
+            else None,
+            "cancel_denied_at": cancel_denied_at.isoformat()
+            if cancel_state == "denied" and cancel_denied_at is not None
+            else None,
+            "cancel_denied_note": _decision_note_for_output(
+                state.get("cancel_denied_note")
+            )
+            if cancel_state == "denied"
+            else None,
             "log_checkpoints": _count_log_checkpoints(state),
             "required_log_checkpoints": _required_log_checkpoints(
                 snapshot["elapsed_seconds"]
@@ -1202,6 +1346,30 @@ def cmd_status(*, json_output: bool = False) -> None:
                     _row("Await question", await_question)
                     _row("Autonomous mode", "proceeding with defaults")
 
+        cancel_state = _cancel_request_state(state)
+        if not json_output and cancel_state == "pending":
+            pause_until = _cancel_pause_deadline(state)
+            _row("Cancel request", c(YELLOW, "pending user decision"))
+            if pause_until is not None and now < pause_until:
+                pause_remaining = (pause_until - now).total_seconds()
+                _row("AI pause", _fmt_remaining(pause_remaining))
+                _row("Pause until", _fmt_dt(pause_until))
+            else:
+                _row("AI pause", "elapsed; autonomous work resumed")
+            _row(
+                "User reply",
+                f"{CANCEL_ACCEPT_TOKEN} (accept), {CANCEL_DENY_TOKEN} (deny)",
+            )
+
+        if not json_output and cancel_state == "denied":
+            denied_at = _parse_iso_datetime(state.get("cancel_denied_at"))
+            _row("Cancel request", c(YELLOW, "denied by user"))
+            if denied_at is not None:
+                _row("Denied at", _fmt_dt(denied_at))
+            denied_note = _decision_note_for_output(state.get("cancel_denied_note"))
+            if denied_note:
+                _row("Decision note", denied_note)
+
         if json_output:
             print(json.dumps(_status_json_payload(state, None, now)))
             return
@@ -1209,6 +1377,24 @@ def cmd_status(*, json_output: bool = False) -> None:
         _row("Log checkpoints", f"{log_count} (target >= {log_target})")
         _row("Sandbox", state["sandbox_dir"])
         print(SEP)
+
+
+def _cancel_active_session(
+    state: dict[str, Any], now: datetime, *, trigger: str
+) -> tuple[Path | None, str | None]:
+    _append_log(
+        state,
+        "Session cancelled",
+        details=[f"Triggered by: {trigger}"],
+    )
+    archive_error: str | None = None
+    archived: Path | None = None
+    try:
+        archived = _archive_sandbox(state, now)
+    except RuntimeError as exc:
+        archive_error = str(exc)
+    _clear_state()
+    return archived, archive_error
 
 
 def cmd_cancel() -> None:
@@ -1236,26 +1422,139 @@ def cmd_cancel() -> None:
             return
 
         now = _now()
+        report_status = _read_report_status(state)
+        snapshot = _status_snapshot(state, now)
+        should_block = _stop_should_block(snapshot, report_status)
+
+        cancel_state = _cancel_request_state(state)
+        pause_until = _cancel_pause_deadline(state)
+        if cancel_state == "pending":
+            _header("Cancellation request pending")
+            _row(
+                "Requested at",
+                _fmt_dt(datetime.fromisoformat(state["cancel_requested_at"])),
+            )
+            if pause_until is not None and now < pause_until:
+                _row("AI pause", _fmt_remaining((pause_until - now).total_seconds()))
+                _row("Pause until", _fmt_dt(pause_until))
+            else:
+                _row("AI pause", "elapsed")
+            _row("Decision", _cancel_instruction_text())
+            print(SEP)
+            return
+
+        _clear_cancel_request_fields(state)
+        pause_seconds = _cancel_pause_seconds()
+        pause_until = now + timedelta(seconds=pause_seconds)
+        state["cancel_request_state"] = "pending"
+        state["cancel_requested_at"] = now.isoformat()
+        state["cancel_pause_until"] = pause_until.isoformat()
+        _save(state)
+
         _append_log(
             state,
-            "Session cancelled via kill-switch",
-            details=["Triggered by: --cancel"],
+            "Cancellation requested; awaiting explicit user decision",
+            details=[
+                f"AI pause window: {pause_seconds} second(s)",
+                f"Pause until: {_fmt_dt(pause_until)}",
+                f"Decision: {_cancel_instruction_text()}",
+            ],
         )
-        archive_error: str | None = None
-        archived: Path | None = None
-        try:
-            archived = _archive_sandbox(state, now)
-        except RuntimeError as exc:
-            archive_error = str(exc)
-        _clear_state()
+
+        _header(f"{c(YELLOW, 'Cancellation request sent')}")
+        _row("Requested at", _fmt_dt(now))
+        _row("AI pause window", f"{pause_seconds} second(s)")
+        _row("Pause until", _fmt_dt(pause_until))
+        _row("Decision", _cancel_instruction_text())
+        if should_block:
+            _row(
+                "Policy",
+                "Autonomous stop remains blocked until user decision or normal stop conditions are met.",
+            )
+        print(SEP)
+
+
+def cmd_cancel_accept(decision_note: str) -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+        if _cancel_request_state(state) != "pending":
+            sys.exit("error: no pending cancellation request to accept")
+
+        now = _now()
+        note = decision_note.strip()
+        _append_log(
+            state,
+            "Cancellation request accepted by user",
+            details=[
+                f"Decision note: {_display_sensitive_text(note, label='decision')}",
+                f"Accept token: {CANCEL_ACCEPT_TOKEN}",
+            ],
+        )
+        archived, archive_error = _cancel_active_session(
+            state, now, trigger="--cancel-accept"
+        )
 
         _header(f"{c(YELLOW, 'Session cancelled')}")
         _row("Cancelled at", _fmt_dt(now))
-        _row("Request", state["request"])
+        _row("Decision", "User accepted cancellation request")
+        if note:
+            _row("Decision note", _display_sensitive_text(note, label="decision"))
         _row("Archived sandbox", str(archived) if archived else "(sandbox not found)")
         if archive_error:
             _row("Archive warning", c(RED, archive_error))
         print(SEP)
+
+
+def cmd_cancel_deny(decision_note: str) -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+        if _cancel_request_state(state) != "pending":
+            sys.exit("error: no pending cancellation request to deny")
+
+        now = _now()
+        note = decision_note.strip()
+        stored_note = _sanitize_decision_note(note)
+        state["cancel_request_state"] = "denied"
+        state["cancel_denied_at"] = now.isoformat()
+        state["cancel_denied_note"] = stored_note
+        state.pop("cancel_pause_until", None)
+        _save(state)
+
+        _append_log(
+            state,
+            "Cancellation request denied by user",
+            details=[
+                f"Decision note: {stored_note or '(none)'}",
+                "Stop remains blocked until normal stop conditions are met.",
+            ],
+        )
+
+        _emit_hook_payload(
+            False,
+            "User denied cancellation request. Continue autonomous work until stop conditions are met.",
+            hook="cancel-deny",
+            active=True,
+            cancellation_denied=True,
+            waiting_for_cancel_decision=False,
+            denied_at=_fmt_dt(now),
+            decision_note=stored_note,
+        )
 
 
 def cmd_hook_precompact() -> None:
@@ -1433,12 +1732,102 @@ def cmd_hook_stop() -> None:
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
-            if snapshot["dynamic"]:
-                should_block = report_status not in {"COMPLETE", "PARTIAL"}
-            else:
-                should_block = bool(
-                    snapshot["remaining_seconds"] and snapshot["remaining_seconds"] > 0
+            should_block = _stop_should_block(snapshot, report_status)
+            cancel_state = _cancel_request_state(state)
+
+            if cancel_state == "pending" and should_block:
+                pause_until = _cancel_pause_deadline(state)
+                template_context = _hook_template_context(state, snapshot, now)
+                template_text = render_template("stop-blocked", template_context)
+                if pause_until is not None and now < pause_until:
+                    pause_remaining = (pause_until - now).total_seconds()
+                    remaining_text = _fmt_remaining(pause_remaining)
+                    pause_seconds = _cancel_pause_seconds()
+                    _append_log(
+                        state,
+                        "Stop attempt blocked by pending cancellation request",
+                        details=[
+                            f"AI pause remaining: {remaining_text}",
+                            f"Pause until: {_fmt_dt(pause_until)}",
+                            f"Decision: {_cancel_instruction_text()}",
+                        ],
+                    )
+                    _emit_hook_payload(
+                        True,
+                        (
+                            "Cancellation request is pending user decision. "
+                            f"Pause for {pause_seconds} seconds, then resume autonomous work if no decision arrives."
+                        ),
+                        hook="stop",
+                        active=True,
+                        block=True,
+                        cancel_request_pending=True,
+                        waiting_for_cancel_decision=True,
+                        cancel_pause_deadline=_fmt_dt(pause_until),
+                        cancel_pause_remaining=remaining_text,
+                        cancel_decision_instructions=_cancel_instruction_text(),
+                        pause_then_resume_seconds=pause_seconds,
+                        retry_immediately=False,
+                        template_id="stop-blocked",
+                        template=template_text,
+                    )
+                    sys.exit(_pause_then_resume_exit_code())
+
+                _append_log(
+                    state,
+                    "Cancellation request still pending; pause window elapsed",
+                    details=[
+                        "No user decision received yet.",
+                        "Autonomous work must continue until decision or normal stop conditions are met.",
+                    ],
                 )
+                _emit_hook_payload(
+                    True,
+                    (
+                        "Cancellation request is still pending user decision. "
+                        "Resume autonomous work now; stop remains blocked until user decides or stop conditions are met."
+                    ),
+                    hook="stop",
+                    active=True,
+                    block=True,
+                    cancel_request_pending=True,
+                    waiting_for_cancel_decision=True,
+                    cancel_pause_elapsed=True,
+                    cancel_decision_instructions=_cancel_instruction_text(),
+                    retry_immediately=True,
+                    template_id="stop-blocked",
+                    template=template_text,
+                )
+                sys.exit(_blocked_stop_exit_code(retry_immediately=True))
+
+            if cancel_state == "denied" and should_block:
+                template_context = _hook_template_context(state, snapshot, now)
+                template_text = render_template("stop-blocked", template_context)
+                denied_at = _parse_iso_datetime(state.get("cancel_denied_at"))
+                _append_log(
+                    state,
+                    "Stop attempt blocked: user denied cancellation request",
+                    details=[
+                        f"Denied at: {_fmt_dt(denied_at) if denied_at is not None else 'unknown'}",
+                        "Stop remains blocked until normal stop conditions are met.",
+                    ],
+                )
+                _emit_hook_payload(
+                    True,
+                    "User denied cancellation request. Keep working until normal stop conditions are met.",
+                    hook="stop",
+                    active=True,
+                    block=True,
+                    cancel_request_denied=True,
+                    waiting_for_cancel_decision=False,
+                    cancel_denied_at=_fmt_dt(denied_at)
+                    if denied_at is not None
+                    else "unknown",
+                    retry_immediately=True,
+                    template_id="stop-blocked",
+                    template=template_text,
+                )
+                sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
             if should_block:
                 remaining_text = _fmt_remaining(snapshot["remaining_seconds"])

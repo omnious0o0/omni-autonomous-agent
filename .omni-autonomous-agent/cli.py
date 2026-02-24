@@ -11,6 +11,8 @@ from pathlib import Path
 from .session_manager import (
     cmd_add,
     cmd_await_user,
+    cmd_cancel_accept,
+    cmd_cancel_deny,
     cmd_cancel,
     cmd_dummy,
     cmd_hook_precompact,
@@ -37,6 +39,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exit non-zero unless there is an active session",
     )
     group.add_argument("--cancel", action="store_true", help="Cancel active session")
+    group.add_argument(
+        "--cancel-accept",
+        action="store_true",
+        help="Accept a pending cancellation request",
+    )
+    group.add_argument(
+        "--cancel-deny",
+        action="store_true",
+        help="Deny a pending cancellation request",
+    )
     group.add_argument("--hook-stop", action="store_true", help="Stop hook")
     group.add_argument("--hook-precompact", action="store_true", help="Precompact hook")
     group.add_argument("--update", action="store_true", help="Update this installation")
@@ -100,6 +112,12 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NOTE",
         type=str,
         help="Free-form note captured with --user-responded",
+    )
+    parser.add_argument(
+        "--decision-note",
+        metavar="NOTE",
+        type=str,
+        help="Free-form note captured with --cancel-accept/--cancel-deny",
     )
     parser.add_argument(
         "--event",
@@ -178,6 +196,8 @@ def main() -> None:
         or args.hook_stop
         or args.hook_precompact
         or args.require_active
+        or args.cancel_accept
+        or args.cancel_deny
         or args.bootstrap
         or args.await_user
         or args.user_responded
@@ -207,6 +227,14 @@ def main() -> None:
 
     if args.cancel:
         cmd_cancel()
+        return
+
+    if args.cancel_accept:
+        cmd_cancel_accept(args.decision_note or "")
+        return
+
+    if args.cancel_deny:
+        cmd_cancel_deny(args.decision_note or "")
         return
 
     if args.hook_stop:

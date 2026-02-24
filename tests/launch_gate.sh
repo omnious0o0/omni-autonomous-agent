@@ -123,6 +123,8 @@ required_flags = [
     '--add',
     '--status',
     '--cancel',
+    '--cancel-accept',
+    '--cancel-deny',
     '--hook-stop',
     '--hook-precompact',
     '--bootstrap',
@@ -138,6 +140,7 @@ required_flags = [
     '--note',
     '--wait-minutes',
     '--response-note',
+    '--decision-note',
 ]
 
 missing = [flag for flag in required_flags if flag not in help_result.stdout]

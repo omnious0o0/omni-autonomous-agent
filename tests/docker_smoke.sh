@@ -92,6 +92,7 @@ assert payload['waiting_for_user'] is False
 PY
 
 "$CLI" --cancel
+"$CLI" --cancel-accept --decision-note "docker cleanup"
 
 AGENT="futureagent" "$CLI" --bootstrap
 test -f "$HOME/.local/bin/omni-wrap-futureagent"
@@ -113,6 +114,7 @@ set -e
 test "$FIXED_HOOK_CODE" -eq 2
 
 "$CLI" --cancel
+"$CLI" --cancel-accept --decision-note "docker fixed cleanup"
 
 ADD_OUTPUT="$($CLI --add -R "docker verification")"
 printf "%s\n" "$ADD_OUTPUT" | grep -q "omni-autonomous-agent - active"

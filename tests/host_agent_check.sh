@@ -128,8 +128,20 @@ if 'OMNI_AGENT_OPENCLAW_SESSION_KEY' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing session key override support')
 if 'OMNI_AGENT_OPENCLAW_SESSION_ID' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing session override support')
+if 'OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender allowlist support')
 if '--log-event' not in openclaw_handler_text or '--event' not in openclaw_handler_text or '--note' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing OAA hook telemetry logging integration')
+if '--cancel-accept' not in openclaw_handler_text or '--cancel-deny' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision command routing')
+if 'CANCEL_ACCEPT_TOKENS' not in openclaw_handler_text or 'CANCEL_DENY_TOKENS' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision token maps')
+if 'senderAuthorizedForCancelDecision' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender authorization guard')
+if 'cancel_decision_unauthorized' not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing unauthorized cancel decision telemetry')
+if "status.cancel_request_state === 'pending'" not in openclaw_handler_text:
+    raise SystemExit('host-agent-check failed: openclaw handler missing pending cancel decision guard')
 if '.npm-global' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
 if "'--session-id', route.sessionId" not in openclaw_handler_text:

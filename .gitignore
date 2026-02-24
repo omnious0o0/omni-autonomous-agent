@@ -8,3 +8,4 @@ omni-sandbox/*
 !omni-sandbox/archived/
 omni-sandbox/archived/*
 !omni-sandbox/archived/.gitkeep
+AGENTS.md

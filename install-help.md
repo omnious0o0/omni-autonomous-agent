@@ -49,10 +49,10 @@ if [ -e ~/.local/bin/omni-autonomous-agent ]; then
 else
   echo "missing: ~/.local/bin/omni-autonomous-agent"
 fi
-if [ -e ~/.omni-autonomous-agent/bin/omni-autonomous-agent ]; then
-  ls -la ~/.omni-autonomous-agent/bin/omni-autonomous-agent
+if [ -e /usr/local/bin/omni-autonomous-agent ]; then
+  ls -la /usr/local/bin/omni-autonomous-agent
 else
-  echo "missing: ~/.omni-autonomous-agent/bin/omni-autonomous-agent"
+  echo "missing: /usr/local/bin/omni-autonomous-agent"
 fi
 python3 -c 'import os; print(os.environ.get("PATH", ""))'
 ```
@@ -165,8 +165,9 @@ They enforce:
    - Calls `omni-autonomous-agent --hook-stop`
    - If hook exits `2`, wrapper continues looping (no premature stop)
    - If hook exits `4`, wrapper pauses and exits (used for user-response wait windows and corrupted-state recovery)
+   - If hook exits `5`, wrapper pauses for 30 seconds and then auto-resumes (used for pending cancel-request handshake)
    - Wrapper exits with command status when hook exits `0`
-   - Wrapper exits with hook error code for other non-`0`/`2`/`4` hook failures
+   - Wrapper exits with hook error code for other non-`0`/`2`/`4`/`5` hook failures
 
 Quick preflight check:
 
@@ -324,15 +325,33 @@ If `session-memory` is unavailable, OAA still works with `omni-recovery` as long
 
 ---
 
-## 8) Kill-switch behavior
+## 8) Cancellation handshake behavior
 
 ```bash
 omni-autonomous-agent --cancel
 ```
 
-- Immediately clears active state
-- Archives sandbox if present
-- If state file is corrupted, it is quarantined as `state.invalid.<timestamp>.json`
+- Opens a pending cancellation request instead of immediate stop
+- AI gets a 30-second pause window, then resumes if no decision is received
+- User can approve later with:
+
+```bash
+omni-autonomous-agent --cancel-accept [--decision-note "<note>"]
+```
+
+- User can deny with:
+
+```bash
+omni-autonomous-agent --cancel-deny [--decision-note "<note>"]
+```
+
+- OpenClaw inbound shortcut tokens while request is pending:
+  - `...` -> accept cancellation
+  - `..` -> deny cancellation
+
+- On approval, session is cancelled and sandbox archived
+- On denial, autonomous stop remains blocked until normal stop conditions are met
+- If state file is corrupted, `--cancel` still performs quarantine recovery as `state.invalid.<timestamp>.json`
 
 ---
 
@@ -351,6 +370,7 @@ omni-autonomous-agent --cancel
 - Set `OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS=<milliseconds>` to tune restart wake dedupe TTL (default: `60000`).
 - Set `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` to disable immediate channel delivery for startup wakes.
 - Set `OMNI_AGENT_OAA_BIN=/absolute/path/to/omni-autonomous-agent` if gateway hook PATH resolution cannot find the OAA launcher.
+- Set `OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS=user1,user2` to explicitly allow specific `message:received` sender ids for `...` / `..` cancel-decision shortcuts.
 - Set `OMNI_AGENT_OPENCLAW_SESSION_KEY=<key>` only for controlled debugging when session key routing must be forced.
 - Set `OMNI_AGENT_OPENCLAW_SESSION_ID=<id>` only for controlled debugging when you must override session route resolution.
 - Hook/template payloads redact request/path text by default. Set `OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT=1` only when detailed context is explicitly required.

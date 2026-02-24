@@ -18,7 +18,7 @@ If bootstrap or hooks fail, follow the "AI self-setup playbook (non-scripted fal
 
 ## Get started
 
-Autonomous work mode. You execute a task continuously without interruptions, no progress updates, no questions, no stalling. You keep working non-stop until the conditions are met:
+Autonomous work mode. You execute a task continuously without interruptions, no progress updates, no stalling. After kickoff questions are resolved, keep working non-stop until the conditions are met:
 - If a duration was specified, work until time's up.
 - If a goal was specified, work until it's achieved.
 
@@ -90,7 +90,9 @@ When you notice stop conditions are near, start concluding your work and prepare
 - Register user reply: `omni-autonomous-agent --user-responded --response-note "<note>"`
 - Write checkpoint before compaction: `omni-autonomous-agent --hook-precompact`
 - Evaluate stop gate: `omni-autonomous-agent --hook-stop`
-- Emergency stop (kill-switch): `omni-autonomous-agent --cancel`
+- Request cancellation (requires user decision): `omni-autonomous-agent --cancel`
+- Accept cancellation request: `omni-autonomous-agent --cancel-accept [--decision-note "<note>"]`
+- Deny cancellation request: `omni-autonomous-agent --cancel-deny [--decision-note "<note>"]`
 - Reconfigure hooks/wrappers: `omni-autonomous-agent --bootstrap`
 
 ## Execution Rules
@@ -165,8 +167,8 @@ Be completely honest and transparent.
 
 ## Notes
 
-- If there's no duration, use `-D dynamic` instead of `-D [duration]`
-- Kill-switch: To cancel a session mid-way (DON'T DO IT WITHOUT A REASON), run `omni-autonomous-agent --cancel`. Stop all work immediately and skip the end-of-session report. Only do this if user explicitly asks/approves.
+- If there's no fixed duration, omit `-D` (or use `-D dynamic` explicitly)
+- Cancellation handshake: `--cancel` no longer force-stops immediately. It opens a user decision request, pauses the AI for 30 seconds, then resumes autonomous work if no decision arrives. User can approve later with `--cancel-accept` (or message token `...`) or deny with `--cancel-deny` (or token `..`).
 - Scope management is your responsibility. If the task is larger than the time budget, prioritize the highest-value work and note what you couldn't finish in your report.
 - Wrapper note: `omni-agent-wrap` and `omni-wrap-*` enforce `--require-active` and `--hook-stop` automatically. Do not replace this with simple EXIT traps.
 - OpenClaw note: hooks are event-driven (startup/inbound), not idle timers. If the session looks idle, send a message or restart gateway to trigger recovery hooks.

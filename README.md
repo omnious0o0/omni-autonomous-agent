@@ -13,7 +13,7 @@ Your agent won't stop until one of the conditions is met based on the task you g
 - Task is done
 - You manually stop it (e.g. "keep doing chores until I stop you")
 
-Manual stop requests are approval-gated: `--cancel` creates a cancellation request, the AI pauses for 30 seconds, and cancellation executes only after explicit user accept (`...` / `--cancel-accept`) while user denial (`..` / `--cancel-deny`) keeps autonomous work running.
+> **NOTE:** Your AI agent can request to stop, once it sends the request it becomes idle for 30 seconds and waits for your approval/denial. If you don't respond within 30 seconds or deny, it will resume autonomous work.
 
 Otherwise it won't stop. Even if it goes offline, it will immediately resume when it comes back online.
 And none of the "I will now do..." and then doing nothing. That's fixed too.

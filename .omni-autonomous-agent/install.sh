@@ -9,7 +9,7 @@ RED="\033[31m"
 RESET="\033[0m"
 SEP="${DIM}----------------------------------------------------------------------${RESET}"
 
-REPO_URL="https://github.com/omnious0o0/omni-autonomous-agent.git"
+REPO_URL="${OMNI_AGENT_REPO_URL:-https://github.com/omnious0o0/omni-autonomous-agent.git}"
 INSTALL_DIR="${OMNI_AGENT_INSTALL_DIR:-${HOME}/.omni-autonomous-agent}"
 DEST_NAME="omni-autonomous-agent"
 
@@ -26,24 +26,139 @@ row() {
   printf "  %b%-20s%b %s\n" "${DIM}" "${label}:" "${RESET}" "${value}"
 }
 
+fail() {
+  printf "%berror:%b %s\n" "${RED}" "${RESET}" "$1" >&2
+  exit 1
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+pkg_manager() {
+  local managers=(apt-get dnf yum pacman zypper apk brew)
+  local manager
+  for manager in "${managers[@]}"; do
+    if has_cmd "${manager}"; then
+      printf "%s\n" "${manager}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_privileged() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return
+  fi
+
+  if ! has_cmd sudo; then
+    fail "install requires elevated package installation for '$*', but sudo is unavailable"
+  fi
+
+  if [[ -t 0 ]]; then
+    sudo "$@"
+    return
+  fi
+
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -n "$@"
+    return
+  fi
+
+  fail "non-interactive install cannot elevate for '$*'; rerun interactively or preinstall dependencies"
+}
+
+install_packages() {
+  local manager
+  if ! manager="$(pkg_manager)"; then
+    fail "no supported package manager found to install required dependencies"
+  fi
+
+  case "${manager}" in
+    apt-get)
+      run_privileged apt-get update -qq
+      run_privileged apt-get install -y -qq "$@"
+      ;;
+    dnf)
+      run_privileged dnf install -y -q "$@"
+      ;;
+    yum)
+      run_privileged yum install -y -q "$@"
+      ;;
+    pacman)
+      run_privileged pacman -Sy --noconfirm "$@"
+      ;;
+    zypper)
+      run_privileged zypper --non-interactive install "$@"
+      ;;
+    apk)
+      run_privileged apk add --no-cache "$@"
+      ;;
+    brew)
+      brew install "$@"
+      ;;
+  esac
+}
+
+ensure_python() {
+  if has_cmd python3; then
+    return
+  fi
+
+  header "Installing Python runtime"
+  local manager
+  if ! manager="$(pkg_manager)"; then
+    fail "python3 is required and no supported package manager is available"
+  fi
+
+  case "${manager}" in
+    apt-get) install_packages python3 ;;
+    dnf) install_packages python3 ;;
+    yum) install_packages python3 ;;
+    pacman) install_packages python ;;
+    zypper) install_packages python3 ;;
+    apk) install_packages python3 ;;
+    brew) install_packages python ;;
+  esac
+
+  has_cmd python3 || fail "python3 installation did not succeed"
+}
+
+ensure_git() {
+  if has_cmd git; then
+    return
+  fi
+
+  header "Installing git"
+  local manager
+  if ! manager="$(pkg_manager)"; then
+    fail "git is required and no supported package manager is available"
+  fi
+
+  case "${manager}" in
+    apt-get|dnf|yum|zypper|apk|brew) install_packages git ;;
+    pacman) install_packages git ;;
+  esac
+
+  has_cmd git || fail "git installation did not succeed"
+}
+
 SCRIPT_SOURCE_DIR=""
 if ! SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"; then
   SCRIPT_SOURCE_DIR=""
 fi
 if [[ -z "${SCRIPT_SOURCE_DIR}" || ! -f "${SCRIPT_SOURCE_DIR}/../main.py" ]]; then
   header "Bootstrapping repository"
-  if ! command -v git >/dev/null 2>&1; then
-    printf "%berror:%b git is required for install.\n" "${RED}" "${RESET}" >&2
-    exit 1
-  fi
+  ensure_python
+  ensure_git
 
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     row "Repository" "${INSTALL_DIR} (existing, pulling latest)"
     git -C "${INSTALL_DIR}" pull --ff-only
   elif [[ -e "${INSTALL_DIR}" ]]; then
-    printf "%berror:%b %s exists but is not a git repository.\n" "${RED}" "${RESET}" "${INSTALL_DIR}" >&2
-    printf "       Remove it manually or set OMNI_AGENT_INSTALL_DIR to a clean location.\n" >&2
-    exit 1
+    fail "${INSTALL_DIR} exists but is not a git repository. Remove it manually or set OMNI_AGENT_INSTALL_DIR to a clean location."
   else
     row "Repository" "Cloning to ${INSTALL_DIR}"
     git clone "${REPO_URL}" "${INSTALL_DIR}"
@@ -51,6 +166,8 @@ if [[ -z "${SCRIPT_SOURCE_DIR}" || ! -f "${SCRIPT_SOURCE_DIR}/../main.py" ]]; th
 
   exec bash "${INSTALL_DIR}/.omni-autonomous-agent/install.sh"
 fi
+
+ensure_python
 
 ROOT_DIR="$(cd "${SCRIPT_SOURCE_DIR}/.." >/dev/null 2>&1 && pwd)"
 MAIN_SCRIPT="${ROOT_DIR}/main.py"
@@ -71,47 +188,36 @@ fi
 
 if [[ -z "${TARGET_DIR}" && -n "${SYSTEM_BIN_OVERRIDE_RAW}" && ! -d "${SYSTEM_BIN}" ]]; then
   if ! mkdir -p "${SYSTEM_BIN}" >/dev/null 2>&1; then
-    printf "%berror:%b OMNI_AGENT_SYSTEM_BIN path could not be created: %s\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
-    printf "       Ensure the path is creatable and writable, then retry.\n" >&2
-    exit 1
+    fail "OMNI_AGENT_SYSTEM_BIN path could not be created: ${SYSTEM_BIN}"
   fi
 fi
 
 if [[ -z "${TARGET_DIR}" ]]; then
   if [[ -d "${SYSTEM_BIN}" && -w "${SYSTEM_BIN}" ]]; then
     TARGET_DIR="${SYSTEM_BIN}"
-  elif [[ -d "${SYSTEM_BIN}" ]] && command -v sudo >/dev/null 2>&1; then
+  elif [[ -d "${SYSTEM_BIN}" ]] && has_cmd sudo; then
     TARGET_DIR="${SYSTEM_BIN}"
     if [[ -t 0 ]]; then
       SUDO_CMD=(sudo)
+    elif sudo -n true >/dev/null 2>&1; then
+      SUDO_CMD=(sudo -n)
     else
-      if sudo -n true >/dev/null 2>&1; then
-        SUDO_CMD=(sudo -n)
-      else
-        printf "%berror:%b non-interactive install requires passwordless sudo for %s.\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
-        printf "       Re-run interactively, add %s to PATH, or set OMNI_AGENT_LOCAL_BIN.\n" "${LOCAL_BIN}" >&2
-        exit 1
-      fi
+      fail "non-interactive install requires passwordless sudo for ${SYSTEM_BIN}; re-run interactively, add ${LOCAL_BIN} to PATH, or set OMNI_AGENT_LOCAL_BIN"
     fi
   elif [[ -n "${SYSTEM_BIN_OVERRIDE_RAW}" ]]; then
-    printf "%berror:%b OMNI_AGENT_SYSTEM_BIN path is not writable or could not be created: %s\n" "${RED}" "${RESET}" "${SYSTEM_BIN}" >&2
-    printf "       Create it with proper permissions, or unset OMNI_AGENT_SYSTEM_BIN and retry.\n" >&2
-    exit 1
+    fail "OMNI_AGENT_SYSTEM_BIN path is not writable or could not be created: ${SYSTEM_BIN}"
   else
-    printf "%berror:%b no writable install target found.\n" "${RED}" "${RESET}" >&2
-    printf "       Set OMNI_AGENT_LOCAL_BIN or OMNI_AGENT_SYSTEM_BIN to a writable path.\n" >&2
     if [[ -n "${LOCAL_BIN_CREATE_ERROR}" ]]; then
-      printf "       Local bin detail: %s\n" "${LOCAL_BIN_CREATE_ERROR}" >&2
+      fail "no writable install target found. Local bin detail: ${LOCAL_BIN_CREATE_ERROR}"
     fi
-    exit 1
+    fail "no writable install target found. Set OMNI_AGENT_LOCAL_BIN or OMNI_AGENT_SYSTEM_BIN to a writable path."
   fi
 fi
 
 DEST="${TARGET_DIR}/${DEST_NAME}"
 
 if [[ -d "${DEST}" && ! -L "${DEST}" ]]; then
-  printf "%berror:%b %s is a directory. Refusing to overwrite it.\n" "${RED}" "${RESET}" "${DEST}" >&2
-  exit 1
+  fail "${DEST} is a directory. Refusing to overwrite it."
 fi
 
 if [[ ${#SUDO_CMD[@]} -gt 0 ]]; then
@@ -134,13 +240,12 @@ run_bootstrap_with_timeout() {
   local cli_path="$1"
   local timeout_seconds="$2"
 
-  if command -v timeout >/dev/null 2>&1; then
+  if has_cmd timeout; then
     timeout "${timeout_seconds}" "${cli_path}" --bootstrap
     return $?
   fi
 
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "${timeout_seconds}" "${cli_path}" <<'PY'
+  python3 - "${timeout_seconds}" "${cli_path}" <<'PY'
 import subprocess
 import sys
 
@@ -156,10 +261,6 @@ except FileNotFoundError:
 
 sys.exit(completed.returncode)
 PY
-    return $?
-  fi
-
-  "${cli_path}" --bootstrap
 }
 
 header "Installed"
@@ -173,12 +274,9 @@ else
   bootstrap_code=$?
   row "Bootstrap" "Automatic bootstrap failed"
   if [[ "${bootstrap_code}" -eq 124 ]]; then
-    printf "%berror:%b bootstrap timed out after %ss.\n" "${RED}" "${RESET}" "${BOOTSTRAP_TIMEOUT}" >&2
-  else
-    printf "%berror:%b bootstrap did not complete successfully.\n" "${RED}" "${RESET}" >&2
+    fail "bootstrap timed out after ${BOOTSTRAP_TIMEOUT}s. Run '${DEST} --bootstrap' and fix reported warnings before autonomous use."
   fi
-  printf "       Run '%s --bootstrap' and fix reported warnings before autonomous use.\n" "${DEST}" >&2
-  exit 1
+  fail "bootstrap did not complete successfully. Run '${DEST} --bootstrap' and fix reported warnings before autonomous use."
 fi
 
 printf "\nRun %b%s --status%b to verify.\n" "${BOLD}" "${DEST_NAME}" "${RESET}"

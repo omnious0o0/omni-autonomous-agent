@@ -1,380 +1,258 @@
-# Install Help & Hook Setup (AI Self-Check)
+# OAA Helper: Hook Setup Playbook for Agents
 
-This file is the post-install self-check for `omni-autonomous-agent`.
+Purpose: give agents a reliable, machine-agnostic way to validate OAA hook setup and recover from partial bootstrap failures.
 
-If installation succeeded, the CLI exists and bootstrap already ran once. You still must verify hooks/wrappers before starting autonomous work.
-
-Goal of this guide: let an AI agent recover and complete setup independently, even when the default scripted flow partially fails.
+This guide intentionally avoids host-specific paths.
+Use command outputs and env overrides instead of assumptions.
 
 ---
 
-## 1) Verify the CLI is reachable
+## 1) Hard rules
+
+- Do not assume install paths.
+- Do not assume shell profile state.
+- Do not trust stale config files without validation.
+- Do not loop full reinstall as first response.
+- Always verify with command output before moving to next step.
+
+---
+
+## 2) Fast readiness check
+
+Run in order:
 
 ```bash
 omni-autonomous-agent --status
-```
-
-Expected result: `No active session.` (or active session details).
-
-If `omni-autonomous-agent` is already reachable, you can rerun install via CLI:
-
-```bash
-omni-autonomous-agent --install
-```
-
-If `omni-autonomous-agent` is not on PATH yet, run the installer directly (default install location):
-
-```bash
-bash ~/.omni-autonomous-agent/.omni-autonomous-agent/install.sh
-```
-
-On Windows PowerShell (default install location):
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.omni-autonomous-agent\.omni-autonomous-agent\install.ps1"
-```
-
-The installer output prints the exact install path and PATH export line.
-
-If the CLI is still not found after install, do a direct binary discovery before retrying scripts:
-
-```bash
-if command -v omni-autonomous-agent >/dev/null 2>&1; then
-  command -v omni-autonomous-agent
-else
-  echo "omni-autonomous-agent not on PATH"
-fi
-if [ -e ~/.local/bin/omni-autonomous-agent ]; then
-  ls -la ~/.local/bin/omni-autonomous-agent
-else
-  echo "missing: ~/.local/bin/omni-autonomous-agent"
-fi
-if [ -e /usr/local/bin/omni-autonomous-agent ]; then
-  ls -la /usr/local/bin/omni-autonomous-agent
-else
-  echo "missing: /usr/local/bin/omni-autonomous-agent"
-fi
-python3 -c 'import os; print(os.environ.get("PATH", ""))'
-```
-
-Use that output to fix PATH in the current shell first, then rerun bootstrap.
-
----
-
-## 2) Re-run bootstrap explicitly (required self-check)
-
-```bash
-omni-autonomous-agent --bootstrap
-```
-
-Important behavior:
-
-- Bootstrap is idempotent.
-- Bootstrap returns non-zero if a required integration step fails.
-- Invalid JSON config files are quarantined to `*.invalid.<token>` and rebuilt safely.
-
-If bootstrap fails, inspect and fix the first failing integration instead of repeatedly rerunning full install:
-
-```bash
 omni-autonomous-agent --bootstrap
 openclaw hooks check
 openclaw hooks info omni-recovery
 ```
 
-Then verify each agent config path directly (examples are below).
+Pass criteria:
+- OAA command is callable.
+- Bootstrap exits zero.
+- `omni-recovery` is enabled and healthy.
+- Hook check does not show blocking errors.
+
+If any command fails, stop and fix that exact failure first.
 
 ---
 
-## 3) What bootstrap configures automatically
+## 3) Required behaviors to verify
 
-### Native-hook agents
-
-- Claude Code: `~/.claude/settings.json`
-  - Stop hook: `omni-autonomous-agent --hook-stop`
-  - PreCompact hook: `omni-autonomous-agent --hook-precompact`
-- Gemini CLI: `~/.gemini/settings.json`
-  - AfterAgent hook: `omni-autonomous-agent --hook-stop`
-  - PreCompress hook: `omni-autonomous-agent --hook-precompact`
-- OpenCode: `~/.config/opencode/plugins/omni-hook.ts`
-  - `session.idle` -> `--hook-stop`
-  - `experimental.session.compacting` -> `--hook-precompact`
-- OpenClaw: `~/.openclaw/hooks/omni-recovery/`
-  - `HOOK.md` + `handler.ts` managed by bootstrap
-  - Bootstrap enables `omni-recovery` and attempts `session-memory` (warning-only on failure)
-  - `omni-recovery` listens to `gateway:startup` and `message:received`
-  - On startup with an active OAA session, it resolves the exact OpenClaw session route and queues a resume ping to that same conversation
-  - On inbound messages, it auto-registers user responses when OAA is waiting
-
-Optional path overrides for non-default environments:
-
-- `OMNI_AGENT_CLAUDE_SETTINGS`
-- `OMNI_AGENT_GEMINI_SETTINGS`
-- `OMNI_AGENT_OPENCODE_PLUGIN`
-- `OMNI_AGENT_OPENCLAW_HOOK_DIR`
-
-Direct config inspection commands (useful when setup was done by another process):
+### A) OAA stop-gate behavior
 
 ```bash
-python3 - <<'PY'
-from pathlib import Path
-
-targets = {
-    'claude': Path.home() / '.claude' / 'settings.json',
-    'gemini': Path.home() / '.gemini' / 'settings.json',
-    'openclaw_hook_md': Path.home() / '.openclaw' / 'hooks' / 'omni-recovery' / 'HOOK.md',
-    'openclaw_handler': Path.home() / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts',
-}
-for name, path in targets.items():
-    print(f"{name}: {'OK' if path.exists() else 'MISSING'} -> {path}")
-PY
-```
-
-### Wrapper-based agents
-
-Bootstrap creates wrappers in a platform-aware bin directory:
-
-- Linux/macOS default: `~/.local/bin`
-- Windows default: `%LOCALAPPDATA%\\omni-autonomous-agent\\bin`
-- Override on any OS: `OMNI_AGENT_WRAPPER_BIN=/custom/path`
-
-Wrapper names:
-
-- Universal wrapper: `omni-agent-wrap` (Windows: `omni-agent-wrap.cmd`)
-- Agent wrappers (when detected): `omni-wrap-<agent>` (Windows: `.cmd` suffix)
-  - built-in candidates: `codex`, `aider`, `goose`, `plandex`, `amp`, `crush`, `kiro`, `roo`, `cline`
-
-You can force wrappers for future agents:
-
-```bash
-OMNI_AGENT_EXTRA_WRAPPERS="myagent,anotheragent" omni-autonomous-agent --bootstrap
-```
-
----
-
-## 4) Wrapper semantics (strict)
-
-Wrappers are not simple EXIT traps.
-
-They enforce:
-
-1. **Active-session preflight**
-   - Calls `omni-autonomous-agent --require-active`
-   - If no active session: exits with code `3`
-2. **Stop-prevention loop**
-   - Runs wrapped agent command
-   - Calls `omni-autonomous-agent --hook-stop`
-   - If hook exits `2`, wrapper continues looping (no premature stop)
-   - If hook exits `4`, wrapper pauses and exits (used for user-response wait windows and corrupted-state recovery)
-   - If hook exits `5`, wrapper pauses for 30 seconds and then auto-resumes (used for pending cancel-request handshake)
-   - Wrapper exits with command status when hook exits `0`
-   - Wrapper exits with hook error code for other non-`0`/`2`/`4`/`5` hook failures
-
-Quick preflight check:
-
-```bash
-WRAP_BIN="${OMNI_AGENT_WRAPPER_BIN:-$HOME/.local/bin}"
-"$WRAP_BIN/omni-agent-wrap" true
-```
-
-Expected (without active session): non-zero and message
-`[omni] no active session. run omni-autonomous-agent --add first.`
-
-On Windows PowerShell:
-
-```powershell
-$wrapBin = if ($env:OMNI_AGENT_WRAPPER_BIN) { $env:OMNI_AGENT_WRAPPER_BIN } elseif ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "omni-autonomous-agent\bin" } else { Join-Path $HOME "AppData\Local\omni-autonomous-agent\bin" }
-& (Join-Path $wrapBin "omni-agent-wrap.cmd") --version
-```
-
----
-
-## 5) Functional hook verification
-
-### Register a test task (dynamic)
-
-```bash
-omni-autonomous-agent --add -R "verification run"
-```
-
-Expected:
-
-- Session registration output
-- Immediate status output
-- Duration defaults to `dynamic` when `-D` is omitted
-
-### Stop must be blocked while still active
-
-```bash
+omni-autonomous-agent --add -R "hook verification run" -D 10
 omni-autonomous-agent --hook-stop
 ```
 
 Expected:
+- stop hook returns blocked payload (`continue=true`, non-zero exit for blocked state)
+- payload includes clear guidance to continue working
 
-- JSON payload on stdout
-- exit code `2`
-- `"continue": true`
-
-### Precompact must checkpoint report
+### B) Precompact checkpoint behavior
 
 ```bash
 omni-autonomous-agent --hook-precompact
 ```
 
 Expected:
+- checkpoint is appended to report/log artifacts for handoff safety
 
-- JSON payload
-- checkpoint appended to `REPORT.md`
+### C) Report-gated closure behavior
 
-### Hook telemetry quick check
-
-```bash
-omni-autonomous-agent --log-event --event verification.hook --note "install-help validation"
-```
-
-Expected:
-
-- `LOG.md` gets a `Hook telemetry` entry
-- `REPORT.md` gets a `Checkpoint (hook:verification.hook)` entry
-
-### Mark report complete and allow stop
-
-Set `### 🚦 Status` to `COMPLETE` (or `PARTIAL`) in sandbox `REPORT.md`, then run:
+Set report status to `COMPLETE` (or `PARTIAL`) then run:
 
 ```bash
 omni-autonomous-agent --hook-stop
 ```
 
 Expected:
+- stop allowed
+- state is closed cleanly
+- sandbox archived
 
-- exit code `0`
-- state file removed
-- sandbox moved to `omni-sandbox/archived/`
-- finalized report contains real completion timestamp + actual worked duration
+### D) Await-user behavior
+
+```bash
+omni-autonomous-agent --await-user -Q "Need missing constraints"
+omni-autonomous-agent --user-responded --response-note "User clarified constraints"
+```
+
+Expected:
+- wait window is opened and then cleared safely
+- stop hook handles timeout path correctly when no response arrives
 
 ---
 
-## 6) Await-user window verification (2-minute default)
+## 4) Wrapper contract (must hold)
 
-Open the user-response window:
+Wrappers are enforcement points, not convenience scripts.
 
-```bash
-omni-autonomous-agent --await-user -Q "Need constraints confirmation"
-```
+They must guarantee:
+1. Active-session preflight before running wrapped agent.
+2. Stop-hook enforcement loop after each wrapped execution.
+3. Correct handling of stop-hook exit classes:
+   - blocked -> continue loop
+   - pause required -> pause then resume
+   - allowed -> exit cleanly
+   - unexpected error -> propagate failure
 
-Expected:
-
-- JSON payload with `"hook": "await-user"`
-- `"waiting_for_user": true`
-- `"wait_minutes": 2` by default
-
-If user returns, clear the wait window:
-
-```bash
-omni-autonomous-agent --user-responded --response-note "User replied with updated priorities"
-```
-
-Expected:
-
-- JSON payload with `"hook": "user-responded"`
-- `"user_response_registered": true`
-- wait window cleared from state
-
-If user does not respond before deadline, stop hook returns timeout guidance:
-
-```bash
-omni-autonomous-agent --hook-stop
-```
-
-Expected:
-
-- exit code `2`
-- `"user_response_timed_out": true`
-- `"template_id": "user-timeout-continue"`
+If wrapper behavior diverges from this contract, treat it as a setup failure.
 
 ---
 
-## 7) OpenClaw verification
+## 4B) Command model (must stay sane)
+
+OAA does **not** replace the shell and does **not** require every command to be prefixed with `omni-autonomous-agent`.
+
+Normal work commands remain normal commands, for example:
+- `git`
+- `python3`
+- `node`
+- `docker`
+- `curl`
+- project-local scripts and build tools
+
+Use OAA commands only for:
+- session lifecycle (`--add`, `--status`, `--cancel`, `--await-user`, etc.)
+- stop/precompact hook entry points
+- bootstrap or repair
+
+Use wrappers only for the **agent process** when you need automatic stop-gate enforcement around that agent binary.
+Do not "solve" integration by forcing unrelated shell commands through OAA.
+
+---
+
+## 4C) Future-agent fallback (must stay generic)
+
+If the provider is not one of the native hook integrations, use wrapper-based fallback instead of inventing provider-specific hacks.
+
+Bootstrap options:
+
+```bash
+AGENT=<agent-command> omni-autonomous-agent --bootstrap
+OMNI_AGENT_EXTRA_WRAPPERS="<agent-a> <agent-b>" omni-autonomous-agent --bootstrap
+```
+
+Verification:
+
+```bash
+omni-wrap-<agent-command> --version
+omni-agent-wrap <agent-command> --version
+```
+
+Expected:
+- with no active session, wrapper preflight fails fast
+- with an active session, wrapped agent execution is followed by OAA stop-gate enforcement
+- wrapper behavior matches the contract in section 4
+
+If only wrapper generation was tested, report that as wrapper-level coverage, not full provider verification.
+
+---
+
+## 5) OpenClaw hook contract (must hold)
+
+`omni-recovery` must reliably handle:
+- gateway startup events (resume active autonomous runs)
+- inbound message events (`message:received`, `message:transcribed`, `message:preprocessed`) using the richest available user text
+- `session:compact:before` forwarding so OAA can write a precompact handoff before OpenClaw compacts the session
+
+Verification commands:
 
 ```bash
 openclaw hooks list
-```
-
-Expected:
-
-- `omni-recovery` ready
-- `session-memory` ready (recommended, optional)
-
-Optional deep check:
-
-```bash
 openclaw hooks info omni-recovery
-```
-
-Expected events:
-
-- `gateway:startup`
-- `message:received`
-
-Eligibility and registration check:
-
-```bash
 openclaw hooks check
 ```
 
-If `session-memory` is unavailable, OAA still works with `omni-recovery` as long as check/info output is healthy.
+If events are missing or disabled, bootstrap is incomplete.
 
 ---
 
-## 8) Cancellation handshake behavior
+## 6) Final-only update policy check (critical)
+
+For requests like "work until <time>", OAA should infer `update_policy=final-only`.
+
+Quick check:
 
 ```bash
-omni-autonomous-agent --cancel
+omni-autonomous-agent --add -R "Continue cleanup until 10:30" -D 30
+omni-autonomous-agent --status --json
 ```
 
-- Opens a pending cancellation request instead of immediate stop
-- AI gets a 30-second pause window, then resumes if no decision is received
-- User can approve later with:
+Expected:
+- JSON includes `"update_policy": "final-only"`
+- stop-hook blocked payloads include `user_update_allowed=false` while still active
 
-```bash
-omni-autonomous-agent --cancel-accept [--decision-note "<note>"]
-```
-
-- User can deny with:
-
-```bash
-omni-autonomous-agent --cancel-deny [--decision-note "<note>"]
-```
-
-- OpenClaw inbound shortcut tokens while request is pending:
-  - `...` -> accept cancellation
-  - `..` -> deny cancellation
-
-- On approval, session is cancelled and sandbox archived
-- On denial, autonomous stop remains blocked until normal stop conditions are met
-- If state file is corrupted, `--cancel` still performs quarantine recovery as `state.invalid.<timestamp>.json`
+This prevents premature progress updates during fixed autonomous windows.
 
 ---
 
-## 9) Notes for autonomous runs
+## 7) Recovery strategy when setup is broken
 
-- Always register first: `omni-autonomous-agent --add -R "..." [-D <minutes|dynamic>]`
-- Always rely on hook output, not assumptions.
-- Use `--await-user` when you need missing constraints; default window is 2 minutes.
-- If using a new agent binary, set `OMNI_AGENT_EXTRA_WRAPPERS` and rerun bootstrap.
-- For CI/non-interactive environments, installer uses non-interactive sudo checks and fails fast when elevation is unavailable.
-- If you override install destination with `OMNI_AGENT_SYSTEM_BIN`, ensure that path is writable (or creatable) by the installer user.
-- Use `OMNI_AGENT_BOOTSTRAP_TIMEOUT=<seconds>` to bound installer bootstrap runtime (default: `120`).
-- OpenClaw hooks are event-driven; there is no true idle wake timer. Resume happens on startup or inbound events.
-- Set `OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE=1` to disable startup auto-resume ping behavior.
-- Set `OMNI_AGENT_HOOK_TELEMETRY=0` to disable hook telemetry checkpoints in OAA `LOG.md` and `REPORT.md`.
-- Set `OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS=<milliseconds>` to tune restart wake dedupe TTL (default: `60000`).
-- Set `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` to disable immediate channel delivery for startup wakes.
-- Set `OMNI_AGENT_OAA_BIN=/absolute/path/to/omni-autonomous-agent` if gateway hook PATH resolution cannot find the OAA launcher.
-- Set `OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS=user1,user2` to explicitly allow specific `message:received` sender ids for `...` / `..` cancel-decision shortcuts.
-- Set `OMNI_AGENT_OPENCLAW_SESSION_KEY=<key>` only for controlled debugging when session key routing must be forced.
-- Set `OMNI_AGENT_OPENCLAW_SESSION_ID=<id>` only for controlled debugging when you must override session route resolution.
-- Hook/template payloads redact request/path text by default. Set `OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT=1` only when detailed context is explicitly required.
-- If you find bugs or integration issues, report them at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with repro steps.
+Use this exact order:
+
+1. Reproduce one failing command.
+2. Fix the failing integration directly (do not broad-reinstall yet).
+3. Re-run bootstrap once.
+4. Re-run behavior checks (stop, precompact, await-user, closure).
+5. Re-run OpenClaw hook checks.
+6. Run test suite and confirm green.
+
+If state is corrupted, use OAA cancel/reset flow, then re-register a fresh session and validate again.
+
+---
+
+## 8) Environment override guidance (generic)
+
+Use env overrides only when defaults are unsuitable or not discoverable.
+Keep overrides explicit and minimal.
+
+Useful override classes:
+- config file locations
+- hook directory locations
+- wrapper bin location
+- timeout bounds for bootstrap/install
+- telemetry/sensitive-context toggles
+- startup wake behavior toggles
+
+Tip: always print active env overrides in logs before bootstrap for reproducibility.
+
+---
+
+## 9) Evidence checklist for agents
+
+Before claiming setup is fixed, capture:
+
+- exact commands run
+- exit codes
+- key stdout/stderr lines
+- files/hooks touched
+- test results summary
+
+No completion claim without this evidence.
+
+---
+
+## 9B) Verification grades (do not blur these)
+
+Keep provider/OS verification honest and explicit:
+
+- `configured`: files, hooks, wrappers, or plugins were generated
+- `callable`: the CLI starts and basic commands succeed
+- `authenticated`: the provider can actually reach its backend/API
+- `live-verified`: autonomous behavior was exercised end-to-end on that provider/OS
+
+Never collapse these into one claim.
+
+Example:
+- "Gemini configured + callable + live-verified" is strong evidence.
+- "Claude configured only" is **not** Claude live verification.
+- "Windows path logic tested" is **not** Windows live install verification.
+
+If any grade is missing, say so directly.
 
 ---
 
@@ -382,14 +260,51 @@ omni-autonomous-agent --cancel-deny [--decision-note "<note>"]
 
 Use this exact order when onboarding fails midway:
 
-1. Confirm runtime tools are callable (`python3`, `omni-autonomous-agent`, agent CLI binaries).
+1. Confirm runtime tools are callable (`python3`, `omni-autonomous-agent`, and the relevant agent CLI).
 2. Rebuild OAA integrations only: `omni-autonomous-agent --bootstrap`.
-3. Validate generated config files exist and contain expected hook commands.
-4. Run one dynamic session (`--add ... -D dynamic`), verify stop-block behavior (`--hook-stop` exit `2`), then mark report COMPLETE and verify clean stop (`--hook-stop` exit `0`).
-5. Verify OpenClaw hook discovery (`openclaw hooks list`, `openclaw hooks info omni-recovery`, `openclaw hooks check`).
-6. Verify wrapper preflight blocks without active session (exit `3`) and loop semantics under active session.
+3. Validate generated config files, plugins, wrappers, and OpenClaw hook files exist and contain the expected OAA commands.
+4. Run one dynamic session (`--add ... -D dynamic`), verify blocked stop behavior (`--hook-stop`), await-user timeout or response handling, and clean closure after report status becomes `COMPLETE` or `PARTIAL`.
+5. Verify OpenClaw discovery and health with `openclaw hooks list`, `openclaw hooks info omni-recovery`, and `openclaw hooks check`.
+6. For fresh-machine or Docker verification, prefer headless auth paths and env-backed secrets:
+   - Gemini CLI: `GEMINI_API_KEY` or Vertex AI env vars
+   - Claude Code: API-key or managed settings/env flow
+   - OpenCode: `/connect` or `opencode auth login`, depending build, with env or file secret references
+   - Codex/OpenAI: `OPENAI_API_KEY`; use wrappers and shell/MCP integration, not an assumed native hook API
+7. If a provider config file was invalid, confirm it was quarantined or replaced safely before continuing.
+8. Capture the evidence checklist before claiming setup is fixed.
 
-This sequence is faster and safer than re-running full install repeatedly.
+This sequence is faster and safer than rerunning a full install without diagnosis.
+
+---
+
+## 10B) Provider coverage rule
+
+If a provider CLI is missing, unauthenticated, or unavailable due subscription/access limits:
+
+- you may verify config generation and wrapper/plugin creation
+- you may verify CLI discovery if the binary exists
+- you must **not** claim live provider verification
+
+Allowed claim examples:
+- "OpenCode configured and callable"
+- "Gemini live-verified"
+- "Claude config path prepared, live verification unavailable on this host"
+
+Disallowed claim examples:
+- "All providers verified" when one provider was not actually run
+- "Future agents verified" when only wrapper generation was tested
+
+---
+
+## 10C) Cross-OS proof rule
+
+If you do not have a real Windows or macOS machine or VM available:
+
+- test path logic, wrapper generation, and installer logic with simulation/unit tests
+- test Linux behavior live where possible
+- report Windows/macOS as **simulated coverage only**
+
+Do not present simulated cross-platform checks as real OS verification.
 
 ---
 
@@ -397,9 +312,18 @@ This sequence is faster and safer than re-running full install repeatedly.
 
 - OpenClaw hooks docs: `https://docs.openclaw.ai/automation/hooks`
 - OpenClaw hooks troubleshooting: `https://docs.openclaw.ai/automation/hooks#troubleshooting`
-- Gemini CLI authentication: `https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html`
-- Gemini CLI repo/docs root: `https://github.com/google-gemini/gemini-cli`
-- Claude Code hooks reference: `https://code.claude.com/docs/en/hooks`
+- Gemini CLI authentication: `https://geminicli.com/docs/get-started/authentication/`
+- Gemini CLI configuration: `https://geminicli.com/docs/reference/configuration/`
+- Gemini CLI hooks: `https://geminicli.com/docs/hooks/`
+- Claude Code hooks: `https://code.claude.com/docs/en/hooks`
+- Claude Code hooks guide: `https://code.claude.com/docs/en/hooks-guide`
+- Claude Code settings: `https://code.claude.com/docs/en/settings`
+- OpenCode plugins: `https://opencode.ai/docs/plugins/`
+- OpenCode config: `https://opencode.ai/docs/config/`
+- OpenCode providers/auth: `https://opencode.ai/docs/providers/`
+- OpenCode CLI: `https://opencode.ai/docs/cli/`
+- OpenAI shell tool guide: `https://platform.openai.com/docs/guides/tools-shell`
+- OpenAI Docs MCP: `https://platform.openai.com/docs/docs-mcp`
 - OAA issue tracker: `https://github.com/omnious0o0/omni-autonomous-agent/issues`
 
 When reporting issues, include:
@@ -409,3 +333,42 @@ When reporting issues, include:
 - stderr/stdout snippet
 - OS + shell
 - whether you used default paths or env overrides
+
+---
+
+## 12) Agent execution tips for flawless setup
+
+- Prefer targeted fixes over broad reinstall.
+- Validate after each fix, not only at the end.
+- Keep reports honest: configured vs callable vs successful.
+- Never mark COMPLETE without stop-gate, hook, and wrapper verification.
+- If anything is ambiguous, fail safe and log assumptions explicitly.
+
+
+---
+
+## 13) Common failure patterns and deterministic fixes
+
+1. **Bootstrap rerun loop without diagnosis**
+   - Symptom: repeated bootstrap attempts with same failure.
+   - Fix: capture first failing command + stderr, patch that integration, rerun bootstrap once.
+
+2. **Hooks exist but events are incomplete**
+   - Symptom: hook appears installed but autonomous resume does not trigger.
+   - Fix: verify hook metadata includes required events and re-bootstrap if missing.
+
+3. **Wrapper exists but stop-gate is bypassed**
+   - Symptom: wrapped agent exits while session is still active.
+   - Fix: re-validate wrapper contract with active-session preflight + stop-hook loop checks.
+
+4. **Session active but unwanted progress updates**
+   - Symptom: user receives updates during fixed deadline autonomous window.
+   - Fix: confirm `update_policy=final-only` inference and `user_update_allowed=false` in blocked stop payloads.
+
+5. **Claiming done without closure proof**
+   - Symptom: report says complete but session state still active.
+   - Fix: require stop-allow evidence (successful final `--hook-stop`) before completion claim.
+
+6. **Provider config file is invalid or stale**
+   - Symptom: bootstrap fails, hooks are ignored, or config JSON cannot be parsed.
+   - Fix: verify invalid config was quarantined or replaced safely, rerun bootstrap once, then rerun provider-specific checks.

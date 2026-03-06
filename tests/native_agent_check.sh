@@ -223,18 +223,23 @@ done
 "${CLI}" --add -R "native e2e" -D dynamic >"${WORK_DIR}/native-add.out"
 
 set +e
+"${CLI}" --hook-stop >"${WORK_DIR}/hook-stop-blocked.out"
+hook_stop_code=$?
+set -e
+test "${hook_stop_code}" -eq 2
+grep -q '"template_id": "stop-blocked"' "${WORK_DIR}/hook-stop-blocked.out"
+
+set +e
 timeout 2 "${WRAP_DIR}/omni-wrap-codex" --version >"${WORK_DIR}/loop.out" 2>&1
 loop_code=$?
 set -e
 test "${loop_code}" -eq 124
-grep -q '"template_id": "stop-blocked"' "${WORK_DIR}/loop.out"
 
 set +e
 timeout 2 "${WRAP_DIR}/omni-agent-wrap" gemini --version >"${WORK_DIR}/loop-gemini.out" 2>&1
 gemini_loop_code=$?
 set -e
 test "${gemini_loop_code}" -eq 124
-grep -q '"template_id": "stop-blocked"' "${WORK_DIR}/loop-gemini.out"
 
 "${CLI}" --await-user -Q "Need constraints confirmation" >"${WORK_DIR}/await-user.out"
 
@@ -373,6 +378,9 @@ if [[ "${hook_info_code}" -ne 0 ]]; then
 fi
 grep -q "gateway:startup" "${WORK_DIR}/native-hook-info.out"
 grep -q "message:received" "${WORK_DIR}/native-hook-info.out"
+grep -q "message:transcribed" "${WORK_DIR}/native-hook-info.out"
+grep -q "message:preprocessed" "${WORK_DIR}/native-hook-info.out"
+grep -q "session:compact:before" "${WORK_DIR}/native-hook-info.out"
 
 set +e
 timeout "${CHECK_TIMEOUT}" openclaw hooks check >"${WORK_DIR}/native-hooks-check.out" 2>"${WORK_DIR}/native-hooks-check.err"

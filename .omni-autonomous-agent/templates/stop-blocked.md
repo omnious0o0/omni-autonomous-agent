@@ -15,5 +15,6 @@ Policy:
 - Keep `REPORT.md` status accurate before each stop retry.
 - If user input is missing, continue with the safest assumptions and log them.
 - Re-attempt stop only when requirements are met.
+- If `update_policy=final-only`, do not send user-facing progress updates until closure or explicit user request.
 
 If you have lost context of `SKILL.md`, reread it now. It is very important (`omni-autonomous-agent` skill).

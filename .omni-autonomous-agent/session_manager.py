@@ -361,6 +361,17 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
     return True
 
 
+def _normalize_state_fields(state: dict[str, Any]) -> bool:
+    policy = str(state.get("update_policy", "")).strip().lower()
+    if policy in {"milestones", "final-only"}:
+        return False
+
+    request = str(state.get("request", ""))
+    duration_mode = str(state.get("duration_mode", "dynamic"))
+    state["update_policy"] = _infer_update_policy(request, duration_mode)
+    return True
+
+
 def _load_with_error() -> tuple[dict[str, Any] | None, str | None]:
     if not STATE_FILE.exists():
         return None, None
@@ -380,6 +391,9 @@ def _load_with_error() -> tuple[dict[str, Any] | None, str | None]:
 
     if not _state_is_valid(loaded):
         return None, "state file is invalid: missing required fields"
+
+    if _normalize_state_fields(loaded):
+        _save(loaded)
 
     return loaded, None
 
@@ -562,6 +576,7 @@ def _hook_template_context(
         "report_path": _display_path(report_path),
         "log_path": _display_path(log_path),
         "report_status": _read_report_status(state),
+        "update_policy": str(state.get("update_policy", "milestones")),
     }
 
 
@@ -612,6 +627,51 @@ def _cancel_instruction_text() -> str:
         f"Reply {CANCEL_ACCEPT_TOKEN!r} to accept cancellation or {CANCEL_DENY_TOKEN!r} to deny. "
         "CLI fallback: --cancel-accept / --cancel-deny."
     )
+
+
+def _infer_update_policy(request: str, duration_mode: str) -> str:
+    text = request.strip().lower()
+    if not text:
+        return "milestones"
+
+    silence_markers = (
+        "no update",
+        "no updates",
+        "no progress update",
+        "no progress updates",
+        "silent",
+        "do not message",
+        "don't message",
+        "dont message",
+        "only final",
+        "final report only",
+    )
+    if any(marker in text for marker in silence_markers):
+        return "final-only"
+
+    if duration_mode == "fixed":
+        if re.search(r"\buntil\b", text):
+            return "final-only"
+        if re.search(r"\b(?:by|till|til)\s+\d{1,2}(?::\d{2})?\b", text):
+            return "final-only"
+
+    return "milestones"
+
+
+def _user_update_allowed(
+    state: dict[str, Any], snapshot: dict[str, Any], report_status: str
+) -> bool:
+    policy = str(state.get("update_policy", "milestones")).strip().lower()
+    if policy != "final-only":
+        return True
+
+    if snapshot["dynamic"]:
+        return report_status in {"COMPLETE", "PARTIAL"}
+
+    remaining = snapshot["remaining_seconds"]
+    if remaining is None:
+        return True
+    return remaining <= 0
 
 
 def _sanitize_decision_note(note: str) -> str:
@@ -943,6 +1003,7 @@ def cmd_add(request: str, duration: str) -> None:
             "task_title": title,
             "sandbox_dir": str(sandbox),
             "status": "active",
+            "update_policy": _infer_update_policy(request_clean, duration_mode),
         }
 
         try:
@@ -956,6 +1017,7 @@ def cmd_add(request: str, duration: str) -> None:
                     f"Duration mode: {duration_mode}",
                     f"Deadline: {_fmt_dt(deadline) if deadline else 'dynamic'}",
                     f"Sandbox: {sandbox}",
+                    f"User updates: {state.get('update_policy', 'milestones')}",
                 ],
             )
         except Exception as exc:
@@ -1208,6 +1270,7 @@ def _status_json_payload(
             else None,
             "time_remaining_seconds": snapshot["remaining_seconds"],
             "duration_input": str(state.get("duration_input", "")),
+            "update_policy": str(state.get("update_policy", "milestones")),
             "report_status": report_status,
             "report_status_effective": report_status_effective,
             "session_registered": True,
@@ -1295,6 +1358,7 @@ def cmd_status(*, json_output: bool = False) -> None:
                 _row("Deadline", _fmt_dt(snapshot["deadline"]))
                 _row("Time remaining", _fmt_remaining(snapshot["remaining_seconds"]))
 
+            _row("User updates", str(state.get("update_policy", "milestones")))
             report_status = _read_report_status(state)
             closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
             report_display = report_status
@@ -1653,6 +1717,7 @@ def cmd_hook_stop() -> None:
             now = _now()
             snapshot = _status_snapshot(state, now)
             report_status = _read_report_status(state)
+            user_update_allowed = _user_update_allowed(state, snapshot, report_status)
 
             await_deadline = _await_user_deadline(state)
             if await_deadline is not None:
@@ -1702,6 +1767,7 @@ def cmd_hook_stop() -> None:
                         response_deadline=_fmt_dt(await_deadline),
                         template_id="stop-blocked",
                         template=template_text,
+                        user_update_allowed=user_update_allowed,
                     )
                     sys.exit(_blocked_stop_exit_code(retry_immediately=False))
 
@@ -1729,6 +1795,7 @@ def cmd_hook_stop() -> None:
                     retry_immediately=True,
                     template_id="user-timeout-continue",
                     template=template_text,
+                    user_update_allowed=user_update_allowed,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
@@ -1770,6 +1837,7 @@ def cmd_hook_stop() -> None:
                         retry_immediately=False,
                         template_id="stop-blocked",
                         template=template_text,
+                        user_update_allowed=user_update_allowed,
                     )
                     sys.exit(_pause_then_resume_exit_code())
 
@@ -1797,6 +1865,7 @@ def cmd_hook_stop() -> None:
                     retry_immediately=True,
                     template_id="stop-blocked",
                     template=template_text,
+                    user_update_allowed=user_update_allowed,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
@@ -1826,6 +1895,7 @@ def cmd_hook_stop() -> None:
                     retry_immediately=True,
                     template_id="stop-blocked",
                     template=template_text,
+                    user_update_allowed=user_update_allowed,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
@@ -1864,6 +1934,7 @@ def cmd_hook_stop() -> None:
                     retry_immediately=True,
                     template_id=template_id,
                     template=template_text,
+                    user_update_allowed=user_update_allowed,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
@@ -1901,6 +1972,7 @@ def cmd_hook_stop() -> None:
                     retry_immediately=True,
                     template_id="stop-blocked",
                     template=template_text,
+                    user_update_allowed=user_update_allowed,
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
@@ -1913,6 +1985,7 @@ def cmd_hook_stop() -> None:
                 active=False,
                 block=False,
                 archived_sandbox=str(archived) if archived else None,
+                user_update_allowed=True,
             )
         except Exception as exc:
             template_text = render_template(

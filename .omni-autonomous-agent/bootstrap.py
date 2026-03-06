@@ -59,6 +59,9 @@ def _path_override(env_name: str, default_path: Path) -> Path:
 
 
 def _default_opencode_plugin_path() -> Path:
+    config_dir = os.environ.get("OPENCODE_CONFIG_DIR", "").strip()
+    if config_dir:
+        return Path(config_dir).expanduser() / "plugins" / "omni-hook.ts"
     config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
     if config_home:
         return Path(config_home).expanduser() / "opencode" / "plugins" / "omni-hook.ts"
@@ -572,17 +575,18 @@ def _forced_wrapper_names() -> set[str]:
 def _openclaw_hook_md() -> str:
     return """---
 name: omni-recovery
-description: \"Auto-resume active autonomous sessions on startup and clear await-user windows on inbound messages\"
+description: \"Auto-resume active autonomous sessions on startup, react to enriched inbound messages, and checkpoint before compaction\"
 metadata:
   openclaw:
     emoji: \"🔁\"
-    events: [\"gateway:startup\", \"message:received\"]
+    events: [\"gateway:startup\", \"message:received\", \"message:transcribed\", \"message:preprocessed\", \"session:compact:before\"]
 ---
 # omni-recovery
 Runs Omni Autonomous Agent recovery flows for OpenClaw events:
 
 - On `gateway:startup`: if an OAA session is active, queue a resume ping turn.
-- On `message:received`: process cancellation decisions (`...` accept, `..` deny) and auto-register await-user responses.
+- On inbound message events: process cancellation decisions (`...` accept, `..` deny) and auto-register await-user responses using the richest available message text.
+- On `session:compact:before`: write the OAA precompact handoff/checkpoint before OpenClaw compacts the session.
 
 Note: OpenClaw hooks are event-driven and do not provide true idle timers.
 """
@@ -732,12 +736,28 @@ const runtimeEnv = buildRuntimeEnv();
 
 const resolveHome = (): string => (process.env.HOME ?? process.env.USERPROFILE ?? '').trim();
 
-const resolveWakeDedupeFile = (): string | null => {
+const resolveConfigDir = (): string | null => {
   const configOverride = process.env.OMNI_AGENT_CONFIG_DIR?.trim();
-  if (configOverride) return join(configOverride, 'openclaw-startup-wake.json');
+  if (configOverride) return configOverride;
   const home = resolveHome();
   if (!home) return null;
-  return join(home, '.config', 'omni-autonomous-agent', 'openclaw-startup-wake.json');
+  if (process.platform === 'win32') {
+    const appData =
+      (process.env.LOCALAPPDATA ?? process.env.APPDATA ?? '').trim() || join(home, 'AppData', 'Local');
+    return join(appData, 'omni-autonomous-agent');
+  }
+  if (process.platform === 'darwin') {
+    return join(home, 'Library', 'Application Support', 'omni-autonomous-agent');
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim();
+  if (xdgConfigHome) return join(xdgConfigHome, 'omni-autonomous-agent');
+  return join(home, '.config', 'omni-autonomous-agent');
+};
+
+const resolveWakeDedupeFile = (): string | null => {
+  const configDir = resolveConfigDir();
+  if (!configDir) return null;
+  return join(configDir, 'openclaw-startup-wake.json');
 };
 
 const readJsonObject = (path: string): Record<string, unknown> | null => {
@@ -1019,6 +1039,21 @@ const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | 
 const readEventAccountId = (event: any): string =>
   typeof event?.context?.accountId === 'string' ? event.context.accountId.trim() : '';
 
+const readInboundEventText = (event: any): string => {
+  const candidates = [
+    event?.context?.bodyForAgent,
+    event?.context?.transcript,
+    event?.context?.content,
+    event?.context?.body,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.replace(/\\s+/g, ' ').trim();
+    if (normalized) return normalized;
+  }
+  return '';
+};
+
 const senderAuthorizedForCancelDecision = (event: any, from: string): boolean => {
   const normalizedFrom = from.trim().toLowerCase();
   if (!normalizedFrom) return false;
@@ -1188,12 +1223,34 @@ const queueResumePing = (status: StatusPayload, event: any) => {
 };
 
 const handler = async (event: any) => {
-  if (event.type === 'message' && event.action === 'received') {
+  if (
+    event.type === 'session' &&
+    event.action === 'compact:before'
+  ) {
+    const status = readStatusPayload();
+    if (!status?.active) return;
+
+    const precompact = runOaa(['--hook-precompact']);
+    if (precompact.ok) {
+      recordHookTelemetry('openclaw.session.precompact_forwarded', 'status=ok');
+      return;
+    }
+
+    const details = normalizeTelemetryText(precompact.output || 'unknown', 180);
+    console.warn(`[omni-recovery] precompact forward failed: ${details}`);
+    recordHookTelemetry('openclaw.session.precompact_failed', `reason=${details}`);
+    return;
+  }
+
+  if (
+    event.type === 'message' &&
+    ['received', 'transcribed', 'preprocessed'].includes(event.action)
+  ) {
     const from = typeof event.context?.from === 'string' ? event.context.from.trim() : '';
     if (!from || from.toLowerCase() === 'system') return;
 
     const status = readStatusPayload();
-    const raw = typeof event.context?.content === 'string' ? event.context.content : '';
+    const raw = readInboundEventText(event);
     const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
 
     if (!status?.active) return;
@@ -1275,7 +1332,7 @@ def _configure_openclaw() -> tuple[bool, Path]:
         handler_ts.write_text(handler_content, encoding="utf-8")
         changed = True
 
-    def _run_openclaw_enable(command: list[str]) -> tuple[bool, str]:
+    def _run_openclaw_command(command: list[str]) -> tuple[bool, str]:
         command_text = " ".join(command)
         try:
             result = subprocess.run(
@@ -1294,17 +1351,23 @@ def _configure_openclaw() -> tuple[bool, Path]:
         details = (result.stderr or result.stdout or "command failed").strip()
         return False, f"{command_text}: {details}"
 
-    recovery_ok, recovery_error = _run_openclaw_enable(
+    recovery_ok, recovery_error = _run_openclaw_command(
         ["openclaw", "hooks", "enable", "omni-recovery"]
     )
     if not recovery_ok:
         raise RuntimeError(recovery_error)
 
-    session_memory_ok, session_memory_error = _run_openclaw_enable(
+    session_memory_ok, session_memory_error = _run_openclaw_command(
         ["openclaw", "hooks", "enable", "session-memory"]
     )
     if not session_memory_ok:
         _row("Warning", c(YELLOW, f"OpenClaw optional hook: {session_memory_error}"))
+
+    hook_check_ok, hook_check_error = _run_openclaw_command(
+        ["openclaw", "hooks", "check"]
+    )
+    if not hook_check_ok:
+        raise RuntimeError(f"openclaw hooks health check failed: {hook_check_error}")
 
     return changed, hook_dir
 

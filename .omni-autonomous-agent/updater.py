@@ -108,6 +108,31 @@ def _should_skip_auto_update() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _refresh_bootstrap(repo_root: Path) -> tuple[bool, str]:
+    env = os.environ.copy()
+    env["OMNI_AGENT_DISABLE_AUTO_UPDATE"] = "1"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(repo_root / "main.py"), "--bootstrap"],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_command_timeout_seconds(180),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return False, f"bootstrap timed out: {exc}"
+    except OSError as exc:
+        return False, str(exc)
+
+    output = (result.stdout or "").strip()
+    error_output = (result.stderr or "").strip()
+    details = error_output or output or f"bootstrap exited with {result.returncode}"
+    return result.returncode == 0, details
+
+
 def maybe_auto_update() -> None:
     if _should_skip_auto_update():
         return
@@ -166,14 +191,23 @@ def maybe_auto_update() -> None:
             env=env,
             timeout=_command_timeout_seconds(120),
         )
-        if result.returncode == 0:
-            next_state["last_result"] = "updated"
-            next_state["last_output"] = (result.stdout or "").strip()
-        else:
+        if result.returncode != 0:
             next_state["last_result"] = "failed"
             next_state["last_output"] = (result.stderr or "").strip() or (
                 result.stdout or ""
             ).strip()
+            _save_auto_update_state(next_state)
+            return
+
+        bootstrap_ok, bootstrap_output = _refresh_bootstrap(repo_root)
+        next_state["last_output"] = (result.stdout or "").strip()
+        if bootstrap_ok:
+            next_state["last_result"] = "updated"
+            if bootstrap_output:
+                next_state["last_bootstrap"] = bootstrap_output
+        else:
+            next_state["last_result"] = "updated_bootstrap_failed"
+            next_state["last_bootstrap"] = bootstrap_output
     except Exception as exc:
         next_state["last_result"] = "failed"
         next_state["last_output"] = str(exc)
@@ -253,9 +287,16 @@ def cmd_update() -> None:
         details = stderr or stdout or "git pull failed"
         sys.exit(f"error: update failed: {details}")
 
+    print(f"  {c(DIM, 'Refreshing hooks and wrappers...')}")
+    bootstrap_ok, bootstrap_output = _refresh_bootstrap(repo_root)
+    if not bootstrap_ok:
+        sys.exit(f"error: update failed during bootstrap refresh: {bootstrap_output}")
+
     output = (result.stdout or "").strip()
     if output:
         print(f"  {c(GREEN, 'OK')} {output}")
     else:
         print(f"  {c(GREEN, 'OK')} Update complete")
-    print(SEP)
+
+    if bootstrap_output:
+        print(f"  {c(GREEN, 'OK')} Bootstrap refreshed")

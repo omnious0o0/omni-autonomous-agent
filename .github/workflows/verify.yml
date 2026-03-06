@@ -1,0 +1,89 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cross-platform-logic:
+    name: cross-platform-logic (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run cross-platform logic tests
+        run: python -m unittest tests.test_cross_platform_logic
+
+  windows-smoke:
+    name: windows-smoke
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Windows Smoke
+        shell: pwsh
+        run: ./tests/windows_smoke.ps1
+
+  macos-smoke:
+    name: macos-smoke
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: macOS Smoke
+        shell: bash
+        run: bash tests/macos_smoke.sh
+
+  linux-full:
+    name: linux-full
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax checks
+        run: |
+          bash -n .omni-autonomous-agent/install.sh tests/docker_smoke.sh tests/native_agent_check.sh tests/host_agent_check.sh tests/launch_gate.sh tests/pwsh_install_smoke.sh
+          python -m py_compile main.py .omni-autonomous-agent/constants.py .omni-autonomous-agent/bootstrap.py .omni-autonomous-agent/updater.py .omni-autonomous-agent/cli.py .omni-autonomous-agent/session_manager.py tests/test_autonomous_agent.py tests/test_cross_platform_logic.py
+
+      - name: Unit tests
+        run: python -m unittest tests.test_autonomous_agent tests.test_cross_platform_logic
+
+      - name: PowerShell Install Smoke
+        shell: bash
+        run: bash tests/pwsh_install_smoke.sh
+
+      - name: Launch gate
+        shell: bash
+        run: bash tests/launch_gate.sh

@@ -200,6 +200,24 @@ if command -v openclaw >/dev/null 2>&1; then
   if ! printf "%s\n" "${hooks_output}" | grep -q "session-memory"; then
     printf "host-agent-check note: session-memory not available; continuing with omni-recovery only\n" >&2
   fi
+
+  set +e
+  hook_info_output="$(timeout "${CHECK_TIMEOUT}" openclaw hooks info omni-recovery)"
+  hook_info_code=$?
+  set -e
+  if [[ "${hook_info_code}" -eq 124 ]]; then
+    printf "host-agent-check failed: openclaw hooks info timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ "${hook_info_code}" -ne 0 ]]; then
+    printf "host-agent-check failed: openclaw hooks info returned %s\n" "${hook_info_code}" >&2
+    exit 1
+  fi
+  printf "%s\n" "${hook_info_output}" | grep -q "gateway:startup"
+  printf "%s\n" "${hook_info_output}" | grep -q "message:received"
+  printf "%s\n" "${hook_info_output}" | grep -q "message:transcribed"
+  printf "%s\n" "${hook_info_output}" | grep -q "message:preprocessed"
+  printf "%s\n" "${hook_info_output}" | grep -q "session:compact:before"
 fi
 
 printf "host-agent-check passed\n"

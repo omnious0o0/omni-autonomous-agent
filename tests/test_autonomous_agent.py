@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import itertools
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+import main as launcher_main
 
 sys.dont_write_bytecode = True
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAIN_SCRIPT = PROJECT_ROOT / "main.py"
+INTERNAL_PKG_COUNTER = itertools.count()
 
 
 def _run_cli(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -31,6 +36,19 @@ def _json_output(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
     if not output:
         return {}
     return json.loads(output.splitlines()[-1])
+
+
+def _load_internal_modules(*module_names: str) -> dict[str, object]:
+    pkg_dir = PROJECT_ROOT / ".omni-autonomous-agent"
+    pkg_name = f"omni_agent_test_{next(INTERNAL_PKG_COUNTER)}"
+    launcher_main._load_package(pkg_name, str(pkg_dir))
+
+    loaded: dict[str, object] = {}
+    for module_name in module_names:
+        loaded[module_name] = launcher_main._load_module(
+            pkg_name, module_name, str(pkg_dir)
+        )
+    return loaded
 
 
 class AutonomousAgentHardeningTests(unittest.TestCase):
@@ -623,8 +641,12 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         universal_wrapper_text = universal_wrapper.read_text(encoding="utf-8")
         codex_wrapper_text = codex_wrapper.read_text(encoding="utf-8")
         self.assertIn(
-            'events: ["gateway:startup", "message:received"]', openclaw_hook_text
+            'events: ["gateway:startup", "message:received", "message:transcribed", "message:preprocessed", "session:compact:before"]',
+            openclaw_hook_text,
         )
+        self.assertIn("message:transcribed", openclaw_hook_text)
+        self.assertIn("message:preprocessed", openclaw_hook_text)
+        self.assertIn("session:compact:before", openclaw_hook_text)
         self.assertIn("OMNI_AGENT_DISABLE_OPENCLAW_AUTOWAKE", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OPENCLAW_BIN", openclaw_handler_text)
         self.assertIn("OMNI_AGENT_OAA_BIN", openclaw_handler_text)
@@ -641,10 +663,18 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("--log-event", openclaw_handler_text)
         self.assertIn("--event", openclaw_handler_text)
         self.assertIn("--note", openclaw_handler_text)
+        self.assertIn("--hook-precompact", openclaw_handler_text)
         self.assertIn(
             "eventSessionKey.startsWith('agent:') ? eventSessionKey : ''",
             openclaw_handler_text,
         )
+        self.assertIn("readInboundEventText", openclaw_handler_text)
+        self.assertIn(
+            "['received', 'transcribed', 'preprocessed'].includes(event.action)",
+            openclaw_handler_text,
+        )
+        self.assertIn("event.type === 'session'", openclaw_handler_text)
+        self.assertIn("event.action === 'compact:before'", openclaw_handler_text)
         self.assertIn("--user-responded", openclaw_handler_text)
         self.assertIn("--cancel-accept", openclaw_handler_text)
         self.assertIn("--cancel-deny", openclaw_handler_text)
@@ -1018,6 +1048,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("WriteAllText", text)
         self.assertIn("OMNI_AGENT_BOOTSTRAP_TIMEOUT", text)
         self.assertIn("Wait-Process", text)
+        self.assertIn("Get-PowerShellHostCommand", text)
+        self.assertIn("$env:ComSpec", text)
+        self.assertIn("$runnerPs1", text)
 
     def test_installer_script_contains_bootstrap_timeout_guard(self) -> None:
         install_sh = PROJECT_ROOT / ".omni-autonomous-agent" / "install.sh"
@@ -1123,6 +1156,246 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("Event: openclaw-startup-wake-queued", log_text)
         self.assertIn("Note: route=abc session=def", log_text)
         self.assertIn("Checkpoint (hook:openclaw-startup-wake-queued)", report_text)
+
+    def test_final_only_update_policy_detected_for_until_requests(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "Clean workspace until 09:00 local time", "-D", "15"],
+            self.env,
+        )
+        self.assertEqual(added.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        status_payload = json.loads(status_json.stdout)
+        self.assertEqual(status_payload.get("update_policy"), "final-only")
+
+        stop = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop.returncode, 2)
+        stop_payload = _json_output(stop)
+        self.assertFalse(bool(stop_payload.get("user_update_allowed", True)))
+        self.assertIn(
+            "final-only",
+            str(stop_payload.get("template", "")).lower(),
+        )
+
+    def test_legacy_state_without_update_policy_is_migrated(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "Keep cleaning until 09:00", "-D", "15"],
+            self.env,
+        )
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state.pop("update_policy", None)
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertEqual(payload.get("update_policy"), "final-only")
+
+        migrated = self._read_state()
+        self.assertEqual(migrated.get("update_policy"), "final-only")
+
+    def test_install_help_is_machine_agnostic(self) -> None:
+        text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
+        banned = ["/home/", "~/", "%LOCALAPPDATA%", "%APPDATA%", "C:/"]
+        for token in banned:
+            self.assertNotIn(token, text)
+
+    def test_install_help_keeps_core_hook_setup_checks(self) -> None:
+        text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "omni-autonomous-agent --bootstrap",
+            "openclaw hooks check",
+            "openclaw hooks info omni-recovery",
+            "Wrapper contract",
+            "Final-only update policy check",
+            "Evidence checklist",
+            "AI self-setup playbook (non-scripted fallback)",
+            "Official references and troubleshooting resources",
+            "message:transcribed",
+            "message:preprocessed",
+            "session:compact:before",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_install_help_keeps_current_official_reference_links(self) -> None:
+        text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
+        required_links = [
+            "https://docs.openclaw.ai/automation/hooks",
+            "https://docs.openclaw.ai/automation/hooks#troubleshooting",
+            "https://geminicli.com/docs/get-started/authentication/",
+            "https://geminicli.com/docs/hooks/",
+            "https://code.claude.com/docs/en/hooks",
+            "https://opencode.ai/docs/plugins/",
+            "https://platform.openai.com/docs/guides/tools-shell",
+        ]
+        for link in required_links:
+            self.assertIn(link, text)
+
+    def test_install_help_keeps_future_agent_and_config_recovery_guidance(self) -> None:
+        text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "Future-agent fallback",
+            "AGENT=<agent-command> omni-autonomous-agent --bootstrap",
+            "OMNI_AGENT_EXTRA_WRAPPERS",
+            "does **not** replace the shell",
+            "provider config file was invalid",
+            "quarantined or replaced safely",
+            "simulated coverage only",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_default_config_dir_windows_uses_localappdata(self) -> None:
+        constants = _load_internal_modules("constants")["constants"]
+        class FakeWindowsPath(PureWindowsPath):
+            def expanduser(self) -> "FakeWindowsPath":
+                return self
+
+        with (
+            mock.patch.dict(
+                constants.os.environ,
+                {"LOCALAPPDATA": "DriveRoot/AppData/Local"},
+                clear=True,
+            ),
+            mock.patch.object(constants, "Path", FakeWindowsPath),
+            mock.patch.object(constants.os, "name", "nt"),
+            mock.patch.object(constants.sys, "platform", "win32"),
+        ):
+            self.assertEqual(
+                str(constants._default_config_dir()),
+                "DriveRoot\\AppData\\Local\\omni-autonomous-agent",
+            )
+
+    def test_default_config_dir_macos_uses_application_support(self) -> None:
+        constants = _load_internal_modules("constants")["constants"]
+        with (
+            mock.patch.dict(constants.os.environ, {}, clear=True),
+            mock.patch.object(constants.os, "name", "posix"),
+            mock.patch.object(constants.sys, "platform", "darwin"),
+            mock.patch.object(
+                constants.Path, "home", return_value=Path("/tmp/macos-home")
+            ),
+        ):
+            self.assertEqual(
+                constants._default_config_dir(),
+                Path("/tmp/macos-home")
+                / "Library"
+                / "Application Support"
+                / "omni-autonomous-agent",
+            )
+
+    def test_default_config_dir_linux_uses_xdg_config_home(self) -> None:
+        constants = _load_internal_modules("constants")["constants"]
+        with (
+            mock.patch.dict(
+                constants.os.environ,
+                {"XDG_CONFIG_HOME": "/tmp/xdg-config"},
+                clear=True,
+            ),
+            mock.patch.object(constants.os, "name", "posix"),
+            mock.patch.object(constants.sys, "platform", "linux"),
+        ):
+            self.assertEqual(
+                constants._default_config_dir(),
+                Path("/tmp/xdg-config") / "omni-autonomous-agent",
+            )
+
+    def test_bootstrap_wrapper_bin_dir_windows_uses_localappdata(self) -> None:
+        modules = _load_internal_modules("constants", "bootstrap")
+        bootstrap = modules["bootstrap"]
+        class FakeWindowsPath(PureWindowsPath):
+            def expanduser(self) -> "FakeWindowsPath":
+                return self
+
+        with (
+            mock.patch.dict(
+                bootstrap.os.environ,
+                {"LOCALAPPDATA": "DriveRoot/AppData/Local"},
+                clear=True,
+            ),
+            mock.patch.object(bootstrap, "Path", FakeWindowsPath),
+            mock.patch.object(bootstrap.os, "name", "nt"),
+        ):
+            self.assertEqual(
+                str(bootstrap._wrapper_bin_dir()),
+                "DriveRoot\\AppData\\Local\\omni-autonomous-agent\\bin",
+            )
+
+    def test_bootstrap_opencode_plugin_path_prefers_opencode_config_dir(self) -> None:
+        modules = _load_internal_modules("constants", "bootstrap")
+        bootstrap = modules["bootstrap"]
+        with mock.patch.dict(
+            bootstrap.os.environ,
+            {"OPENCODE_CONFIG_DIR": "/tmp/opencode-config"},
+            clear=True,
+        ):
+            self.assertEqual(
+                bootstrap._default_opencode_plugin_path(),
+                Path("/tmp/opencode-config") / "plugins" / "omni-hook.ts",
+            )
+
+    def test_docker_smoke_uses_real_docker_matrix(self) -> None:
+        text = (PROJECT_ROOT / "tests" / "docker_smoke.sh").read_text(
+            encoding="utf-8"
+        )
+        required_snippets = [
+            "docker run",
+            "curl -fsSL",
+            "OMNI_DOCKER_SMOKE_INSTALLER_HOST",
+            "--network host",
+            "OMNI_DOCKER_SMOKE_IMAGES",
+            "ubuntu:24.04",
+            "debian:12-slim",
+            "alpine:3.20",
+            "session:compact:before",
+            "message:transcribed",
+            "message:preprocessed",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_pwsh_install_smoke_script_exists(self) -> None:
+        text = (PROJECT_ROOT / "tests" / "pwsh_install_smoke.sh").read_text(
+            encoding="utf-8"
+        )
+        required_snippets = [
+            "mcr.microsoft.com/powershell:latest",
+            "pwsh -NoLogo -NoProfile -File /repo/.omni-autonomous-agent/install.ps1",
+            "omni-autonomous-agent.ps1",
+            "omni-autonomous-agent.cmd",
+            "omni-wrap-futureagent",
+            "--hook-stop",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_final_only_update_policy_detected_for_by_and_no_update_phrases(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "Finish hardening by 10:30 and no progress updates", "-D", "20"],
+            self.env,
+        )
+        self.assertEqual(added.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertEqual(payload.get("update_policy"), "final-only")
+
+    def test_no_update_phrase_for_dynamic_session_sets_final_only_policy(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "Do maintenance, no updates unless done", "-D", "dynamic"],
+            self.env,
+        )
+        self.assertEqual(added.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertEqual(payload.get("update_policy"), "final-only")
 
     def test_main_preflight_includes_bootstrap_module(self) -> None:
         main_text = (PROJECT_ROOT / "main.py").read_text(encoding="utf-8")

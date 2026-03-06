@@ -28,9 +28,12 @@ required_paths=(
   ".gitignore"
   "tests/test_autonomous_agent.py"
   "tests/docker_smoke.sh"
+  "tests/macos_smoke.sh"
+  "tests/pwsh_install_smoke.sh"
   "tests/native_agent_check.sh"
   "tests/host_agent_check.sh"
   "tests/launch_gate.sh"
+  "tests/windows_smoke.ps1"
   ".omni-autonomous-agent/install.ps1"
 )
 
@@ -82,7 +85,10 @@ files = [
     root / ".omni-autonomous-agent" / "install.ps1",
     root / "tests" / "test_autonomous_agent.py",
     root / "tests" / "docker_smoke.sh",
+    root / "tests" / "macos_smoke.sh",
+    root / "tests" / "pwsh_install_smoke.sh",
     root / "tests" / "host_agent_check.sh",
+    root / "tests" / "windows_smoke.ps1",
 ]
 
 patterns = [
@@ -152,18 +158,119 @@ if "trap 'omni-autonomous-agent --hook-stop' EXIT" in install_help:
     raise SystemExit('launch-gate failed: install-help.md contains outdated trap-only wrapper guidance')
 
 required_install_help_markers = [
+    '## 4C) Future-agent fallback (must stay generic)',
     '## 10) AI self-setup playbook (non-scripted fallback)',
+    '## 10B) Provider coverage rule',
+    '## 10C) Cross-OS proof rule',
     '## 11) Official references and troubleshooting resources',
+    'does **not** require every command to be prefixed',
+    'Verification grades',
+    'live-verified',
+    'simulated coverage only',
+    'quarantined or replaced safely',
     'https://docs.openclaw.ai/automation/hooks',
     'https://docs.openclaw.ai/automation/hooks#troubleshooting',
-    'https://google-gemini.github.io/gemini-cli/docs/get-started/authentication.html',
+    'https://geminicli.com/docs/get-started/authentication/',
+    'https://geminicli.com/docs/hooks/',
     'https://code.claude.com/docs/en/hooks',
+    'https://opencode.ai/docs/plugins/',
+    'https://platform.openai.com/docs/guides/tools-shell',
 ]
 missing_markers = [marker for marker in required_install_help_markers if marker not in install_help]
 if missing_markers:
     raise SystemExit(
         'launch-gate failed: install-help.md missing required self-setup markers: '
         + ', '.join(missing_markers)
+    )
+
+docker_smoke = (root / 'tests' / 'docker_smoke.sh').read_text(encoding='utf-8')
+required_docker_markers = [
+    'docker run',
+    'curl -fsSL',
+    'OMNI_DOCKER_SMOKE_INSTALLER_HOST',
+    '--network host',
+    'OMNI_DOCKER_SMOKE_IMAGES',
+    'ubuntu:24.04',
+    'debian:12-slim',
+    'alpine:3.20',
+    'session:compact:before',
+]
+missing_docker_markers = [
+    marker for marker in required_docker_markers if marker not in docker_smoke
+]
+if missing_docker_markers:
+    raise SystemExit(
+        'launch-gate failed: docker_smoke.sh is missing required Docker verification markers: '
+        + ', '.join(missing_docker_markers)
+    )
+
+pwsh_smoke = (root / 'tests' / 'pwsh_install_smoke.sh').read_text(encoding='utf-8')
+required_pwsh_markers = [
+    'mcr.microsoft.com/powershell:latest',
+    'install.ps1',
+    'omni-autonomous-agent.ps1',
+    'futureagent',
+    'pwsh-install-smoke passed',
+]
+missing_pwsh_markers = [
+    marker for marker in required_pwsh_markers if marker not in pwsh_smoke
+]
+if missing_pwsh_markers:
+    raise SystemExit(
+        'launch-gate failed: pwsh_install_smoke.sh is missing required PowerShell verification markers: '
+        + ', '.join(missing_pwsh_markers)
+    )
+
+windows_smoke = (root / 'tests' / 'windows_smoke.ps1').read_text(encoding='utf-8')
+required_windows_markers = [
+    'windows-smoke passed',
+    'omni-autonomous-agent.ps1',
+    'futureagent',
+    'omni-wrap-codex.cmd',
+]
+missing_windows_markers = [
+    marker for marker in required_windows_markers if marker not in windows_smoke
+]
+if missing_windows_markers:
+    raise SystemExit(
+        'launch-gate failed: windows_smoke.ps1 is missing required Windows verification markers: '
+        + ', '.join(missing_windows_markers)
+    )
+
+macos_smoke = (root / 'tests' / 'macos_smoke.sh').read_text(encoding='utf-8')
+required_macos_markers = [
+    'macos-smoke passed',
+    'futureagent',
+    'omni-wrap-codex',
+    'omni-agent-wrap',
+]
+missing_macos_markers = [
+    marker for marker in required_macos_markers if marker not in macos_smoke
+]
+if missing_macos_markers:
+    raise SystemExit(
+        'launch-gate failed: macos_smoke.sh is missing required macOS verification markers: '
+        + ', '.join(missing_macos_markers)
+    )
+
+workflow = (root / '.github' / 'workflows' / 'verify.yml').read_text(encoding='utf-8')
+required_workflow_markers = [
+    'ubuntu-latest',
+    'windows-latest',
+    'macos-latest',
+    'tests.test_cross_platform_logic',
+    'tests.test_autonomous_agent',
+    'tests/pwsh_install_smoke.sh',
+    'tests/windows_smoke.ps1',
+    'tests/macos_smoke.sh',
+]
+missing_workflow_markers = [
+    marker for marker in required_workflow_markers if marker not in workflow
+]
+if missing_workflow_markers:
+    raise SystemExit(
+        'launch-gate failed: verify workflow is missing required cross-platform markers: '
+        + ', '.join(missing_workflow_markers)
     )
 PY
 

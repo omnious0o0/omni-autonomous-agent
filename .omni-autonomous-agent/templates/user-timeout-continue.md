@@ -13,3 +13,4 @@ Proceed with autonomous defaults:
 - Use the best safe assumptions from existing context.
 - Record those assumptions in `REPORT.md` and `LOG.md`.
 - Keep working until stop conditions are truly satisfied.
+- If `update_policy=final-only`, do not send user-facing progress updates until closure or explicit user request.

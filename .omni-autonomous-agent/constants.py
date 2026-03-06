@@ -12,9 +12,36 @@ def _path_env(name: str, default: Path) -> Path:
     return Path(value).expanduser()
 
 
-CONFIG_DIR = _path_env(
-    "OMNI_AGENT_CONFIG_DIR", Path.home() / ".config" / "omni-autonomous-agent"
-)
+def _default_config_dir() -> Path:
+    if os.name == "nt":
+        base = (
+            os.environ.get("LOCALAPPDATA", "").strip()
+            or os.environ.get("APPDATA", "").strip()
+        )
+        if base:
+            return Path(base).expanduser() / "omni-autonomous-agent"
+        return (
+            Path.home()
+            / "AppData"
+            / "Local"
+            / "omni-autonomous-agent"
+        )
+
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "omni-autonomous-agent"
+        )
+
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if config_home:
+        return Path(config_home).expanduser() / "omni-autonomous-agent"
+    return Path.home() / ".config" / "omni-autonomous-agent"
+
+
+CONFIG_DIR = _path_env("OMNI_AGENT_CONFIG_DIR", _default_config_dir())
 STATE_FILE = CONFIG_DIR / "state.json"
 
 REPO_ROOT = _path_env("OMNI_AGENT_REPO_ROOT", Path(__file__).resolve().parent.parent)

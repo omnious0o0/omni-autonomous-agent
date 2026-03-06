@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Run cross-platform logic tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -42,6 +47,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Windows Smoke
         shell: pwsh
         run: ./tests/windows_smoke.ps1
@@ -58,6 +68,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: macOS Smoke
         shell: bash
         run: bash tests/macos_smoke.sh
@@ -73,6 +88,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Launch gate (clean copy)
         shell: bash

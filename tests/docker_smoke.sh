@@ -9,20 +9,6 @@ HTTP_PORT="${OMNI_DOCKER_SMOKE_HTTP_PORT:-}"
 INSTALLER_HOST="${OMNI_DOCKER_SMOKE_INSTALLER_HOST:-127.0.0.1}"
 DOCKER_RUN_ARGS_RAW="${OMNI_DOCKER_SMOKE_DOCKER_RUN_ARGS:---network host}"
 HTTP_SERVER_PID=""
-trap 'stop_installer_server; rm -rf "${WORK_DIR}"' EXIT
-
-if [[ -z "${HTTP_PORT}" ]]; then
-  HTTP_PORT="$(
-    python3 - <<'PY'
-import socket
-
-sock = socket.socket()
-sock.bind(("127.0.0.1", 0))
-print(sock.getsockname()[1])
-sock.close()
-PY
-  )"
-fi
 
 require_cmd() {
   local cmd="$1"
@@ -66,14 +52,64 @@ stop_installer_server() {
   fi
 }
 
+trap 'stop_installer_server; rm -rf "${WORK_DIR}"' EXIT
+
+if [[ -z "${HTTP_PORT}" ]]; then
+  HTTP_PORT="$(
+    python3 - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+  )"
+fi
+
 prepare_repo_fixture() {
   mkdir -p "${REPO_FIXTURE_DIR}"
-  rsync -a \
-    --exclude '.git' \
-    --exclude '__pycache__' \
-    --exclude '.ruff_cache' \
-    --exclude 'omni-sandbox/archived/*' \
-    "${ROOT_DIR}/" "${REPO_FIXTURE_DIR}/"
+  python3 - "${ROOT_DIR}" "${REPO_FIXTURE_DIR}" <<'PY'
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+fixture_dir = Path(sys.argv[2]).resolve()
+
+paths = subprocess.check_output(
+    [
+        "git",
+        "-C",
+        str(root),
+        "ls-files",
+        "--cached",
+        "--modified",
+        "--deduplicate",
+        "-z",
+    ]
+)
+
+for raw_rel in paths.decode("utf-8").split("\0"):
+    if not raw_rel:
+        continue
+    rel = Path(raw_rel)
+    source = root / rel
+    target = fixture_dir / rel
+    if not source.exists():
+        raise SystemExit(
+            f"docker-smoke failed: tracked path missing from working tree: {raw_rel}"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_symlink():
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        os.symlink(os.readlink(source), target)
+        continue
+    shutil.copy2(source, target)
+PY
 
   git init -q "${REPO_FIXTURE_DIR}"
   git -C "${REPO_FIXTURE_DIR}" config user.email "docker-smoke@example.invalid"
@@ -94,9 +130,10 @@ export WORK_DIR
 
 write_fake_binary() {
   local name="$1"
-  cat > "${WORK_DIR}/fakebin/${name}" <<'BIN'
+  cat > "${WORK_DIR}/fakebin/${name}" <<BIN
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "\$*" >> "${WORK_DIR}/agent-invocations/${name}.log"
 if [[ "${1:-}" == "--exit-code" ]]; then
   exit "${2:-0}"
 fi
@@ -201,7 +238,7 @@ export PYTHONPYCACHEPREFIX="${WORK_DIR}/pycache"
 export OMNI_AGENT_REPO_URL="file:///oaa-test/repo-source"
 export OMNI_DOCKER_SMOKE_INSTALLER_HOST="${OMNI_DOCKER_SMOKE_INSTALLER_HOST:-127.0.0.1}"
 
-mkdir -p "${HOME}" "${WORK_DIR}/fakebin" "${WORK_DIR}/bin"
+mkdir -p "${HOME}" "${WORK_DIR}/fakebin" "${WORK_DIR}/bin" "${WORK_DIR}/agent-invocations"
 export PATH="${WORK_DIR}/fakebin:${PATH}"
 
 cat > "${HOME}/.gitconfig" <<'GITCONF'
@@ -448,7 +485,8 @@ set +e
 "${HOME}/.local/bin/omni-wrap-codex" --exit-code 7
 FINAL_WRAP_CODE=$?
 set -e
-test "${FINAL_WRAP_CODE}" -eq 7
+test "${FINAL_WRAP_CODE}" -eq 0
+test ! -e "${WORK_DIR}/agent-invocations/codex.log"
 
 "${CLI}" --status > "${WORK_DIR}/post-final-status.txt"
 grep -q "No active session" "${WORK_DIR}/post-final-status.txt"
@@ -524,7 +562,6 @@ run_image() {
 require_cmd docker
 require_cmd curl
 require_cmd python3
-require_cmd rsync
 require_cmd git
 ensure_docker
 prepare_repo_fixture

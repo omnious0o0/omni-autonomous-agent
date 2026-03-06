@@ -113,6 +113,13 @@ class CrossPlatformLogicTests(unittest.TestCase):
         with mock.patch.object(bootstrap.os, "name", "nt"):
             self.assertEqual(bootstrap._wrapper_filename("omni-wrap-codex"), "omni-wrap-codex.cmd")
 
+    def test_windows_wrapper_does_not_claim_child_powershell_pid(self) -> None:
+        bootstrap = _load_internal_modules("constants", "bootstrap")["bootstrap"]
+        with mock.patch.object(bootstrap.os, "name", "nt"):
+            script = bootstrap._specific_wrapper_script("codex")
+        self.assertNotIn("--execution-owner-pid", script)
+        self.assertNotIn('-Command "$PID"', script)
+
     def test_opencode_plugin_path_respects_explicit_config_dir(self) -> None:
         bootstrap = _load_internal_modules("constants", "bootstrap")["bootstrap"]
         with tempfile.TemporaryDirectory() as config_dir:
@@ -139,6 +146,10 @@ class CrossPlatformLogicTests(unittest.TestCase):
             script = bootstrap._specific_wrapper_script("gemini")
         self.assertIn('gemini "$@"', script)
         self.assertNotIn("omni-autonomous-agent gemini", script)
+        self.assertIn(
+            "trap 'omni_exit_status=$?; trap - EXIT; cleanup_owner; exit \"$omni_exit_status\"' EXIT",
+            script,
+        )
 
     def test_install_help_documents_command_model_and_proof_limits(self) -> None:
         text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
@@ -231,7 +242,11 @@ class CrossPlatformLogicTests(unittest.TestCase):
             encoding="utf-8"
         )
         required_snippets = [
-            "git -C \"${ROOT_DIR}\" archive --format=tar HEAD",
+            '"git",',
+            '"ls-files",',
+            '"--cached",',
+            '"--modified",',
+            '"--deduplicate",',
             "rev-parse --is-inside-work-tree",
             "touch \"${COPY_DIR}/TASK.md\"",
             "bash tests/launch_gate.sh",
@@ -253,6 +268,19 @@ class CrossPlatformLogicTests(unittest.TestCase):
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)
+
+    def test_docker_smoke_uses_tracked_fixture_and_safe_cleanup_order(self) -> None:
+        text = (PROJECT_ROOT / "tests" / "docker_smoke.sh").read_text(
+            encoding="utf-8"
+        )
+        for snippet in ['"git",', '"ls-files",', '"--cached",', '"--modified",', '"--deduplicate",']:
+            self.assertIn(snippet, text)
+        self.assertNotIn("rsync -a", text)
+        self.assertNotIn("require_cmd rsync", text)
+        self.assertLess(
+            text.index("stop_installer_server() {"),
+            text.index('trap \'stop_installer_server; rm -rf "${WORK_DIR}"\' EXIT'),
+        )
 
     def test_windows_and_macos_smoke_scripts_exist(self) -> None:
         windows_text = (PROJECT_ROOT / "tests" / "windows_smoke.ps1").read_text(
@@ -284,6 +312,8 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "ubuntu-latest",
             "windows-latest",
             "macos-latest",
+            "actions/setup-node@v4",
+            'node-version: "22"',
             "tests.test_cross_platform_logic",
             "tests.test_autonomous_agent",
             "tests/launch_gate_clean.sh",

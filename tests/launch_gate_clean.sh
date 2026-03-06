@@ -13,7 +13,18 @@ if ! git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
-git -C "${ROOT_DIR}" archive --format=tar HEAD | tar -xf - -C "${COPY_DIR}"
+(
+  cd "${ROOT_DIR}"
+  tar \
+    --exclude-vcs \
+    --exclude='.git' \
+    --exclude='__pycache__' \
+    --exclude='*/__pycache__' \
+    --exclude='.ruff_cache' \
+    --exclude='omni-sandbox/archived' \
+    --exclude='omni-sandbox/archived/*' \
+    -cf - .
+) | tar -xf - -C "${COPY_DIR}"
 
 mkdir -p "${COPY_DIR}/omni-sandbox/archived"
 touch "${COPY_DIR}/omni-sandbox/archived/.gitkeep"

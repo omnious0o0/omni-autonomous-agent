@@ -154,6 +154,10 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "must **not** claim live provider verification",
             "simulated coverage only",
             "defined-but-broken VM",
+            "Do not fail a generic wrapper-based setup just because `openclaw` is absent",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest",
+            "tests/native_agent_check.sh",
+            "tests/host_agent_check.sh",
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)
@@ -184,6 +188,17 @@ class CrossPlatformLogicTests(unittest.TestCase):
         ]:
             self.assertIn(snippet, skill_text)
 
+    def test_gitignore_keeps_task_and_archived_sandbox_rules(self) -> None:
+        text = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        for snippet in [
+            "TASK.md",
+            "omni-sandbox/*",
+            "!omni-sandbox/archived/",
+            "omni-sandbox/archived/*",
+            "!omni-sandbox/archived/.gitkeep",
+        ]:
+            self.assertIn(snippet, text)
+
     def test_install_ps1_keeps_self_healing_bootstrap_logic(self) -> None:
         text = (PROJECT_ROOT / ".omni-autonomous-agent" / "install.ps1").read_text(
             encoding="utf-8"
@@ -198,6 +213,21 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "OMNI_AGENT_REPO_URL",
             "$env:ComSpec",
             "$runnerPs1",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_launch_gate_clean_script_keeps_sanitized_copy_flow(self) -> None:
+        text = (PROJECT_ROOT / "tests" / "launch_gate_clean.sh").read_text(
+            encoding="utf-8"
+        )
+        required_snippets = [
+            "rsync -a",
+            "__pycache__",
+            ".ruff_cache",
+            "omni-sandbox/archived/***",
+            "bash tests/launch_gate.sh",
+            "launch-gate-clean passed",
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)
@@ -248,6 +278,8 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "macos-latest",
             "tests.test_cross_platform_logic",
             "tests.test_autonomous_agent",
+            "tests/launch_gate_clean.sh",
+            "tests/docker_smoke.sh",
             "tests/launch_gate.sh",
             "tests/pwsh_install_smoke.sh",
             "tests/windows_smoke.ps1",

@@ -4,16 +4,18 @@
 
 ## What it does
 
-Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. like:
+Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. For example:
 - Work overnight
 - Work on this for 2 hours
 - Keep working on this until it's done
 - Do chores until I stop you
 ...
 
-Don't worry about the duration of the task, there's a memory system
+Don't worry about the duration of the task. There's a memory system.
 
 Basically any task that could take longer than usual.
+
+If OAA needs missing constraints before a long run, it tells the agent to give you 2 minutes to respond, then continue with the safest available assumptions if you do not reply in time.
 
 Your agent gets its own workspace where it can log its memory, reasoning, plans, timestamps of what it's doing, make its own tools and helpers, etc.
 

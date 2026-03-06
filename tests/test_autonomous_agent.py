@@ -1215,10 +1215,15 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "AI self-setup playbook (non-scripted fallback)",
             "Preferred repo-native verification ladder",
             "Official references and troubleshooting resources",
+            "Do not fail a generic wrapper-based setup just because `openclaw` is absent",
             "message:transcribed",
             "message:preprocessed",
             "session:compact:before",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest",
+            "tests/launch_gate_clean.sh",
             "tests/pwsh_install_smoke.sh",
+            "tests/native_agent_check.sh",
+            "tests/host_agent_check.sh",
             "tests/macos_smoke.sh",
             "tests/windows_smoke.ps1",
         ]
@@ -1234,7 +1239,8 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "https://geminicli.com/docs/hooks/",
             "https://code.claude.com/docs/en/hooks",
             "https://opencode.ai/docs/plugins/",
-            "https://platform.openai.com/docs/guides/tools-shell",
+            "https://developers.openai.com/api/docs/guides/tools-shell",
+            "https://developers.openai.com/api/docs/mcp",
         ]
         for link in required_links:
             self.assertIn(link, text)
@@ -1279,11 +1285,24 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "Work on this for 2 hours",
             "Keep working on this until it's done",
             "Do chores until I stop you",
+            "2 minutes",
             "install-help.md",
         ]
         for snippet in shared_snippets:
             self.assertIn(snippet, readme_text)
             self.assertIn(snippet, skill_text)
+
+    def test_gitignore_keeps_task_and_archived_sandbox_rules(self) -> None:
+        text = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        required_snippets = [
+            "TASK.md",
+            "omni-sandbox/*",
+            "!omni-sandbox/archived/",
+            "omni-sandbox/archived/*",
+            "!omni-sandbox/archived/.gitkeep",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
 
     def test_skill_keeps_command_model_and_honest_proof_rules(self) -> None:
         text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")

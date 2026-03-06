@@ -26,14 +26,18 @@ required_paths=(
   "LICENSE"
   "install-help.md"
   ".gitignore"
+  ".github/workflows/verify.yml"
   "tests/test_autonomous_agent.py"
+  "tests/test_cross_platform_logic.py"
   "tests/docker_smoke.sh"
   "tests/macos_smoke.sh"
   "tests/pwsh_install_smoke.sh"
   "tests/native_agent_check.sh"
   "tests/host_agent_check.sh"
   "tests/launch_gate.sh"
+  "tests/launch_gate_clean.sh"
   "tests/windows_smoke.ps1"
+  ".omni-autonomous-agent/install.sh"
   ".omni-autonomous-agent/install.ps1"
 )
 
@@ -169,7 +173,12 @@ required_install_help_markers = [
     'live-verified',
     'simulated coverage only',
     'quarantined or replaced safely',
+    'Do not fail a generic wrapper-based setup just because `openclaw` is absent',
+    'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest',
+    'tests/launch_gate_clean.sh',
     'tests/pwsh_install_smoke.sh',
+    'tests/native_agent_check.sh',
+    'tests/host_agent_check.sh',
     'tests/macos_smoke.sh',
     'tests/windows_smoke.ps1',
     'https://docs.openclaw.ai/automation/hooks',
@@ -178,7 +187,8 @@ required_install_help_markers = [
     'https://geminicli.com/docs/hooks/',
     'https://code.claude.com/docs/en/hooks',
     'https://opencode.ai/docs/plugins/',
-    'https://platform.openai.com/docs/guides/tools-shell',
+    'https://developers.openai.com/api/docs/guides/tools-shell',
+    'https://developers.openai.com/api/docs/mcp',
 ]
 missing_markers = [marker for marker in required_install_help_markers if marker not in install_help]
 if missing_markers:
@@ -193,7 +203,8 @@ required_readme_markers = [
     'Work on this for 2 hours',
     "Keep working on this until it's done",
     'Do chores until I stop you',
-    "there's a memory system",
+    "There's a memory system",
+    '2 minutes',
     'install-help.md',
     'canonical hook setup playbook',
 ]
@@ -234,6 +245,23 @@ if missing_skill_markers:
     raise SystemExit(
         'launch-gate failed: SKILL.md missing required autonomy contract markers: '
         + ', '.join(missing_skill_markers)
+    )
+
+gitignore_text = (root / '.gitignore').read_text(encoding='utf-8')
+required_gitignore_markers = [
+    'TASK.md',
+    'omni-sandbox/*',
+    '!omni-sandbox/archived/',
+    'omni-sandbox/archived/*',
+    '!omni-sandbox/archived/.gitkeep',
+]
+missing_gitignore_markers = [
+    marker for marker in required_gitignore_markers if marker not in gitignore_text
+]
+if missing_gitignore_markers:
+    raise SystemExit(
+        'launch-gate failed: .gitignore missing required task/archive markers: '
+        + ', '.join(missing_gitignore_markers)
     )
 
 docker_smoke = (root / 'tests' / 'docker_smoke.sh').read_text(encoding='utf-8')
@@ -313,6 +341,8 @@ required_workflow_markers = [
     'macos-latest',
     'tests.test_cross_platform_logic',
     'tests.test_autonomous_agent',
+    'tests/launch_gate_clean.sh',
+    'tests/docker_smoke.sh',
     'tests/pwsh_install_smoke.sh',
     'tests/windows_smoke.ps1',
     'tests/macos_smoke.sh',

@@ -19,20 +19,36 @@ Use command outputs and env overrides instead of assumptions.
 
 ## 2) Fast readiness check
 
-Run in order:
+Start with the universal checks:
 
 ```bash
 omni-autonomous-agent --status
 omni-autonomous-agent --bootstrap
+```
+
+Then choose the branch that matches the current host:
+
+- If OpenClaw is installed or this host is supposed to use the OpenClaw integration, run:
+
+```bash
 openclaw hooks check
 openclaw hooks info omni-recovery
+```
+
+- If OpenClaw is not installed and you are validating a wrapper-based or generic agent path, run:
+
+```bash
+omni-agent-wrap <agent-command> --version
+omni-wrap-<agent-command> --version
 ```
 
 Pass criteria:
 - OAA command is callable.
 - Bootstrap exits zero.
-- `omni-recovery` is enabled and healthy.
-- Hook check does not show blocking errors.
+- On the OpenClaw path, `omni-recovery` is enabled and healthy.
+- On the wrapper path, wrapper preflight fails fast without an active session, then becomes enforceable once a session exists.
+
+Do not fail a generic wrapper-based setup just because `openclaw` is absent on that host.
 
 If any command fails, stop and fix that exact failure first.
 
@@ -152,7 +168,9 @@ If only wrapper generation was tested, report that as wrapper-level coverage, no
 
 ---
 
-## 5) OpenClaw hook contract (must hold)
+## 5) OpenClaw hook contract (must hold when OpenClaw is installed or targeted)
+
+If OpenClaw is not installed on this host and you are validating a wrapper-based path, skip this section and continue with the wrapper contract instead.
 
 `omni-recovery` must reliably handle:
 - gateway startup events (resume active autonomous runs)
@@ -198,7 +216,7 @@ Use this exact order:
 2. Fix the failing integration directly (do not broad-reinstall yet).
 3. Re-run bootstrap once.
 4. Re-run behavior checks (stop, precompact, await-user, closure).
-5. Re-run OpenClaw hook checks.
+5. If OpenClaw is installed, re-run OpenClaw hook checks.
 6. Run test suite and confirm green.
 
 If state is corrupted, use OAA cancel/reset flow, then re-register a fresh session and validate again.
@@ -264,7 +282,7 @@ Use this exact order when onboarding fails midway:
 2. Rebuild OAA integrations only: `omni-autonomous-agent --bootstrap`.
 3. Validate generated config files, plugins, wrappers, and OpenClaw hook files exist and contain the expected OAA commands.
 4. Run one dynamic session (`--add ... -D dynamic`), verify blocked stop behavior (`--hook-stop`), await-user timeout or response handling, and clean closure after report status becomes `COMPLETE` or `PARTIAL`.
-5. Verify OpenClaw discovery and health with `openclaw hooks list`, `openclaw hooks info omni-recovery`, and `openclaw hooks check`.
+5. If OpenClaw is installed or targeted, verify OpenClaw discovery and health with `openclaw hooks list`, `openclaw hooks info omni-recovery`, and `openclaw hooks check`.
 6. For fresh-machine or Docker verification, prefer headless auth paths and env-backed secrets:
    - Gemini CLI: `GEMINI_API_KEY` or Vertex AI env vars
    - Claude Code: API-key or managed settings/env flow
@@ -316,9 +334,12 @@ If you are working inside the OAA repository, prefer existing verification entry
 Run the strongest checks you can for the current environment:
 
 ```bash
-python3 -m unittest tests.test_autonomous_agent tests.test_cross_platform_logic
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_autonomous_agent tests.test_cross_platform_logic
 bash tests/launch_gate.sh
+bash tests/launch_gate_clean.sh
 bash tests/docker_smoke.sh
+bash tests/native_agent_check.sh
+bash tests/host_agent_check.sh
 bash tests/pwsh_install_smoke.sh
 bash tests/macos_smoke.sh
 pwsh -File tests/windows_smoke.ps1
@@ -326,11 +347,16 @@ pwsh -File tests/windows_smoke.ps1
 
 Interpret them honestly:
 
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest ...`: structural logic proof without dirtying the repo with `__pycache__`
+- `tests/launch_gate.sh`: strict release-tree gate; use it on a clean checkout or staged release bundle
+- `tests/launch_gate_clean.sh`: convenience wrapper that runs the same gate against a sanitized copy when your working tree contains archived sandboxes, bytecode, or other local runtime residue
 - `tests/docker_smoke.sh`: real fresh-machine Linux install + lifecycle proof in Docker
+- `tests/native_agent_check.sh`: isolated install/bootstrap/session proof against real agent binaries already available on the current host
+- `tests/host_agent_check.sh`: non-destructive verification of generated hooks, wrappers, and host-side agent config on the current machine
 - `tests/pwsh_install_smoke.sh`: strong PowerShell installer proof using a PowerShell runtime, but still simulated coverage rather than real Windows
 - `tests/macos_smoke.sh`: repo-native smoke flow intended for real macOS runners
 - `tests/windows_smoke.ps1`: repo-native smoke flow intended for real Windows runners
-- unit tests + launch gate: structural and cross-platform logic proof, not a substitute for live provider/OS proof
+- unit tests + launch gate are still not substitutes for live provider/OS proof by themselves
 
 ---
 
@@ -348,8 +374,8 @@ Interpret them honestly:
 - OpenCode config: `https://opencode.ai/docs/config/`
 - OpenCode providers/auth: `https://opencode.ai/docs/providers/`
 - OpenCode CLI: `https://opencode.ai/docs/cli/`
-- OpenAI shell tool guide: `https://platform.openai.com/docs/guides/tools-shell`
-- OpenAI Docs MCP: `https://platform.openai.com/docs/docs-mcp`
+- OpenAI shell tool guide: `https://developers.openai.com/api/docs/guides/tools-shell`
+- OpenAI Docs MCP: `https://developers.openai.com/api/docs/mcp`
 - OAA issue tracker: `https://github.com/omnious0o0/omni-autonomous-agent/issues`
 
 When reporting issues, include:

@@ -88,6 +88,10 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python -m unittest tests.test_autonomous_agent tests.test_cross_platform_logic
 
+      - name: Host Agent Check
+        shell: bash
+        run: bash tests/host_agent_check.sh
+
       - name: PowerShell Install Smoke
         shell: bash
         run: bash tests/pwsh_install_smoke.sh

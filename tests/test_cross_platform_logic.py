@@ -211,11 +211,15 @@ class CrossPlatformLogicTests(unittest.TestCase):
         required_snippets = [
             "Ensure-PythonCommand",
             "Ensure-GitCommand",
+            "Get-PythonVersion",
             "Get-PowerShellHostCommand",
             "Refresh-Path",
             "Python.Python.3.12",
             "Git.Git",
             "OMNI_AGENT_REPO_URL",
+            "requires >= 3.10",
+            "Assert-CleanGitCheckout",
+            "Invoke-GitPullNoPrompt",
             "$env:ComSpec",
             "$runnerPs1",
         ]
@@ -227,10 +231,9 @@ class CrossPlatformLogicTests(unittest.TestCase):
             encoding="utf-8"
         )
         required_snippets = [
-            "rsync -a",
-            "__pycache__",
-            ".ruff_cache",
-            "omni-sandbox/archived/***",
+            "git -C \"${ROOT_DIR}\" archive --format=tar HEAD",
+            "rev-parse --is-inside-work-tree",
+            "touch \"${COPY_DIR}/TASK.md\"",
             "bash tests/launch_gate.sh",
             "launch-gate-clean passed",
         ]

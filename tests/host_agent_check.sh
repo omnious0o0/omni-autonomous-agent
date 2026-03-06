@@ -22,11 +22,21 @@ if command -v claude >/dev/null 2>&1; then
   HAS_CLAUDE=1
 fi
 
+HAS_GEMINI=0
+if command -v gemini >/dev/null 2>&1; then
+  HAS_GEMINI=1
+fi
+
 HAS_OPENCODE=0
 if command -v opencode >/dev/null 2>&1; then
   HAS_OPENCODE=1
 fi
-export HAS_CLAUDE HAS_OPENCODE
+
+HAS_OPENCLAW=0
+if command -v openclaw >/dev/null 2>&1; then
+  HAS_OPENCLAW=1
+fi
+export HAS_CLAUDE HAS_GEMINI HAS_OPENCODE HAS_OPENCLAW
 
 rm -rf "${HOME}" "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
 mkdir -p "${HOME}" "${XDG_CONFIG_HOME}" "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
@@ -54,7 +64,9 @@ from pathlib import Path
 
 home = Path.home()
 has_claude = os.environ.get('HAS_CLAUDE') == '1'
+has_gemini = os.environ.get('HAS_GEMINI') == '1'
 has_opencode = os.environ.get('HAS_OPENCODE') == '1'
+has_openclaw = os.environ.get('HAS_OPENCLAW') == '1'
 
 claude_hooks = {}
 if has_claude:
@@ -65,12 +77,14 @@ if has_claude:
     claude_data = json.loads(claude_path.read_text(encoding='utf-8'))
     claude_hooks = claude_data.get('hooks', {}) if isinstance(claude_data, dict) else {}
 
-gemini_path = home / '.gemini' / 'settings.json'
-if not gemini_path.exists():
-    raise SystemExit('host-agent-check failed: missing ~/.gemini/settings.json')
+hooks = {}
+if has_gemini:
+    gemini_path = home / '.gemini' / 'settings.json'
+    if not gemini_path.exists():
+        raise SystemExit('host-agent-check failed: missing ~/.gemini/settings.json')
 
-data = json.loads(gemini_path.read_text(encoding='utf-8'))
-hooks = data.get('hooks', {}) if isinstance(data, dict) else {}
+    data = json.loads(gemini_path.read_text(encoding='utf-8'))
+    hooks = data.get('hooks', {}) if isinstance(data, dict) else {}
 
 def has(entries, command):
     if not isinstance(entries, list):
@@ -89,10 +103,10 @@ if has_claude and not has(claude_hooks.get('Stop', []), 'omni-autonomous-agent -
 if has_claude and not has(claude_hooks.get('PreCompact', []), 'omni-autonomous-agent --hook-precompact'):
     raise SystemExit('host-agent-check failed: claude precompact hook missing')
 
-if not has(hooks.get('AfterAgent', []), 'omni-autonomous-agent --hook-stop'):
+if has_gemini and not has(hooks.get('AfterAgent', []), 'omni-autonomous-agent --hook-stop'):
     raise SystemExit('host-agent-check failed: gemini stop hook missing')
 
-if not has(hooks.get('PreCompress', []), 'omni-autonomous-agent --hook-precompact'):
+if has_gemini and not has(hooks.get('PreCompress', []), 'omni-autonomous-agent --hook-precompact'):
     raise SystemExit('host-agent-check failed: gemini precompact hook missing')
 
 if has_opencode:
@@ -106,87 +120,88 @@ if has_opencode:
     if 'runHook(["--hook-precompact"]);' not in plugin_text:
         raise SystemExit('host-agent-check failed: OpenCode precompact hook missing in plugin')
 
-openclaw_hook_md = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'HOOK.md'
-openclaw_handler = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts'
+if has_openclaw:
+    openclaw_hook_md = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'HOOK.md'
+    openclaw_handler = home / '.openclaw' / 'hooks' / 'omni-recovery' / 'handler.ts'
 
-if not openclaw_hook_md.exists() or not openclaw_handler.exists():
-    raise SystemExit('host-agent-check failed: openclaw omni-recovery hook files missing')
+    if not openclaw_hook_md.exists() or not openclaw_handler.exists():
+        raise SystemExit('host-agent-check failed: openclaw omni-recovery hook files missing')
 
-openclaw_handler_text = openclaw_handler.read_text(encoding='utf-8')
-if 'OMNI_AGENT_OPENCLAW_BIN' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_BIN override support')
-if 'OMNI_AGENT_OAA_BIN' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OAA_BIN override support')
-if 'OMNI_AGENT_OPENCLAW_AGENT_ID' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_AGENT_ID override support')
-if 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing sensitive-context toggle support')
-if 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake dedupe TTL support')
-if 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake delivery toggle support')
-if 'OMNI_AGENT_HOOK_TELEMETRY' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing hook telemetry toggle support')
-if 'OMNI_AGENT_OPENCLAW_SESSION_KEY' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing session key override support')
-if 'OMNI_AGENT_OPENCLAW_SESSION_ID' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing session override support')
-if 'OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender allowlist support')
-if '--log-event' not in openclaw_handler_text or '--event' not in openclaw_handler_text or '--note' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing OAA hook telemetry logging integration')
-if '--cancel-accept' not in openclaw_handler_text or '--cancel-deny' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision command routing')
-if 'CANCEL_ACCEPT_TOKENS' not in openclaw_handler_text or 'CANCEL_DENY_TOKENS' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision token maps')
-if 'senderAuthorizedForCancelDecision' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender authorization guard')
-if 'cancel_decision_unauthorized' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing unauthorized cancel decision telemetry')
-if "status.cancel_request_state === 'pending'" not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing pending cancel decision guard')
-if '.npm-global' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
-if "'--session-id', route.sessionId" not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing explicit --session-id startup wake routing')
-if '--deliver' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake deliver flag support')
-if '--reply-channel' not in openclaw_handler_text or '--reply-to' not in openclaw_handler_text or '--reply-account' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake reply overrides')
-if 'openclaw-startup-wake.json' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing persisted startup wake dedupe storage')
-if 'acquireDedupeLock' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake lock-based dedupe guard')
-if 'startup wake skipped: unresolved session route' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing unresolved-route safety log')
-if 'startup wake skipped: unable to read OAA status' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing status-read failure log')
-if 'startup wake skipped: duplicate restart event' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing duplicate startup wake guard log')
-if 'startup wake skipped: dedupe lock unavailable' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing dedupe lock contention log')
-if 'Request: [redacted]' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
-if 'startup wake queued for agent=' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake queue log line')
-if 'failed to launch agent wake runner' not in openclaw_handler_text:
-    raise SystemExit('host-agent-check failed: openclaw handler missing startup wake launch error logging')
+    openclaw_handler_text = openclaw_handler.read_text(encoding='utf-8')
+    if 'OMNI_AGENT_OPENCLAW_BIN' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_BIN override support')
+    if 'OMNI_AGENT_OAA_BIN' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OAA_BIN override support')
+    if 'OMNI_AGENT_OPENCLAW_AGENT_ID' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing OMNI_AGENT_OPENCLAW_AGENT_ID override support')
+    if 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing sensitive-context toggle support')
+    if 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake dedupe TTL support')
+    if 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake delivery toggle support')
+    if 'OMNI_AGENT_HOOK_TELEMETRY' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing hook telemetry toggle support')
+    if 'OMNI_AGENT_OPENCLAW_SESSION_KEY' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing session key override support')
+    if 'OMNI_AGENT_OPENCLAW_SESSION_ID' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing session override support')
+    if 'OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender allowlist support')
+    if '--log-event' not in openclaw_handler_text or '--event' not in openclaw_handler_text or '--note' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing OAA hook telemetry logging integration')
+    if '--cancel-accept' not in openclaw_handler_text or '--cancel-deny' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision command routing')
+    if 'CANCEL_ACCEPT_TOKENS' not in openclaw_handler_text or 'CANCEL_DENY_TOKENS' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing cancel decision token maps')
+    if 'senderAuthorizedForCancelDecision' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing cancel sender authorization guard')
+    if 'cancel_decision_unauthorized' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing unauthorized cancel decision telemetry')
+    if "status.cancel_request_state === 'pending'" not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing pending cancel decision guard')
+    if '.npm-global' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing npm-global PATH fallback')
+    if "'--session-id', route.sessionId" not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing explicit --session-id startup wake routing')
+    if '--deliver' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake deliver flag support')
+    if '--reply-channel' not in openclaw_handler_text or '--reply-to' not in openclaw_handler_text or '--reply-account' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake reply overrides')
+    if 'openclaw-startup-wake.json' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing persisted startup wake dedupe storage')
+    if 'acquireDedupeLock' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake lock-based dedupe guard')
+    if 'startup wake skipped: unresolved session route' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing unresolved-route safety log')
+    if 'startup wake skipped: unable to read OAA status' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing status-read failure log')
+    if 'startup wake skipped: duplicate restart event' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing duplicate startup wake guard log')
+    if 'startup wake skipped: dedupe lock unavailable' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing dedupe lock contention log')
+    if 'Request: [redacted]' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
+    if 'startup wake queued for agent=' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake queue log line')
+    if 'failed to launch agent wake runner' not in openclaw_handler_text:
+        raise SystemExit('host-agent-check failed: openclaw handler missing startup wake launch error logging')
 
-plugin_info = subprocess.run(
-    ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
-    capture_output=True,
-    text=True,
-    check=False,
-    timeout=30,
-)
-if plugin_info.returncode != 0:
-    raise SystemExit('host-agent-check failed: missing OpenClaw OAA plugin')
+    plugin_info = subprocess.run(
+        ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if plugin_info.returncode != 0:
+        raise SystemExit('host-agent-check failed: missing OpenClaw OAA plugin')
 
-plugin_payload = json.loads(plugin_info.stdout)
-if plugin_payload.get('id') != 'omni-autonomous-agent':
-    raise SystemExit('host-agent-check failed: unexpected OpenClaw OAA plugin id')
-if plugin_payload.get('status') != 'loaded':
-    raise SystemExit('host-agent-check failed: OpenClaw OAA plugin is not loaded')
+    plugin_payload = json.loads(plugin_info.stdout)
+    if plugin_payload.get('id') != 'omni-autonomous-agent':
+        raise SystemExit('host-agent-check failed: unexpected OpenClaw OAA plugin id')
+    if plugin_payload.get('status') != 'loaded':
+        raise SystemExit('host-agent-check failed: OpenClaw OAA plugin is not loaded')
 
 for wrapper_name in ['omni-wrap-codex', 'omni-wrap-soonagent']:
     wrapper = home / '.local' / 'bin' / wrapper_name

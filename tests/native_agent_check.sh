@@ -39,7 +39,7 @@ run_cli_smoke() {
   exit 1
 }
 
-for cmd in codex gemini openclaw python3 timeout; do
+for cmd in codex gemini python3 timeout; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     printf "native-agent-check failed: missing required command '%s'\n" "$cmd" >&2
     exit 1
@@ -55,7 +55,12 @@ HAS_OPENCODE=0
 if command -v opencode >/dev/null 2>&1; then
   HAS_OPENCODE=1
 fi
-export HAS_CLAUDE HAS_OPENCODE
+
+HAS_OPENCLAW=0
+if command -v openclaw >/dev/null 2>&1; then
+  HAS_OPENCLAW=1
+fi
+export HAS_CLAUDE HAS_OPENCODE HAS_OPENCLAW
 
 OPTIONAL_WRAPPER_CANDIDATES=(aider goose plandex amp crush kiro roo cline)
 OPTIONAL_WRAPPERS=()
@@ -79,7 +84,9 @@ OMNI_AGENT_LOCAL_BIN="${WORK_DIR}/bin" OMNI_AGENT_INSTALL_DIR="${WORK_DIR}/insta
 
 run_cli_smoke codex "${WORK_DIR}/smoke-codex.out"
 run_cli_smoke gemini "${WORK_DIR}/smoke-gemini.out"
-run_cli_smoke openclaw "${WORK_DIR}/smoke-openclaw.out"
+if [[ "${HAS_OPENCLAW}" -eq 1 ]]; then
+  run_cli_smoke openclaw "${WORK_DIR}/smoke-openclaw.out"
+fi
 
 for optional in "${OPTIONAL_WRAPPER_CANDIDATES[@]}"; do
   if command -v "${optional}" >/dev/null 2>&1; then
@@ -107,6 +114,7 @@ from pathlib import Path
 home = Path(os.environ['HOME'])
 has_claude = os.environ.get('HAS_CLAUDE') == '1'
 has_opencode = os.environ.get('HAS_OPENCODE') == '1'
+has_openclaw = os.environ.get('HAS_OPENCLAW') == '1'
 
 claude_hooks = {}
 if has_claude:
@@ -158,59 +166,62 @@ if has_opencode:
     if 'runHook(["--hook-precompact"]);' not in plugin_text:
         raise SystemExit('native-agent-check failed: OpenCode precompact hook missing in plugin')
 
-plugin_info = subprocess.run(
-    ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-if plugin_info.returncode != 0:
-    raise SystemExit('native-agent-check failed: OpenClaw OAA plugin missing')
+if has_openclaw:
+    plugin_info = subprocess.run(
+        ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if plugin_info.returncode != 0:
+        raise SystemExit('native-agent-check failed: OpenClaw OAA plugin missing')
 
-plugin_payload = json.loads(plugin_info.stdout)
-if plugin_payload.get('id') != 'omni-autonomous-agent':
-    raise SystemExit('native-agent-check failed: unexpected OpenClaw OAA plugin id')
-if plugin_payload.get('status') != 'loaded':
-    raise SystemExit('native-agent-check failed: OpenClaw OAA plugin is not loaded')
+    plugin_payload = json.loads(plugin_info.stdout)
+    if plugin_payload.get('id') != 'omni-autonomous-agent':
+        raise SystemExit('native-agent-check failed: unexpected OpenClaw OAA plugin id')
+    if plugin_payload.get('status') != 'loaded':
+        raise SystemExit('native-agent-check failed: OpenClaw OAA plugin is not loaded')
 PY
 
-test -f "${HOME}/.openclaw/hooks/omni-recovery/HOOK.md"
-test -f "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_BIN' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OAA_BIN' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_AGENT_ID' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_HOOK_TELEMETRY' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_SESSION_KEY' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_SESSION_ID' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--log-event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--note" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--cancel-accept" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--cancel-deny" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "CANCEL_ACCEPT_TOKENS" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "CANCEL_DENY_TOKENS" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "senderAuthorizedForCancelDecision" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "cancel_decision_unauthorized" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "status.cancel_request_state === 'pending'" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q '.npm-global' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "'--session-id', route.sessionId" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--deliver" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--reply-channel" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--reply-to" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q -- "--reply-account" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "openclaw-startup-wake.json" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "acquireDedupeLock" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "startup wake skipped: unresolved session route" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "startup wake skipped: unable to read OAA status" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "startup wake skipped: duplicate restart event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q "startup wake skipped: dedupe lock unavailable" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'Request: \[redacted\]' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'startup wake queued for agent=' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'failed to launch agent wake runner' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+if [[ "${HAS_OPENCLAW}" -eq 1 ]]; then
+  test -f "${HOME}/.openclaw/hooks/omni-recovery/HOOK.md"
+  test -f "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_BIN' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OAA_BIN' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_AGENT_ID' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_WAKE_DELIVER' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_HOOK_TELEMETRY' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_SESSION_KEY' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_SESSION_ID' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'OMNI_AGENT_OPENCLAW_CANCEL_ALLOWED_SENDERS' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--log-event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--note" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--cancel-accept" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--cancel-deny" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "CANCEL_ACCEPT_TOKENS" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "CANCEL_DENY_TOKENS" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "senderAuthorizedForCancelDecision" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "cancel_decision_unauthorized" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "status.cancel_request_state === 'pending'" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q '.npm-global' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "'--session-id', route.sessionId" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--deliver" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--reply-channel" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--reply-to" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q -- "--reply-account" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "openclaw-startup-wake.json" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "acquireDedupeLock" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "startup wake skipped: unresolved session route" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "startup wake skipped: unable to read OAA status" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "startup wake skipped: duplicate restart event" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q "startup wake skipped: dedupe lock unavailable" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'Request: \[redacted\]' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'startup wake queued for agent=' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+  grep -q 'failed to launch agent wake runner' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+fi
 
 for wrapper in omni-wrap-codex omni-agent-wrap; do
   test -f "${WRAP_DIR}/${wrapper}"
@@ -363,52 +374,54 @@ grep -q "corrupted" "${WORK_DIR}/corrupt-stop.out"
 "${CLI}" --cancel >"${WORK_DIR}/native-cancel.out"
 "${CLI}" --status | grep -q "No active session"
 
-set +e
-timeout "${CHECK_TIMEOUT}" openclaw hooks list >"${WORK_DIR}/native-hooks.out" 2>"${WORK_DIR}/native-hooks.err"
-hooks_code=$?
-set -e
-if [[ "${hooks_code}" -eq 124 ]]; then
-  printf "native-agent-check failed: openclaw hooks list timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
-  exit 1
-fi
-if [[ "${hooks_code}" -ne 0 ]]; then
-  printf "native-agent-check failed: openclaw hooks list returned %s\n" "${hooks_code}" >&2
-  exit 1
-fi
-grep -q "omni-recovery" "${WORK_DIR}/native-hooks.out"
-if ! grep -q "session-memory" "${WORK_DIR}/native-hooks.out"; then
-  printf "native-agent-check note: session-memory not available; continuing with omni-recovery only\n" >&2
-fi
+if [[ "${HAS_OPENCLAW}" -eq 1 ]]; then
+  set +e
+  timeout "${CHECK_TIMEOUT}" openclaw hooks list >"${WORK_DIR}/native-hooks.out" 2>"${WORK_DIR}/native-hooks.err"
+  hooks_code=$?
+  set -e
+  if [[ "${hooks_code}" -eq 124 ]]; then
+    printf "native-agent-check failed: openclaw hooks list timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ "${hooks_code}" -ne 0 ]]; then
+    printf "native-agent-check failed: openclaw hooks list returned %s\n" "${hooks_code}" >&2
+    exit 1
+  fi
+  grep -q "omni-recovery" "${WORK_DIR}/native-hooks.out"
+  if ! grep -q "session-memory" "${WORK_DIR}/native-hooks.out"; then
+    printf "native-agent-check note: session-memory not available; continuing with omni-recovery only\n" >&2
+  fi
 
-set +e
-timeout "${CHECK_TIMEOUT}" openclaw hooks info omni-recovery >"${WORK_DIR}/native-hook-info.out" 2>"${WORK_DIR}/native-hook-info.err"
-hook_info_code=$?
-set -e
-if [[ "${hook_info_code}" -eq 124 ]]; then
-  printf "native-agent-check failed: openclaw hooks info timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
-  exit 1
-fi
-if [[ "${hook_info_code}" -ne 0 ]]; then
-  printf "native-agent-check failed: openclaw hooks info returned %s\n" "${hook_info_code}" >&2
-  exit 1
-fi
-grep -q "gateway:startup" "${WORK_DIR}/native-hook-info.out"
-grep -q "message:received" "${WORK_DIR}/native-hook-info.out"
-grep -q "message:transcribed" "${WORK_DIR}/native-hook-info.out"
-grep -q "message:preprocessed" "${WORK_DIR}/native-hook-info.out"
-grep -q "session:compact:before" "${WORK_DIR}/native-hook-info.out"
+  set +e
+  timeout "${CHECK_TIMEOUT}" openclaw hooks info omni-recovery >"${WORK_DIR}/native-hook-info.out" 2>"${WORK_DIR}/native-hook-info.err"
+  hook_info_code=$?
+  set -e
+  if [[ "${hook_info_code}" -eq 124 ]]; then
+    printf "native-agent-check failed: openclaw hooks info timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ "${hook_info_code}" -ne 0 ]]; then
+    printf "native-agent-check failed: openclaw hooks info returned %s\n" "${hook_info_code}" >&2
+    exit 1
+  fi
+  grep -q "gateway:startup" "${WORK_DIR}/native-hook-info.out"
+  grep -q "message:received" "${WORK_DIR}/native-hook-info.out"
+  grep -q "message:transcribed" "${WORK_DIR}/native-hook-info.out"
+  grep -q "message:preprocessed" "${WORK_DIR}/native-hook-info.out"
+  grep -q "session:compact:before" "${WORK_DIR}/native-hook-info.out"
 
-set +e
-timeout "${CHECK_TIMEOUT}" openclaw hooks check >"${WORK_DIR}/native-hooks-check.out" 2>"${WORK_DIR}/native-hooks-check.err"
-hooks_check_code=$?
-set -e
-if [[ "${hooks_check_code}" -eq 124 ]]; then
-  printf "native-agent-check failed: openclaw hooks check timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
-  exit 1
-fi
-if [[ "${hooks_check_code}" -ne 0 ]]; then
-  printf "native-agent-check failed: openclaw hooks check returned %s\n" "${hooks_check_code}" >&2
-  exit 1
+  set +e
+  timeout "${CHECK_TIMEOUT}" openclaw hooks check >"${WORK_DIR}/native-hooks-check.out" 2>"${WORK_DIR}/native-hooks-check.err"
+  hooks_check_code=$?
+  set -e
+  if [[ "${hooks_check_code}" -eq 124 ]]; then
+    printf "native-agent-check failed: openclaw hooks check timed out after %ss\n" "${CHECK_TIMEOUT}" >&2
+    exit 1
+  fi
+  if [[ "${hooks_check_code}" -ne 0 ]]; then
+    printf "native-agent-check failed: openclaw hooks check returned %s\n" "${hooks_check_code}" >&2
+    exit 1
+  fi
 fi
 
 printf "native-agent-check passed\n"

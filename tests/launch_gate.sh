@@ -342,6 +342,7 @@ required_workflow_markers = [
     'tests.test_cross_platform_logic',
     'tests.test_autonomous_agent',
     'tests/launch_gate_clean.sh',
+    'tests/host_agent_check.sh',
     'tests/docker_smoke.sh',
     'tests/pwsh_install_smoke.sh',
     'tests/windows_smoke.ps1',

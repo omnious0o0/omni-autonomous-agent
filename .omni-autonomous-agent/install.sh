@@ -267,15 +267,47 @@ if [[ -d "${DEST}" && ! -L "${DEST}" ]]; then
   fail "${DEST} is a directory. Refusing to overwrite it."
 fi
 
-if [[ ${#SUDO_CMD[@]} -gt 0 ]]; then
-  "${SUDO_CMD[@]}" chmod +x "${MAIN_SCRIPT}"
-  "${SUDO_CMD[@]}" rm -f "${DEST}"
-  "${SUDO_CMD[@]}" ln -s "${MAIN_SCRIPT}" "${DEST}"
-else
-  chmod +x "${MAIN_SCRIPT}"
-  rm -f "${DEST}"
-  ln -s "${MAIN_SCRIPT}" "${DEST}"
+write_launcher() {
+  local destination="$1"
+  local main_script="$2"
+  local temp_file quoted_main
+
+  temp_file="$(mktemp "${TMPDIR:-/tmp}/omni-autonomous-agent-launcher.XXXXXX")"
+  printf -v quoted_main '%q' "${main_script}"
+
+  cat > "${temp_file}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+MAIN_SCRIPT=${quoted_main}
+
+if [[ ! -f "\${MAIN_SCRIPT}" ]]; then
+  printf 'error: OAA main.py not found at %s\n' "\${MAIN_SCRIPT}" >&2
+  exit 1
 fi
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 "\${MAIN_SCRIPT}" "\$@"
+fi
+
+if command -v python >/dev/null 2>&1; then
+  exec python "\${MAIN_SCRIPT}" "\$@"
+fi
+
+printf 'error: python3 or python is required to run omni-autonomous-agent.\n' >&2
+exit 1
+EOF
+
+  if [[ ${#SUDO_CMD[@]} -gt 0 ]]; then
+    "${SUDO_CMD[@]}" install -m 0755 "${temp_file}" "${destination}"
+  else
+    install -m 0755 "${temp_file}" "${destination}"
+  fi
+
+  rm -f "${temp_file}"
+}
+
+write_launcher "${DEST}" "${MAIN_SCRIPT}"
 
 BOOTSTRAP_TIMEOUT_RAW="${OMNI_AGENT_BOOTSTRAP_TIMEOUT:-120}"
 BOOTSTRAP_TIMEOUT="120"
@@ -312,19 +344,33 @@ PY
 
 header "Installed"
 row "Source" "${MAIN_SCRIPT}"
-row "Link" "${DEST}"
+row "Command" "${DEST}"
 row "Self-check" "Read ${ROOT_DIR}/install-help.md"
 
-if run_bootstrap_with_timeout "${DEST}" "${BOOTSTRAP_TIMEOUT}" >/dev/null 2>&1; then
+BOOTSTRAP_STDOUT="$(mktemp "${TMPDIR:-/tmp}/omni-autonomous-agent-bootstrap.stdout.XXXXXX")"
+BOOTSTRAP_STDERR="$(mktemp "${TMPDIR:-/tmp}/omni-autonomous-agent-bootstrap.stderr.XXXXXX")"
+
+if run_bootstrap_with_timeout "${DEST}" "${BOOTSTRAP_TIMEOUT}" >"${BOOTSTRAP_STDOUT}" 2>"${BOOTSTRAP_STDERR}"; then
   row "Bootstrap" "Completed automatic hook/setup bootstrap"
 else
   bootstrap_code=$?
   row "Bootstrap" "Automatic bootstrap failed"
+  bootstrap_details="$(cat "${BOOTSTRAP_STDERR}" "${BOOTSTRAP_STDOUT}")"
   if [[ "${bootstrap_code}" -eq 124 ]]; then
+    if [[ -n "${bootstrap_details//[$'\t\r\n ']}" ]]; then
+      printf "Details:\n%s\n" "${bootstrap_details}" >&2
+    fi
+    rm -f "${BOOTSTRAP_STDOUT}" "${BOOTSTRAP_STDERR}"
     fail "bootstrap timed out after ${BOOTSTRAP_TIMEOUT}s. Run '${DEST} --bootstrap' and fix reported warnings before autonomous use."
   fi
+  if [[ -n "${bootstrap_details//[$'\t\r\n ']}" ]]; then
+    printf "Details:\n%s\n" "${bootstrap_details}" >&2
+  fi
+  rm -f "${BOOTSTRAP_STDOUT}" "${BOOTSTRAP_STDERR}"
   fail "bootstrap did not complete successfully. Run '${DEST} --bootstrap' and fix reported warnings before autonomous use."
 fi
+
+rm -f "${BOOTSTRAP_STDOUT}" "${BOOTSTRAP_STDERR}"
 
 printf "\nRun %b%s --status%b to verify.\n" "${BOLD}" "${DEST_NAME}" "${RESET}"
 printf "Read install-help.md and apply the self-check hook guidance before autonomous sessions.\n"

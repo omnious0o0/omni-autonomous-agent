@@ -22,6 +22,12 @@ OAA is built for long sessions. Do not treat long duration as a special case or 
 curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.sh | bash
 ```
 
+On native Windows without a POSIX shell, use:
+
+```powershell
+irm https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.ps1 | iex
+```
+
 After install or update, read `install-help.md`, then verify the environment with the documented self-check and recovery flow before you claim setup is complete.
 
 ### Self-Check (DO NOT SKIP)

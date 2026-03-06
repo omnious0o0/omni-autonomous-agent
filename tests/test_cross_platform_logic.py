@@ -155,6 +155,10 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "simulated coverage only",
             "defined-but-broken VM",
             "Do not fail a generic wrapper-based setup just because `openclaw` is absent",
+            "openclaw sessions --json --all-agents",
+            "handlerPath",
+            "`python3`, `python`, or `py`",
+            "`winget`",
             "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest",
             "tests/native_agent_check.sh",
             "tests/host_agent_check.sh",
@@ -172,6 +176,7 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "Keep working on this until it's done",
             "Do chores until I stop you",
             "memory system",
+            "install.ps1",
         ]:
             self.assertIn(snippet, readme_text)
             self.assertIn(snippet, skill_text)

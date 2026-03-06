@@ -7,6 +7,9 @@ cd "${ROOT_DIR}"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
+export HOME="${WORK_DIR}/home"
+export USERPROFILE="${HOME}"
+export XDG_CONFIG_HOME="${HOME}/.config"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPYCACHEPREFIX="${WORK_DIR}/pycache"
 export OMNI_AGENT_CONFIG_DIR="${WORK_DIR}/host-config"
@@ -25,8 +28,8 @@ if command -v opencode >/dev/null 2>&1; then
 fi
 export HAS_CLAUDE HAS_OPENCODE
 
-rm -rf "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
-mkdir -p "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
+rm -rf "${HOME}" "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
+mkdir -p "${HOME}" "${XDG_CONFIG_HOME}" "${OMNI_AGENT_CONFIG_DIR}" "${OMNI_AGENT_SANDBOX_ROOT}"
 
 CHECK_TIMEOUT="${OMNI_CHECK_TIMEOUT:-120}"
 
@@ -166,8 +169,24 @@ if 'Request: [redacted]' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing default request redaction')
 if 'startup wake queued for agent=' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing startup wake queue log line')
-if 'failed to launch startup wake ping' not in openclaw_handler_text:
+if 'failed to launch agent wake runner' not in openclaw_handler_text:
     raise SystemExit('host-agent-check failed: openclaw handler missing startup wake launch error logging')
+
+plugin_info = subprocess.run(
+    ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
+    capture_output=True,
+    text=True,
+    check=False,
+    timeout=30,
+)
+if plugin_info.returncode != 0:
+    raise SystemExit('host-agent-check failed: missing OpenClaw OAA plugin')
+
+plugin_payload = json.loads(plugin_info.stdout)
+if plugin_payload.get('id') != 'omni-autonomous-agent':
+    raise SystemExit('host-agent-check failed: unexpected OpenClaw OAA plugin id')
+if plugin_payload.get('status') != 'loaded':
+    raise SystemExit('host-agent-check failed: OpenClaw OAA plugin is not loaded')
 
 for wrapper_name in ['omni-wrap-codex', 'omni-wrap-soonagent']:
     wrapper = home / '.local' / 'bin' / wrapper_name

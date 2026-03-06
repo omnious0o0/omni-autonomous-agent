@@ -43,6 +43,7 @@ def _default_config_dir() -> Path:
 
 CONFIG_DIR = _path_env("OMNI_AGENT_CONFIG_DIR", _default_config_dir())
 STATE_FILE = CONFIG_DIR / "state.json"
+OPENCLAW_ROUTE_CACHE_FILE = CONFIG_DIR / "openclaw-route-cache.json"
 
 REPO_ROOT = _path_env("OMNI_AGENT_REPO_ROOT", Path(__file__).resolve().parent.parent)
 SANDBOX_ROOT = _path_env("OMNI_AGENT_SANDBOX_ROOT", REPO_ROOT / "omni-sandbox")

@@ -18,6 +18,8 @@ from .session_manager import (
     cmd_hook_precompact,
     cmd_hook_stop,
     cmd_log_event,
+    cmd_record_openclaw_route,
+    cmd_revise_session,
     cmd_require_active,
     cmd_status,
     cmd_user_responded,
@@ -54,6 +56,11 @@ def _build_parser() -> argparse.ArgumentParser:
     group.add_argument("--update", action="store_true", help="Update this installation")
     group.add_argument("--install", action="store_true", help="Run installer script")
     group.add_argument(
+        "--revise-session",
+        action="store_true",
+        help="Revise the active session request and/or duration",
+    )
+    group.add_argument(
         "--bootstrap",
         action="store_true",
         help="Auto-configure hooks and wrappers with no manual setup",
@@ -72,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-event",
         action="store_true",
         help="Append hook telemetry event details to the active session log",
+    )
+    group.add_argument(
+        "--record-openclaw-route",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     group.add_argument("--dummy", action="store_true", help="Register a test session")
 
@@ -130,6 +142,48 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NOTE",
         type=str,
         help="Event note used with --log-event",
+    )
+    parser.add_argument(
+        "--openclaw-agent-id",
+        metavar="AGENT_ID",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-session-key",
+        metavar="SESSION_KEY",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-session-id",
+        metavar="SESSION_ID",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-reply-channel",
+        metavar="CHANNEL",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-reply-to",
+        metavar="TARGET",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-reply-from",
+        metavar="SOURCE",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--openclaw-reply-account",
+        metavar="ACCOUNT",
+        type=str,
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -198,10 +252,12 @@ def main() -> None:
         or args.require_active
         or args.cancel_accept
         or args.cancel_deny
+        or args.revise_session
         or args.bootstrap
         or args.await_user
         or args.user_responded
         or args.log_event
+        or args.record_openclaw_route
     ):
         maybe_auto_update()
 
@@ -237,6 +293,15 @@ def main() -> None:
         cmd_cancel_deny(args.decision_note or "")
         return
 
+    if args.revise_session:
+        cmd_revise_session(
+            request=args.request,
+            duration=args.duration,
+            response_note=args.response_note or "",
+        )
+        cmd_status()
+        return
+
     if args.hook_stop:
         cmd_hook_stop()
         return
@@ -269,6 +334,18 @@ def main() -> None:
 
     if args.log_event:
         cmd_log_event(args.event or "", args.note or "")
+        return
+
+    if args.record_openclaw_route:
+        cmd_record_openclaw_route(
+            agent_id=args.openclaw_agent_id or "",
+            session_key=args.openclaw_session_key or "",
+            session_id=args.openclaw_session_id or "",
+            channel=args.openclaw_reply_channel or "",
+            reply_to=args.openclaw_reply_to or "",
+            reply_from=args.openclaw_reply_from or "",
+            account_id=args.openclaw_reply_account or "",
+        )
         return
 
     if args.dummy:

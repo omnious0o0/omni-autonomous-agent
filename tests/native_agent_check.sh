@@ -101,6 +101,7 @@ WRAP_DIR="${HOME}/.local/bin"
 python3 - <<'PY'
 import json
 import os
+import subprocess
 from pathlib import Path
 
 home = Path(os.environ['HOME'])
@@ -156,6 +157,21 @@ if has_opencode:
         raise SystemExit('native-agent-check failed: OpenCode stop hook missing in plugin')
     if 'runHook(["--hook-precompact"]);' not in plugin_text:
         raise SystemExit('native-agent-check failed: OpenCode precompact hook missing in plugin')
+
+plugin_info = subprocess.run(
+    ['openclaw', 'plugins', 'info', 'omni-autonomous-agent', '--json'],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+if plugin_info.returncode != 0:
+    raise SystemExit('native-agent-check failed: OpenClaw OAA plugin missing')
+
+plugin_payload = json.loads(plugin_info.stdout)
+if plugin_payload.get('id') != 'omni-autonomous-agent':
+    raise SystemExit('native-agent-check failed: unexpected OpenClaw OAA plugin id')
+if plugin_payload.get('status') != 'loaded':
+    raise SystemExit('native-agent-check failed: OpenClaw OAA plugin is not loaded')
 PY
 
 test -f "${HOME}/.openclaw/hooks/omni-recovery/HOOK.md"
@@ -194,7 +210,7 @@ grep -q "startup wake skipped: duplicate restart event" "${HOME}/.openclaw/hooks
 grep -q "startup wake skipped: dedupe lock unavailable" "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 grep -q 'Request: \[redacted\]' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 grep -q 'startup wake queued for agent=' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
-grep -q 'failed to launch startup wake ping' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
+grep -q 'failed to launch agent wake runner' "${HOME}/.openclaw/hooks/omni-recovery/handler.ts"
 
 for wrapper in omni-wrap-codex omni-agent-wrap; do
   test -f "${WRAP_DIR}/${wrapper}"

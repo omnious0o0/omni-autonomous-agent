@@ -43,10 +43,14 @@ Please install `https://github.com/omnious0o0/omni-autonomous-agent`. Follow all
 ```
 
 ### Manual (not recommended)
-Use this:
+Use the entry point that matches the host:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.ps1 | iex
 ```
 
 After install:

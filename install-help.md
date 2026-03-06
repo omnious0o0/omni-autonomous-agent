@@ -189,6 +189,84 @@ If events are missing or disabled, bootstrap is incomplete.
 
 ---
 
+## 5B) Delivery-disabled live OpenClaw verification
+
+Use this when OpenClaw is installed and you need real proof that restart wake and mid-task user replies work on the current host without sending anything back to the human chat.
+
+1. Create a fresh active OAA session:
+
+```bash
+omni-autonomous-agent --add -R "live openclaw verification" -D 10
+```
+
+2. Find the current OpenClaw session route for the active agent with `openclaw sessions --json --all-agents`.
+   Use the live CLI JSON as the primary source.
+   Capture the current `sessionId`, `sessionKey`, channel, `to`, `from`, and `accountId`.
+   Important:
+   - If the same `sessionId` appears under multiple `sessionKey` values, treat the freshest `updatedAt` entry as the live route.
+   - OpenClaw direct-message sessions may legitimately collapse onto `agent:<agent-id>:main` depending on the current DM session policy; do not assume a stale per-chat key is authoritative just because it looks more specific.
+   - The CLI summary may omit delivery fields on some entries. If channel or reply target metadata is missing, discover the raw session store files from the `stores` array in the CLI JSON output and read the matching record there instead of assuming a default home-directory location.
+
+3. Bind that route into OAA:
+
+```bash
+omni-autonomous-agent --record-openclaw-route \
+  --openclaw-agent-id <agent-id> \
+  --openclaw-session-key <session-key> \
+  --openclaw-session-id <session-id> \
+  --openclaw-reply-channel <channel> \
+  --openclaw-reply-to <reply-to> \
+  --openclaw-reply-from <reply-from> \
+  --openclaw-reply-account <account-id>
+```
+
+4. Resolve the installed handler path from `openclaw hooks info omni-recovery --json`, then trigger it with delivery disabled.
+   The example below uses the working Python command on this host to read `handlerPath`.
+
+```bash
+PYTHON_CMD=<python-command-that-works-on-this-host>
+HANDLER_PATH="$(openclaw hooks info omni-recovery --json | "$PYTHON_CMD" -c 'import json,sys; print(json.load(sys.stdin)["handlerPath"])')"
+OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0 \
+node --experimental-transform-types --input-type=module -e \
+"import { pathToFileURL } from 'url'; const mod = await import(pathToFileURL(process.argv[1]).href); await mod.default(JSON.parse(process.argv[2]));" \
+"$HANDLER_PATH" \
+'{"type":"gateway","action":"startup"}'
+```
+
+Expected proof:
+- OAA `LOG.md` records `openclaw.startup.wake_queued`
+- the installed hook returns promptly instead of blocking until the full model turn completes
+- the active session later records a blocked `--hook-stop` or other resumed work evidence
+- the target OpenClaw session transcript contains a fresh `[omni] Gateway restarted and an autonomous session is still active.` message
+  This is internal OpenClaw session evidence, not external chat delivery. `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` suppresses reply delivery to the human channel, not the internal session write.
+
+5. Verify live inbound reply handling with a unique marker:
+
+```bash
+omni-autonomous-agent --await-user -Q "live interruption verification"
+OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0 \
+node --experimental-transform-types --input-type=module -e \
+"import { pathToFileURL } from 'url'; const mod = await import(pathToFileURL(process.argv[1]).href); await mod.default(JSON.parse(process.argv[2]));" \
+"$HANDLER_PATH" \
+'{"type":"message","action":"received","sessionKey":"<session-key>","context":{"bodyForAgent":"<unique-marker>","from":"<reply-from>","accountId":"<account-id>","messageId":"<unique-message-id>"}}'
+```
+
+Expected proof:
+- `omni-autonomous-agent --status --json` flips `waiting_for_user` from `true` to `false`
+- OAA `LOG.md` records `User response registered`
+- OAA `LOG.md` records `openclaw.message.user_responded`
+- OAA `LOG.md` records `openclaw.message.forward_queued`
+- the installed hook returns promptly instead of waiting for the entire forwarded turn to finish
+- the target OpenClaw session transcript contains the unique marker inside the forwarded `[omni] New user message arrived during an active autonomous session.` prompt
+  This is again internal session evidence. With `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0`, do not expect a human-chat echo.
+
+Optional stronger proof:
+- If you control an isolated test chat and explicitly want end-to-end delivery proof, rerun the same handler invocation without `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0` and verify the external reply path as well.
+
+If you cannot show those proofs, do not claim OpenClaw is live-verified.
+
+---
+
 ## 6) Final-only update policy check (critical)
 
 For requests like "work until <time>", OAA should infer `update_policy=final-only`.
@@ -278,7 +356,7 @@ If any grade is missing, say so directly.
 
 Use this exact order when onboarding fails midway:
 
-1. Confirm runtime tools are callable (`python3`, `omni-autonomous-agent`, and the relevant agent CLI).
+1. Confirm runtime tools are callable (`omni-autonomous-agent`, the relevant agent CLI, and a working Python command such as `python3`, `python`, or `py`).
 2. Rebuild OAA integrations only: `omni-autonomous-agent --bootstrap`.
 3. Validate generated config files, plugins, wrappers, and OpenClaw hook files exist and contain the expected OAA commands.
 4. Run one dynamic session (`--add ... -D dynamic`), verify blocked stop behavior (`--hook-stop`), await-user timeout or response handling, and clean closure after report status becomes `COMPLETE` or `PARTIAL`.
@@ -288,6 +366,7 @@ Use this exact order when onboarding fails midway:
    - Claude Code: API-key or managed settings/env flow
    - OpenCode: `/connect` or `opencode auth login`, depending build, with env or file secret references
    - Codex/OpenAI: `OPENAI_API_KEY`; use wrappers and shell/MCP integration, not an assumed native hook API
+   - Native Windows bootstrap: missing Python or Git may be self-installed with `winget`; if `winget` is unavailable, report Windows as partial or simulated coverage instead of claiming self-healing completed
 7. If a provider config file was invalid, confirm it was quarantined or replaced safely before continuing.
 8. Capture the evidence checklist before claiming setup is fixed.
 
@@ -352,7 +431,7 @@ Interpret them honestly:
 - `tests/launch_gate_clean.sh`: convenience wrapper that runs the same gate against a sanitized copy when your working tree contains archived sandboxes, bytecode, or other local runtime residue
 - `tests/docker_smoke.sh`: real fresh-machine Linux install + lifecycle proof in Docker
 - `tests/native_agent_check.sh`: isolated install/bootstrap/session proof against real agent binaries already available on the current host
-- `tests/host_agent_check.sh`: non-destructive verification of generated hooks, wrappers, and host-side agent config on the current machine
+- `tests/host_agent_check.sh`: isolated host-side verification of generated hooks, wrappers, and config using a temporary HOME/config root
 - `tests/pwsh_install_smoke.sh`: strong PowerShell installer proof using a PowerShell runtime, but still simulated coverage rather than real Windows
 - `tests/macos_smoke.sh`: repo-native smoke flow intended for real macOS runners
 - `tests/windows_smoke.ps1`: repo-native smoke flow intended for real Windows runners

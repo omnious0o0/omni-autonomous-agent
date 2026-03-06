@@ -26,6 +26,8 @@ KNOWN_WRAPPER_AGENTS: dict[str, str] = {
     "cline": "cline",
 }
 
+OPENCLAW_PLUGIN_ID = "omni-autonomous-agent"
+
 
 def _is_windows() -> bool:
     return os.name == "nt"
@@ -66,6 +68,13 @@ def _default_opencode_plugin_path() -> Path:
     if config_home:
         return Path(config_home).expanduser() / "opencode" / "plugins" / "omni-hook.ts"
     return Path.home() / ".config" / "opencode" / "plugins" / "omni-hook.ts"
+
+
+def _openclaw_plugin_dir() -> Path:
+    return _path_override(
+        "OMNI_AGENT_OPENCLAW_PLUGIN_DIR",
+        Path(__file__).resolve().parent / "openclaw-plugin",
+    )
 
 
 def _header(title: str) -> None:
@@ -572,6 +581,35 @@ def _forced_wrapper_names() -> set[str]:
     return forced
 
 
+def _cli_candidate_paths(command: str) -> list[Path]:
+    candidates: list[Path] = []
+    home = Path.home()
+    if _is_windows():
+        candidates.extend(
+            [
+                home / "AppData" / "Roaming" / "npm" / f"{command}.cmd",
+                home / "AppData" / "Roaming" / "npm" / f"{command}.exe",
+                home / ".local" / "bin" / f"{command}.cmd",
+                home / ".local" / "bin" / f"{command}.exe",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                home / ".local" / "bin" / command,
+                home / ".npm-global" / "bin" / command,
+                home / ".pnpm-global" / "bin" / command,
+            ]
+        )
+    return candidates
+
+
+def _has_cli(command: str) -> bool:
+    if shutil.which(command) is not None:
+        return True
+    return any(candidate.exists() for candidate in _cli_candidate_paths(command))
+
+
 def _openclaw_hook_md() -> str:
     return """---
 name: omni-recovery
@@ -585,7 +623,7 @@ metadata:
 Runs Omni Autonomous Agent recovery flows for OpenClaw events:
 
 - On `gateway:startup`: if an OAA session is active, queue a resume ping turn.
-- On inbound message events: process cancellation decisions (`...` accept, `..` deny) and auto-register await-user responses using the richest available message text.
+- On inbound message events: process cancellation decisions (`...` accept, `..` deny), auto-register await-user responses, and keep the recovery route binding fresh.
 - On `session:compact:before`: write the OAA precompact handoff/checkpoint before OpenClaw compacts the session.
 
 Note: OpenClaw hooks are event-driven and do not provide true idle timers.
@@ -607,6 +645,20 @@ type StatusPayload = {
   deadline?: string | null;
   report_status?: string;
   started_at?: string;
+  runtime_bindings?: {
+    openclaw?: OpenclawBinding;
+  } | null;
+};
+
+type OpenclawBinding = {
+  agent_id?: string;
+  session_key?: string;
+  session_id?: string;
+  channel?: string;
+  to?: string;
+  from?: string;
+  account_id?: string;
+  updated_at?: string;
 };
 
 type SessionRoute = {
@@ -614,6 +666,7 @@ type SessionRoute = {
   sessionId: string;
   channel?: string;
   to?: string;
+  from?: string;
   accountId?: string;
 };
 
@@ -648,8 +701,38 @@ const parsePositiveInt = (raw: string | undefined, fallback: number): number => 
   return fallback;
 };
 
+const AGENT_WAKE_RETRY_ATTEMPTS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_AGENT_RETRY_ATTEMPTS,
+  5,
+);
+const AGENT_WAKE_RETRY_DELAY_MS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_AGENT_RETRY_DELAY_MS,
+  1_500,
+);
+const DETACHED_LAUNCH_VERIFY_MS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_DETACHED_VERIFY_MS,
+  250,
+);
+const DETACHED_LAUNCH_POLL_MS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_DETACHED_POLL_MS,
+  25,
+);
+const syncAgentLaunch = process.env.OMNI_AGENT_OPENCLAW_SYNC_LAUNCH === '1';
+
 const normalizeTelemetryText = (raw: string, maxLen: number): string =>
   raw.replace(/\\s+/g, ' ').trim().slice(0, maxLen);
+
+const readCandidateString = (...candidates: unknown[]): string => {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.trim();
+    if (normalized) return normalized;
+  }
+  return '';
+};
+
+const readRecordString = (record: Record<string, unknown> | null, key: string): string =>
+  record && typeof record[key] === 'string' ? String(record[key]).trim() : '';
 
 const shortFingerprint = (raw: string | undefined): string => {
   const value = (raw ?? '').trim();
@@ -687,6 +770,10 @@ const parseCancelDecision = (raw: string): 'accept' | 'deny' | null => {
 const STARTUP_WAKE_PERSISTED_DEDUPE_MS = parsePositiveInt(
   process.env.OMNI_AGENT_OPENCLAW_WAKE_DEDUPE_MS,
   60_000,
+);
+const INBOUND_FORWARD_DEDUPE_MS = parsePositiveInt(
+  process.env.OMNI_AGENT_OPENCLAW_MESSAGE_DEDUPE_MS,
+  5_000,
 );
 
 const buildRuntimeEnv = () => {
@@ -754,10 +841,52 @@ const resolveConfigDir = (): string | null => {
   return join(home, '.config', 'omni-autonomous-agent');
 };
 
-const resolveWakeDedupeFile = (): string | null => {
+const resolveNamedDedupeFile = (fileName: string): string | null => {
   const configDir = resolveConfigDir();
   if (!configDir) return null;
-  return join(configDir, 'openclaw-startup-wake.json');
+  return join(configDir, fileName);
+};
+
+const resolveWakeDedupeFile = (): string | null =>
+  resolveNamedDedupeFile('openclaw-startup-wake.json');
+
+const resolveInboundForwardDedupeFile = (): string | null =>
+  resolveNamedDedupeFile('openclaw-inbound-forward.json');
+
+const readPersistedOpenclawBinding = (status: StatusPayload | null): OpenclawBinding | null => {
+  const binding = status?.runtime_bindings?.openclaw;
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) return null;
+
+  const sessionId = readCandidateString((binding as OpenclawBinding).session_id);
+  if (!sessionId) return null;
+
+  const normalized: OpenclawBinding = {
+    session_id: sessionId,
+  };
+
+  const agentId = readCandidateString((binding as OpenclawBinding).agent_id);
+  if (agentId) normalized.agent_id = agentId;
+
+  const sessionKey = readCandidateString((binding as OpenclawBinding).session_key);
+  if (sessionKey) normalized.session_key = sessionKey;
+
+  const channel = readCandidateString((binding as OpenclawBinding).channel);
+  if (channel) normalized.channel = channel;
+
+  const to = readCandidateString((binding as OpenclawBinding).to);
+  if (to) normalized.to = to;
+
+  const from = readCandidateString((binding as OpenclawBinding).from);
+  if (from) normalized.from = from;
+
+  const accountId = readCandidateString((binding as OpenclawBinding).account_id);
+  if (accountId) normalized.account_id = accountId;
+
+  const updatedAt = readCandidateString((binding as OpenclawBinding).updated_at);
+  if (updatedAt) normalized.updated_at = updatedAt;
+
+  if (!normalized.agent_id) normalized.agent_id = 'main';
+  return normalized;
 };
 
 const readJsonObject = (path: string): Record<string, unknown> | null => {
@@ -771,8 +900,95 @@ const readJsonObject = (path: string): Record<string, unknown> | null => {
   }
 };
 
+const readSessionsFromCliStores = (
+  payload: Record<string, unknown>,
+  targetAgentId: string,
+): Record<string, unknown> | null => {
+  const stores = Array.isArray(payload.stores) ? payload.stores : [];
+  const entries: Record<string, unknown> = {};
+
+  for (const store of stores) {
+    if (!store || typeof store !== 'object' || Array.isArray(store)) continue;
+    const storeRecord = store as Record<string, unknown>;
+    const storePath = readRecordString(storeRecord, 'path');
+    if (!storePath) continue;
+
+    const storeAgentId = readRecordString(storeRecord, 'agentId');
+    if (storeAgentId && storeAgentId !== targetAgentId) continue;
+
+    const storeEntries = readJsonObject(storePath);
+    if (!storeEntries) continue;
+
+    for (const [sessionKey, entry] of Object.entries(storeEntries)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const record = entry as Record<string, unknown>;
+      const sessionId = readCandidateString(record.sessionId);
+      if (!sessionId) continue;
+
+      const sessionKeyAgentId = sessionKey.split(':')[1]?.trim() ?? '';
+      const recordAgentId = readCandidateString(record.agentId);
+      const effectiveAgentId = recordAgentId || sessionKeyAgentId || storeAgentId;
+      if (effectiveAgentId && effectiveAgentId !== targetAgentId) continue;
+
+      entries[sessionKey] = record;
+    }
+  }
+
+  return Object.keys(entries).length > 0 ? entries : null;
+};
+
+const readSessionsFromCli = (
+  targetAgentId: string,
+): Record<string, unknown> | null => {
+  const result = spawnWithShimFallback(openclawBin, ['sessions', '--json', '--all-agents'], {
+    stdio: 'pipe',
+    encoding: 'utf-8',
+    env: runtimeEnv,
+  });
+
+  if (typeof result.status === 'number' && result.status !== 0) {
+    return null;
+  }
+  if (result.error) {
+    return null;
+  }
+
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  if (!output) return null;
+
+  try {
+    const parsed = JSON.parse(output);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const payload = parsed as Record<string, unknown>;
+    const storeEntries = readSessionsFromCliStores(payload, targetAgentId);
+    const sessions = (parsed as Record<string, unknown>).sessions;
+    const entries: Record<string, unknown> = storeEntries ? { ...storeEntries } : {};
+    if (Array.isArray(sessions)) {
+      for (const session of sessions) {
+        if (!session || typeof session !== 'object' || Array.isArray(session)) continue;
+        const record = session as Record<string, unknown>;
+        const sessionKey = readCandidateString(record.key);
+        const sessionId = readCandidateString(record.sessionId);
+        const agentId = readCandidateString(record.agentId);
+        if (!sessionKey || !sessionId) continue;
+        if (agentId && agentId !== targetAgentId) continue;
+        if (entries[sessionKey] !== undefined) continue;
+        entries[sessionKey] = record;
+      }
+    }
+
+    return Object.keys(entries).length > 0 ? entries : null;
+  } catch {
+    return null;
+  }
+};
+
 const acquireDedupeLock = (lockDir: string): boolean => {
   try {
+    mkdirSync(dirname(lockDir), { recursive: true });
     mkdirSync(lockDir);
     return true;
   } catch {
@@ -858,6 +1074,46 @@ const forgetStartupWake = (dedupeKey: string): void => {
   }
 };
 
+const rememberInboundForward = (dedupeKey: string): DedupeResult => {
+  const dedupeFile = resolveInboundForwardDedupeFile();
+  if (!dedupeFile) return { decision: 'disabled' };
+
+  const lockDir = `${dedupeFile}.lock`;
+  if (!acquireDedupeLock(lockDir)) {
+    return { decision: 'lock-unavailable' };
+  }
+
+  try {
+    const now = Date.now();
+    const existing = readJsonObject(dedupeFile);
+    const entriesRaw = existing?.entries;
+    const entries: Record<string, number> = {};
+
+    if (entriesRaw && typeof entriesRaw === 'object' && !Array.isArray(entriesRaw)) {
+      for (const [key, value] of Object.entries(entriesRaw as Record<string, unknown>)) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+        if (now - value > INBOUND_FORWARD_DEDUPE_MS) continue;
+        entries[key] = value;
+      }
+    }
+
+    const seenAt = entries[dedupeKey];
+    if (typeof seenAt === 'number' && now - seenAt < INBOUND_FORWARD_DEDUPE_MS) {
+      return { decision: 'duplicate' };
+    }
+
+    entries[dedupeKey] = now;
+    mkdirSync(dirname(dedupeFile), { recursive: true });
+    writeFileSync(dedupeFile, JSON.stringify({ entries }, null, 2), 'utf-8');
+  } catch {
+    return { decision: 'error' };
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+
+  return { decision: 'recorded' };
+};
+
 const resolveOpenclawBinary = () => {
   const override = process.env.OMNI_AGENT_OPENCLAW_BIN?.trim();
   if (override) return override;
@@ -925,14 +1181,52 @@ const resolveOaaBinary = () => {
 
 const oaaBin = resolveOaaBinary();
 
+const quotePosixArg = (value: string): string =>
+  `'${value.replace(/'/g, `'\\''`)}'`;
+
+const quoteWindowsArg = (value: string): string =>
+  `"${value.replace(/(["^%])/g, '^$1')}"`;
+
+const buildShellCommand = (command: string, args: string[]): string => {
+  const quote = process.platform === 'win32' ? quoteWindowsArg : quotePosixArg;
+  return [command, ...args].map(quote).join(' ');
+};
+
+const spawnWithShimFallback = (
+  command: string,
+  args: string[],
+  options: Parameters<typeof spawnSync>[2],
+) => {
+  const direct = spawnSync(command, args, options);
+  const errorCode =
+    direct.error && typeof direct.error === 'object' && 'code' in direct.error
+      ? String((direct.error as NodeJS.ErrnoException).code ?? '')
+      : '';
+  if (errorCode !== 'EPERM') {
+    return direct;
+  }
+
+  return spawnSync(buildShellCommand(command, args), {
+    ...options,
+    shell: true,
+  });
+};
+
 const runOaa = (args: string[]) => {
-  const result = spawnSync(oaaBin, args, {
+  const result = spawnWithShimFallback(oaaBin, args, {
     stdio: 'pipe',
     encoding: 'utf-8',
     env: runtimeEnv,
   });
 
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  if (typeof result.status === 'number') {
+    return {
+      ok: result.status === 0,
+      output,
+    };
+  }
+
   if (result.error) {
     const reason = result.error instanceof Error ? result.error.message : String(result.error);
     return {
@@ -970,41 +1264,52 @@ const requireActiveSession = (): boolean => {
   return active.ok;
 };
 
+const loadOpenclawSessions = (
+  targetAgentId: string,
+): Record<string, unknown> | null => {
+  const home = resolveHome();
+  const fileSessions = home
+    ? readJsonObject(
+        join(home, '.openclaw', 'agents', targetAgentId, 'sessions', 'sessions.json'),
+      )
+    : null;
+  const cliSessions = readSessionsFromCli(targetAgentId);
+  return mergeSessionEntryMaps(cliSessions, fileSessions);
+};
+
 const readEventSessionKey = (event: any): string =>
   typeof event?.sessionKey === 'string' ? event.sessionKey.trim() : '';
 
-const resolveTargetAgentId = (event: any): string | null => {
-  const override = process.env.OMNI_AGENT_OPENCLAW_AGENT_ID?.trim();
-  if (override) return override;
-
-  const sessionKey = readEventSessionKey(event);
-  if (sessionKey.startsWith('agent:')) {
-    const parts = sessionKey.split(':');
-    const candidate = parts[1]?.trim();
-    if (candidate) return candidate;
-  }
-
-  return 'main';
+const agentIdFromSessionKey = (sessionKey: string): string => {
+  if (!sessionKey.startsWith('agent:')) return '';
+  const parts = sessionKey.split(':');
+  return parts[1]?.trim() ?? '';
 };
 
-const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | null => {
-  const explicitSessionKey = process.env.OMNI_AGENT_OPENCLAW_SESSION_KEY?.trim();
-  const eventSessionKey = readEventSessionKey(event);
-  const eventAgentSessionKey = eventSessionKey.startsWith('agent:') ? eventSessionKey : '';
-  const fallbackSessionKey = `agent:${targetAgentId}:main`;
-  const routeSessionKey = eventAgentSessionKey || explicitSessionKey || fallbackSessionKey;
+const routeFromBinding = (
+  binding: OpenclawBinding | null,
+  targetAgentId: string,
+): SessionRoute | null => {
+  if (!binding?.session_id) return null;
 
-  const overrideSessionId = process.env.OMNI_AGENT_OPENCLAW_SESSION_ID?.trim();
-  if (overrideSessionId) return { sessionKey: routeSessionKey, sessionId: overrideSessionId };
+  const agentId = readCandidateString(binding.agent_id) || targetAgentId;
+  const sessionKey =
+    readCandidateString(binding.session_key) || `agent:${agentId}:main`;
 
-  const home = resolveHome();
-  if (!home) return null;
+  return {
+    sessionKey,
+    sessionId: binding.session_id,
+    channel: readCandidateString(binding.channel) || undefined,
+    to: readCandidateString(binding.to) || undefined,
+    from: readCandidateString(binding.from) || undefined,
+    accountId: readCandidateString(binding.account_id) || undefined,
+  };
+};
 
-  const sessionsPath = join(home, '.openclaw', 'agents', targetAgentId, 'sessions', 'sessions.json');
-  const sessions = readJsonObject(sessionsPath);
-  if (!sessions) return null;
-
-  const entry = sessions[routeSessionKey];
+const routeFromEntry = (
+  sessionKey: string,
+  entry: unknown,
+): { route: SessionRoute; updatedAt: number } | null => {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
 
   const record = entry as Record<string, unknown>;
@@ -1015,29 +1320,360 @@ const resolveSessionRoute = (event: any, targetAgentId: string): SessionRoute | 
     record.deliveryContext && typeof record.deliveryContext === 'object' && !Array.isArray(record.deliveryContext)
       ? (record.deliveryContext as Record<string, unknown>)
       : null;
+  const origin =
+    record.origin && typeof record.origin === 'object' && !Array.isArray(record.origin)
+      ? (record.origin as Record<string, unknown>)
+      : null;
 
   const channel =
-    deliveryContext && typeof deliveryContext.channel === 'string'
-      ? deliveryContext.channel.trim()
-      : '';
+    readRecordString(deliveryContext, 'channel') ||
+    readRecordString(record, 'lastChannel') ||
+    readRecordString(origin, 'surface') ||
+    readRecordString(origin, 'provider');
   const to =
-    deliveryContext && typeof deliveryContext.to === 'string' ? deliveryContext.to.trim() : '';
+    readRecordString(deliveryContext, 'to') ||
+    readRecordString(record, 'lastTo') ||
+    readRecordString(origin, 'to');
+  const from = readRecordString(origin, 'from');
   const accountId =
-    deliveryContext && typeof deliveryContext.accountId === 'string'
-      ? deliveryContext.accountId.trim()
-      : '';
+    readRecordString(deliveryContext, 'accountId') ||
+    readRecordString(record, 'lastAccountId') ||
+    readRecordString(origin, 'accountId');
+  const updatedAt =
+    typeof record.updatedAt === 'number' && Number.isFinite(record.updatedAt)
+      ? record.updatedAt
+      : 0;
 
   return {
-    sessionKey: routeSessionKey,
-    sessionId,
-    channel: channel || undefined,
-    to: to || undefined,
-    accountId: accountId || undefined,
+    route: {
+      sessionKey,
+      sessionId,
+      channel: channel || undefined,
+      to: to || undefined,
+      from: from || undefined,
+      accountId: accountId || undefined,
+    },
+    updatedAt,
   };
 };
 
+const mergeSessionRoutes = (
+  primary: SessionRoute | null,
+  fallback: SessionRoute | null,
+): SessionRoute | null => {
+  if (!primary) return fallback;
+  if (!fallback) return primary;
+
+  if (
+    fallback.sessionId &&
+    primary.sessionId &&
+    fallback.sessionId !== primary.sessionId
+  ) {
+    return primary;
+  }
+
+  return {
+    sessionKey: primary.sessionKey || fallback.sessionKey,
+    sessionId: primary.sessionId || fallback.sessionId,
+    channel: primary.channel || fallback.channel,
+    to: primary.to || fallback.to,
+    from: primary.from || fallback.from,
+    accountId: primary.accountId || fallback.accountId,
+  };
+};
+
+const routeDeliveryScore = (route: SessionRoute): number => {
+  let score = 0;
+  if (route.channel) score += 2;
+  if (route.to) score += 4;
+  if (route.from) score += 2;
+  if (route.accountId) score += 1;
+  return score;
+};
+
+const routeSubagentPenalty = (route: SessionRoute): number =>
+  route.sessionKey.includes(':subagent:') ? 1 : 0;
+
+const sessionEntrySignalScore = (sessionKey: string, entry: unknown): number => {
+  const candidate = routeFromEntry(sessionKey, entry);
+  if (!candidate) return 0;
+  let score = routeDeliveryScore(candidate.route) * 10;
+  if (candidate.updatedAt > 0) score += 1;
+  return score;
+};
+
+const mergeSessionEntryMaps = (
+  primary: Record<string, unknown> | null,
+  fallback: Record<string, unknown> | null,
+): Record<string, unknown> | null => {
+  if (!primary) return fallback;
+  if (!fallback) return primary;
+
+  const merged = { ...fallback };
+  for (const [sessionKey, entry] of Object.entries(primary)) {
+    const existing = merged[sessionKey];
+    if (existing === undefined) {
+      merged[sessionKey] = entry;
+      continue;
+    }
+
+    const entryScore = sessionEntrySignalScore(sessionKey, entry);
+    const existingScore = sessionEntrySignalScore(sessionKey, existing);
+    if (entryScore >= existingScore) {
+      merged[sessionKey] = entry;
+    }
+  }
+
+  return merged;
+};
+
+const sessionKeyMatchesTargetAgent = (
+  sessionKey: string,
+  targetAgentId: string,
+): boolean => {
+  const agentId = agentIdFromSessionKey(sessionKey);
+  if (!agentId) return true;
+  return agentId === targetAgentId;
+};
+
+const selectSessionRoute = (
+  sessions: Record<string, unknown>,
+  targetAgentId: string,
+  preferredKeys: string[],
+  preferredSessionId: string,
+): SessionRoute | null => {
+  const preferredKeySet = new Set(
+    preferredKeys.map((value) => value.trim()).filter(Boolean),
+  );
+  const candidates: Array<{
+    route: SessionRoute;
+    updatedAt: number;
+    score: number;
+  }> = [];
+
+  let bestRoute: SessionRoute | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  let bestUpdatedAt = -1;
+
+  for (const [sessionKey, entry] of Object.entries(sessions)) {
+    const candidate = routeFromEntry(sessionKey, entry);
+    if (!candidate) continue;
+    if (!sessionKeyMatchesTargetAgent(candidate.route.sessionKey, targetAgentId)) continue;
+
+    let score = 0;
+    if (preferredKeySet.has(candidate.route.sessionKey)) score += 240;
+    if (preferredSessionId && candidate.route.sessionId === preferredSessionId) score += 220;
+    if (candidate.route.sessionKey.startsWith(`agent:${targetAgentId}:`)) score += 30;
+    if (candidate.route.channel && candidate.route.to) score += 40;
+    if (candidate.route.accountId) score += 10;
+    if (candidate.route.sessionKey.includes(':subagent:')) score -= 180;
+    candidates.push({
+      route: candidate.route,
+      updatedAt: candidate.updatedAt,
+      score,
+    });
+
+    if (
+      bestRoute === null ||
+      score > bestScore ||
+      (score === bestScore && candidate.updatedAt > bestUpdatedAt)
+    ) {
+      bestRoute = candidate.route;
+      bestScore = score;
+      bestUpdatedAt = candidate.updatedAt;
+    }
+  }
+
+  const sameSessionRoutes = bestRoute
+    ? candidates.filter((candidate) => candidate.route.sessionId === bestRoute?.sessionId)
+    : [];
+
+  if (sameSessionRoutes.length > 1) {
+    const freshestRoute = [...sameSessionRoutes].sort((left, right) => {
+      const subagentDiff =
+        routeSubagentPenalty(left.route) - routeSubagentPenalty(right.route);
+      if (subagentDiff !== 0) return subagentDiff;
+      if (right.updatedAt !== left.updatedAt) return right.updatedAt - left.updatedAt;
+      if (right.score !== left.score) return right.score - left.score;
+      const metadataDiff =
+        routeDeliveryScore(right.route) - routeDeliveryScore(left.route);
+      if (metadataDiff !== 0) return metadataDiff;
+      return right.route.sessionKey.localeCompare(left.route.sessionKey);
+    })[0]?.route ?? null;
+
+    const mostDeliverableRoute = [...sameSessionRoutes].sort((left, right) => {
+      const subagentDiff =
+        routeSubagentPenalty(left.route) - routeSubagentPenalty(right.route);
+      if (subagentDiff !== 0) return subagentDiff;
+      const metadataDiff =
+        routeDeliveryScore(right.route) - routeDeliveryScore(left.route);
+      if (metadataDiff !== 0) return metadataDiff;
+      if (right.score !== left.score) return right.score - left.score;
+      if (right.updatedAt !== left.updatedAt) return right.updatedAt - left.updatedAt;
+      return right.route.sessionKey.localeCompare(left.route.sessionKey);
+    })[0]?.route ?? null;
+
+    return mergeSessionRoutes(freshestRoute, mostDeliverableRoute);
+  }
+
+  return bestRoute;
+};
+
+const persistOpenclawRoute = (targetAgentId: string, route: SessionRoute): void => {
+  const args = [
+    '--record-openclaw-route',
+    '--openclaw-agent-id',
+    targetAgentId,
+    '--openclaw-session-id',
+    route.sessionId,
+  ];
+
+  if (route.sessionKey) args.push('--openclaw-session-key', route.sessionKey);
+  if (route.channel) args.push('--openclaw-reply-channel', route.channel);
+  if (route.to) args.push('--openclaw-reply-to', route.to);
+  if (route.from) args.push('--openclaw-reply-from', route.from);
+  if (route.accountId) args.push('--openclaw-reply-account', route.accountId);
+
+  runOaa(args);
+};
+
+const eventMatchesActiveRoute = (
+  event: any,
+  targetAgentId: string,
+  status: StatusPayload,
+  route: SessionRoute,
+): boolean => {
+  const eventSessionKey = readEventSessionKey(event);
+  if (eventSessionKey) {
+    if (route.sessionKey === eventSessionKey) return true;
+
+    const persistedBinding = readPersistedOpenclawBinding(status);
+    if (readCandidateString(persistedBinding?.session_key) === eventSessionKey) {
+      return true;
+    }
+
+    const sessions = loadOpenclawSessions(targetAgentId);
+    const eventRoute = sessions
+      ? routeFromEntry(eventSessionKey, sessions[eventSessionKey])?.route ?? null
+      : null;
+    if (!eventRoute) {
+      return false;
+    }
+
+    const persistedSessionId = readCandidateString(persistedBinding?.session_id);
+    if (eventRoute.sessionId === route.sessionId) {
+      return true;
+    }
+    if (persistedSessionId && eventRoute.sessionId === persistedSessionId) {
+      return true;
+    }
+
+    return false;
+  }
+
+  return eventEnvelopeMatchesRoute(route, event);
+};
+
+const resolveTargetAgentId = (event: any, status?: StatusPayload | null): string | null => {
+  const override = process.env.OMNI_AGENT_OPENCLAW_AGENT_ID?.trim();
+  if (override) return override;
+
+  const sessionKey = readEventSessionKey(event);
+  const sessionAgentId = agentIdFromSessionKey(sessionKey);
+  if (sessionAgentId) return sessionAgentId;
+
+  const explicitSessionKey = process.env.OMNI_AGENT_OPENCLAW_SESSION_KEY?.trim();
+  const explicitAgentId = agentIdFromSessionKey(explicitSessionKey ?? '');
+  if (explicitAgentId) return explicitAgentId;
+
+  const persistedBinding = readPersistedOpenclawBinding(status ?? null);
+  const persistedAgentId = readCandidateString(persistedBinding?.agent_id);
+  if (persistedAgentId) return persistedAgentId;
+
+  return 'main';
+};
+
+const resolveSessionRoute = (
+  event: any,
+  targetAgentId: string,
+  status?: StatusPayload | null,
+  options?: { includeEventDelivery?: boolean },
+): SessionRoute | null => {
+  const explicitSessionKey = process.env.OMNI_AGENT_OPENCLAW_SESSION_KEY?.trim();
+  const eventSessionKey = readEventSessionKey(event);
+  const persistedBinding = readPersistedOpenclawBinding(status ?? null);
+  const persistedRoute = routeFromBinding(persistedBinding, targetAgentId);
+  const fallbackSessionKey =
+    readCandidateString(persistedBinding?.session_key) || `agent:${targetAgentId}:main`;
+  const includeEventDelivery = options?.includeEventDelivery !== false;
+  const finalizeRoute = (route: SessionRoute | null): SessionRoute | null => {
+    if (!route) return null;
+    if (!includeEventDelivery || event?.type !== 'message') return route;
+    return mergeEventDeliveryContext(route, event);
+  };
+
+  const overrideSessionId = process.env.OMNI_AGENT_OPENCLAW_SESSION_ID?.trim();
+  if (overrideSessionId) {
+    return finalizeRoute({
+      sessionKey: eventSessionKey || explicitSessionKey || fallbackSessionKey,
+      sessionId: overrideSessionId,
+      channel: persistedRoute?.channel,
+      to: persistedRoute?.to,
+      from: persistedRoute?.from,
+      accountId: persistedRoute?.accountId,
+    });
+  }
+
+  const sessions = loadOpenclawSessions(targetAgentId);
+  if (!sessions) return finalizeRoute(persistedRoute);
+
+  const selected = selectSessionRoute(
+    sessions,
+    targetAgentId,
+    [
+      eventSessionKey,
+      explicitSessionKey ?? '',
+      readCandidateString(persistedBinding?.session_key),
+    ],
+    readCandidateString(persistedBinding?.session_id),
+  );
+  if (selected) return finalizeRoute(mergeSessionRoutes(selected, persistedRoute));
+
+  return finalizeRoute(persistedRoute);
+};
+
 const readEventAccountId = (event: any): string =>
-  typeof event?.context?.accountId === 'string' ? event.context.accountId.trim() : '';
+  readCandidateString(
+    event?.context?.accountId,
+    event?.context?.metadata?.accountId,
+    event?.accountId,
+  );
+
+const readEventChannel = (event: any): string =>
+  readCandidateString(
+    event?.context?.channel,
+    event?.context?.metadata?.channel,
+    event?.context?.surface,
+    event?.context?.metadata?.surface,
+    event?.context?.provider,
+    event?.context?.metadata?.provider,
+    event?.channel,
+  );
+
+const readInboundSender = (event: any): string =>
+  readCandidateString(
+    event?.context?.from,
+    event?.context?.metadata?.from,
+    event?.context?.metadata?.senderId,
+    event?.from,
+  );
+
+const readInboundRecipient = (event: any): string =>
+  readCandidateString(
+    event?.context?.to,
+    event?.context?.metadata?.to,
+    event?.to,
+  );
 
 const readInboundEventText = (event: any): string => {
   const candidates = [
@@ -1045,6 +1681,12 @@ const readInboundEventText = (event: any): string => {
     event?.context?.transcript,
     event?.context?.content,
     event?.context?.body,
+    event?.context?.text,
+    event?.context?.message,
+    event?.context?.metadata?.bodyForAgent,
+    event?.context?.metadata?.transcript,
+    event?.context?.metadata?.content,
+    event?.context?.metadata?.text,
   ];
   for (const candidate of candidates) {
     if (typeof candidate !== 'string') continue;
@@ -1054,7 +1696,61 @@ const readInboundEventText = (event: any): string => {
   return '';
 };
 
-const senderAuthorizedForCancelDecision = (event: any, from: string): boolean => {
+const readInboundMessageId = (event: any): string =>
+  readCandidateString(
+    event?.context?.messageId,
+    event?.context?.metadata?.messageId,
+    event?.messageId,
+    event?.id,
+  );
+
+const readEventDirection = (event: any): string =>
+  readCandidateString(
+    event?.context?.direction,
+    event?.context?.metadata?.direction,
+    event?.direction,
+  );
+
+const readEventRole = (event: any): string =>
+  readCandidateString(
+    event?.context?.role,
+    event?.context?.metadata?.role,
+    event?.role,
+  );
+
+const normalizeRouteIdentity = (value: string | undefined): string =>
+  (value ?? '').trim().toLowerCase();
+
+const isNonUserIdentity = (value: string): boolean => {
+  const normalized = normalizeInboundMessage(value);
+  if (!normalized) return false;
+  const tokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.some((token) =>
+    new Set(['assistant', 'system', 'agent', 'model', 'bot']).has(token),
+  );
+};
+
+const isLikelyUserMessageEvent = (event: any): boolean => {
+  const direction = normalizeInboundMessage(readEventDirection(event));
+  if (direction && new Set(['outbound', 'egress', 'assistant', 'agent', 'system']).has(direction)) {
+    return false;
+  }
+
+  const role = normalizeInboundMessage(readEventRole(event));
+  if (role && new Set(['assistant', 'system', 'tool', 'model']).has(role)) {
+    return false;
+  }
+
+  const from = readInboundSender(event);
+  if (from && isNonUserIdentity(from)) return false;
+  return true;
+};
+
+const senderAuthorizedForCancelDecision = (
+  event: any,
+  from: string,
+  status?: StatusPayload | null,
+): boolean => {
   const normalizedFrom = from.trim().toLowerCase();
   if (!normalizedFrom) return false;
 
@@ -1062,12 +1758,26 @@ const senderAuthorizedForCancelDecision = (event: any, from: string): boolean =>
     return cancelAllowedSenders.has(normalizedFrom);
   }
 
-  const targetAgentId = resolveTargetAgentId(event);
+  const targetAgentId = resolveTargetAgentId(event, status);
   if (!targetAgentId) return false;
-  const route = resolveSessionRoute(event, targetAgentId);
+  const route = resolveSessionRoute(
+    event,
+    targetAgentId,
+    status,
+    { includeEventDelivery: false },
+  );
   if (!route) return false;
 
-  if (route.to && route.to.trim().toLowerCase() !== normalizedFrom) {
+  const allowedSenders = [route.to]
+    .map((value) => normalizeRouteIdentity(value))
+    .filter(Boolean);
+  if (allowedSenders.length === 0 && route.from && !isNonUserIdentity(route.from)) {
+    allowedSenders.push(normalizeRouteIdentity(route.from));
+  }
+  if (allowedSenders.length === 0) {
+    return false;
+  }
+  if (!allowedSenders.includes(normalizedFrom)) {
     return false;
   }
 
@@ -1081,43 +1791,271 @@ const senderAuthorizedForCancelDecision = (event: any, from: string): boolean =>
   return true;
 };
 
+const mergeEventDeliveryContext = (
+  route: SessionRoute,
+  event: any,
+): SessionRoute => ({
+  sessionKey: route.sessionKey,
+  sessionId: route.sessionId,
+  channel: route.channel || readEventChannel(event) || undefined,
+  to: route.to || readInboundSender(event) || undefined,
+  from: route.from || readInboundRecipient(event) || undefined,
+  accountId: route.accountId || readEventAccountId(event) || undefined,
+});
+
+const routeAllowsInboundSender = (route: SessionRoute, from: string): boolean => {
+  const normalizedFrom = normalizeRouteIdentity(from);
+  if (!normalizedFrom) return false;
+
+  const allowedSenders = [route.to]
+    .map((value) => normalizeRouteIdentity(value))
+    .filter(Boolean);
+  if (allowedSenders.length === 0 && route.from && !isNonUserIdentity(route.from)) {
+    allowedSenders.push(normalizeRouteIdentity(route.from));
+  }
+  if (allowedSenders.length === 0) return false;
+  return allowedSenders.includes(normalizedFrom);
+};
+
+const eventEnvelopeMatchesRoute = (
+  route: SessionRoute,
+  event: any,
+): boolean => {
+  const from = readInboundSender(event);
+  if (!routeAllowsInboundSender(route, from)) {
+    return false;
+  }
+
+  if (route.accountId) {
+    const eventAccountId = readEventAccountId(event);
+    if (!eventAccountId || route.accountId.trim() !== eventAccountId) {
+      return false;
+    }
+  }
+
+  const routeChannel = normalizeRouteIdentity(route.channel);
+  const eventChannel = normalizeRouteIdentity(readEventChannel(event));
+  if (routeChannel && eventChannel && routeChannel !== eventChannel) {
+    return false;
+  }
+
+  return true;
+};
+
 const startupWakeDedupeKey = (status: StatusPayload, route: SessionRoute): string => {
   const startedAt = typeof status.started_at === 'string' ? status.started_at.trim() : '';
   const sessionStartToken = startedAt || `missing-started-at:${shortFingerprint(status.request)}`;
   return ['startup', route.sessionKey, route.sessionId, sessionStartToken].join('|');
 };
 
+const inboundForwardDedupeKey = (
+  route: SessionRoute,
+  event: any,
+  raw: string,
+  from: string,
+): string => {
+  const messageId = readInboundMessageId(event);
+  const messageToken = messageId || `text:${shortFingerprint(normalizeInboundMessage(raw))}`;
+  return [
+    'message',
+    route.sessionKey,
+    route.sessionId,
+    messageToken,
+    shortFingerprint(from),
+  ].join('|');
+};
+
+const buildAgentArgs = (targetAgentId: string, route: SessionRoute, prompt: string): string[] => {
+  const args = ['agent', '--agent', targetAgentId, '--session-id', route.sessionId, '--message', prompt];
+  if (deliverStartupWake) {
+    args.push('--deliver');
+    if (route.channel) args.push('--reply-channel', route.channel);
+    if (route.to) args.push('--reply-to', route.to);
+    if (route.accountId) args.push('--reply-account', route.accountId);
+  }
+  return args;
+};
+
+const reportLaunchFailure = (
+  reason: string,
+  spawnFailedEvent: string,
+  spawnFailedNote: string,
+  rollbackStartupDedupeKey?: string,
+): false => {
+  if (rollbackStartupDedupeKey) {
+    forgetStartupWake(rollbackStartupDedupeKey);
+  }
+  console.error(`[omni-recovery] failed to launch agent wake runner: ${reason}`);
+  recordHookTelemetry(
+    spawnFailedEvent,
+    `${spawnFailedNote} reason=${normalizeTelemetryText(reason, 160)}`,
+  );
+  return false;
+};
+
+const sleepMs = (ms: number): void => {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+const launchDetachedOpenclawAgent = (
+  command: string,
+  args: string[],
+  options: { shell: boolean },
+): { ok: boolean; reason: string } => {
+  const shell = options.shell;
+  if (process.platform !== 'win32') {
+    const quotedCommand = shell ? buildShellCommand(command, args) : buildShellCommand(command, args);
+    const verifySeconds = Math.max(1, Math.ceil(DETACHED_LAUNCH_VERIFY_MS / 1000));
+    const script = `nohup ${quotedCommand} >/dev/null 2>&1 & child=$!; sleep ${verifySeconds}; kill -0 "$child" >/dev/null 2>&1`;
+    const result = spawnSync('sh', ['-lc', script], {
+      stdio: 'ignore',
+      env: runtimeEnv,
+    });
+
+    if (result.status === 0) {
+      return { ok: true, reason: '' };
+    }
+
+    const reason = typeof result.status === 'number'
+      ? `exit=${result.status}`
+      : result.error instanceof Error
+        ? result.error.message
+        : 'unknown';
+    return { ok: false, reason };
+  }
+
+  try {
+    const child = shell
+      ? spawn(buildShellCommand(command, args), {
+          stdio: 'ignore',
+          env: runtimeEnv,
+          detached: true,
+          windowsHide: true,
+          shell: true,
+        })
+      : spawn(command, args, {
+          stdio: 'ignore',
+          env: runtimeEnv,
+          detached: true,
+          windowsHide: true,
+        });
+
+    const pid = child.pid;
+    if (typeof pid !== 'number' || pid <= 0) {
+      return { ok: false, reason: 'missing child pid' };
+    }
+    child.unref();
+
+    const deadline = Date.now() + DETACHED_LAUNCH_VERIFY_MS;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      sleepMs(Math.min(DETACHED_LAUNCH_POLL_MS, remaining));
+    }
+
+    try {
+      process.kill(pid, 0);
+      return { ok: true, reason: '' };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { ok: false, reason: reason || 'process exited before verification' };
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason };
+  }
+};
+
+const launchOpenclawAgent = (
+  args: string[],
+  spawnFailedEvent: string,
+  spawnFailedNote: string,
+  rollbackStartupDedupeKey?: string,
+) => {
+  if (!syncAgentLaunch) {
+    const directAttempt = launchDetachedOpenclawAgent(openclawBin, args, {
+      shell: false,
+    });
+    if (directAttempt.ok) {
+      return true;
+    }
+
+    const shellAttempt = launchDetachedOpenclawAgent(openclawBin, args, {
+      shell: true,
+    });
+    if (shellAttempt.ok) {
+      return true;
+    }
+
+    return reportLaunchFailure(
+      shellAttempt.reason || directAttempt.reason || 'unknown',
+      spawnFailedEvent,
+      spawnFailedNote,
+      rollbackStartupDedupeKey,
+    );
+  }
+
+  let failureReason = 'unknown';
+
+  for (let attempt = 0; attempt < AGENT_WAKE_RETRY_ATTEMPTS; attempt += 1) {
+    const result = spawnWithShimFallback(openclawBin, args, {
+      stdio: 'ignore',
+      env: runtimeEnv,
+    });
+    if (result.status === 0) {
+      return true;
+    }
+
+    failureReason = typeof result.status === 'number'
+      ? `exit=${result.status}`
+      : result.error instanceof Error
+        ? result.error.message
+        : 'unknown';
+
+    if (attempt + 1 < AGENT_WAKE_RETRY_ATTEMPTS) {
+      sleepMs(AGENT_WAKE_RETRY_DELAY_MS);
+    }
+  }
+
+  return reportLaunchFailure(
+    failureReason,
+    spawnFailedEvent,
+    spawnFailedNote,
+    rollbackStartupDedupeKey,
+  );
+};
+
 const queueResumePing = (status: StatusPayload, event: any) => {
   const eventSessionKey = readEventSessionKey(event);
-  const targetAgentId = resolveTargetAgentId(event);
+  const targetAgentId = resolveTargetAgentId(event, status);
   if (!targetAgentId) {
     console.warn('[omni-recovery] startup wake skipped: unresolved target agent id');
     recordHookTelemetry(
       'openclaw.startup.target_unresolved',
       `event_key=${shortFingerprint(eventSessionKey)}`,
     );
-    return;
+    return false;
   }
 
-  const route = resolveSessionRoute(event, targetAgentId);
+  const route = resolveSessionRoute(event, targetAgentId, status);
   if (!route) {
     console.warn('[omni-recovery] startup wake skipped: unresolved session route');
     recordHookTelemetry(
       'openclaw.startup.route_unresolved',
       `agent=${targetAgentId} event_key=${shortFingerprint(eventSessionKey)}`,
     );
-    return;
+    return false;
   }
+  persistOpenclawRoute(targetAgentId, route);
 
   const latestStatus = readStatusPayload();
-  if (!latestStatus?.active || latestStatus.waiting_for_user) {
+  if (!latestStatus?.active) {
     console.log('[omni-recovery] startup wake skipped: session no longer active');
-    const reason = !latestStatus?.active ? 'inactive' : 'waiting_for_user';
     recordHookTelemetry(
       'openclaw.startup.session_ineligible',
-      `reason=${reason} route=${shortFingerprint(route.sessionKey)}`,
+      `reason=inactive route=${shortFingerprint(route.sessionKey)}`,
     );
-    return;
+    return false;
   }
 
   if (!requireActiveSession()) {
@@ -1126,7 +2064,7 @@ const queueResumePing = (status: StatusPayload, event: any) => {
       'openclaw.startup.require_active_failed',
       `route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
     );
-    return;
+    return false;
   }
 
   const effectiveStatus = latestStatus ?? status;
@@ -1139,7 +2077,7 @@ const queueResumePing = (status: StatusPayload, event: any) => {
       'openclaw.startup.duplicate_skip',
       `key=${shortFingerprint(dedupeKey)} route=${shortFingerprint(route.sessionKey)}`,
     );
-    return;
+    return false;
   }
 
   if (dedupe.decision === 'lock-unavailable') {
@@ -1148,7 +2086,7 @@ const queueResumePing = (status: StatusPayload, event: any) => {
       'openclaw.startup.dedupe_lock_unavailable',
       `key=${shortFingerprint(dedupeKey)} route=${shortFingerprint(route.sessionKey)}`,
     );
-    return;
+    return false;
   }
 
   if (dedupe.decision === 'error') {
@@ -1163,21 +2101,18 @@ const queueResumePing = (status: StatusPayload, event: any) => {
   const deadline = effectiveStatus.dynamic ? 'dynamic' : (effectiveStatus.deadline ?? 'unknown');
   const reportStatus = effectiveStatus.report_status ?? 'UNKNOWN';
   const requestLine = includeSensitiveContext ? `Request: ${request}` : 'Request: [redacted]';
+  const resumeLine = effectiveStatus.waiting_for_user
+    ? 'A user-response window may still be active. If it is still open, remain paused for the user; if it has expired, continue autonomously with the best available information.'
+    : 'Resume autonomous execution now.';
   const prompt = [
     '[omni] Gateway restarted and an autonomous session is still active.',
-    'Resume autonomous execution now.',
+    resumeLine,
     requestLine,
     `Deadline: ${deadline}`,
     `Report status: ${reportStatus}`,
   ].join('\\n');
 
-  const args = ['agent', '--agent', targetAgentId, '--session-id', route.sessionId, '--message', prompt];
-  if (deliverStartupWake) {
-    args.push('--deliver');
-    if (route.channel) args.push('--reply-channel', route.channel);
-    if (route.to) args.push('--reply-to', route.to);
-    if (route.accountId) args.push('--reply-account', route.accountId);
-  }
+  const args = buildAgentArgs(targetAgentId, route, prompt);
 
   console.log(
     `[omni-recovery] startup wake queued for agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
@@ -1187,39 +2122,81 @@ const queueResumePing = (status: StatusPayload, event: any) => {
     `agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
   );
 
-  let child: ReturnType<typeof spawn>;
-  try {
-    child = spawn(openclawBin, args, {
-      detached: true,
-      stdio: 'ignore',
-      env: runtimeEnv,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (dedupe.decision === 'recorded') {
-      forgetStartupWake(dedupeKey);
-    }
-    console.error(`[omni-recovery] failed to launch startup wake ping: ${message}`);
+  const launched = launchOpenclawAgent(
+    args,
+    'openclaw.startup.spawn_failed',
+    `route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} rollback=1`,
+    dedupe.decision === 'recorded' ? dedupeKey : undefined,
+  );
+  return launched;
+};
+
+const queueInboundUserMessage = (
+  status: StatusPayload,
+  event: any,
+  raw: string,
+  targetAgentId: string,
+  route: SessionRoute,
+) => {
+  if (!route) {
+    console.warn('[omni-recovery] inbound forward skipped: unresolved session route');
     recordHookTelemetry(
-      'openclaw.startup.spawn_failed',
-      `reason=${normalizeTelemetryText(message, 180)} rollback=1`,
+      'openclaw.message.forward_route_unresolved',
+      `agent=${targetAgentId} event_key=${shortFingerprint(readEventSessionKey(event))}`,
     );
-    return;
+    return false;
   }
 
-  child.on('error', (error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    if (dedupe.decision === 'recorded') {
-      forgetStartupWake(dedupeKey);
-    }
-    console.error(`[omni-recovery] failed to launch startup wake ping: ${message}`);
+  const from = readInboundSender(event);
+  const dedupeKey = inboundForwardDedupeKey(route, event, raw, from);
+  const dedupe = rememberInboundForward(dedupeKey);
+  if (dedupe.decision === 'duplicate') {
+    console.log('[omni-recovery] inbound forward skipped: duplicate message event');
     recordHookTelemetry(
-      'openclaw.startup.spawn_failed',
-      `reason=${normalizeTelemetryText(message, 180)} rollback=1`,
+      'openclaw.message.forward_duplicate',
+      `action=${event.action} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
     );
-  });
+    return false;
+  }
+  if (dedupe.decision === 'lock-unavailable') {
+    console.warn('[omni-recovery] inbound forward dedupe lock unavailable; proceeding');
+    recordHookTelemetry(
+      'openclaw.message.forward_dedupe_lock_unavailable',
+      `action=${event.action} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+    );
+  }
+  if (dedupe.decision === 'error') {
+    console.warn('[omni-recovery] inbound forward dedupe file unavailable; proceeding');
+    recordHookTelemetry(
+      'openclaw.message.forward_dedupe_error',
+      `action=${event.action} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+    );
+  }
 
-  child.unref();
+  const deadline = status.dynamic ? 'dynamic' : (status.deadline ?? 'unknown');
+  const reportStatus = status.report_status ?? 'UNKNOWN';
+  const prompt = [
+    '[omni] New user message arrived during an active autonomous session.',
+    'Handle it immediately, then continue autonomous execution unless the user changed the task or told you to stop.',
+    `User message: ${raw}`,
+    `Deadline: ${deadline}`,
+    `Report status: ${reportStatus}`,
+  ].join('\\n');
+  const args = buildAgentArgs(targetAgentId, route, prompt);
+
+  console.log(
+    `[omni-recovery] inbound message forwarded to agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+  );
+  recordHookTelemetry(
+    'openclaw.message.forward_queued',
+    `action=${event.action} agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
+  );
+  const launched = launchOpenclawAgent(
+    args,
+    'openclaw.message.forward_spawn_failed',
+    `action=${event.action} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+  );
+  return launched;
 };
 
 const handler = async (event: any) => {
@@ -1246,19 +2223,25 @@ const handler = async (event: any) => {
     event.type === 'message' &&
     ['received', 'transcribed', 'preprocessed'].includes(event.action)
   ) {
-    const from = typeof event.context?.from === 'string' ? event.context.from.trim() : '';
-    if (!from || from.toLowerCase() === 'system') return;
-
     const status = readStatusPayload();
     const raw = readInboundEventText(event);
     const note = raw.replace(/\\s+/g, ' ').trim().slice(0, 200) || 'Inbound user message received.';
+    const from = readInboundSender(event);
 
     if (!status?.active) return;
+    if (!isLikelyUserMessageEvent(event)) {
+      recordHookTelemetry(
+        'openclaw.message.non_user_ignored',
+        `action=${event.action} from=${shortFingerprint(from)}`,
+      );
+      return;
+    }
 
     if (status.cancel_request_state === 'pending') {
       const decision = parseCancelDecision(raw);
       if (decision) {
-        if (!senderAuthorizedForCancelDecision(event, from)) {
+        if (!from || from.toLowerCase() === 'system') return;
+        if (!senderAuthorizedForCancelDecision(event, from, status)) {
           recordHookTelemetry(
             'openclaw.message.cancel_decision_unauthorized',
             `from=${shortFingerprint(from)} account=${shortFingerprint(readEventAccountId(event))}`,
@@ -1278,10 +2261,31 @@ const handler = async (event: any) => {
       }
     }
 
-    if (!status.waiting_for_user) return;
+    const targetAgentId = resolveTargetAgentId(event, status);
+    if (!targetAgentId) return;
 
-    runOaa(['--user-responded', '--response-note', note]);
-    recordHookTelemetry('openclaw.message.user_responded', `from=${shortFingerprint(from)}`);
+    const route = resolveSessionRoute(event, targetAgentId, status);
+    if (!route) return;
+    if (!eventMatchesActiveRoute(event, targetAgentId, status, route)) {
+      recordHookTelemetry(
+        'openclaw.message.route_mismatch_ignored',
+        `action=${event.action} from=${shortFingerprint(from)} session=${shortFingerprint(readEventSessionKey(event))}`,
+      );
+      return;
+    }
+    persistOpenclawRoute(targetAgentId, route);
+
+    if (raw) {
+      runOaa(['--user-responded', '--response-note', note]);
+      recordHookTelemetry(
+        'openclaw.message.user_responded',
+        `action=${event.action} from=${shortFingerprint(from)} active_wait=${status.waiting_for_user ? '1' : '0'}`,
+      );
+    }
+
+    if (!raw) return;
+    const latestStatus = readStatusPayload() ?? status;
+    queueInboundUserMessage(latestStatus, event, raw, targetAgentId, route);
     return;
   }
 
@@ -1298,9 +2302,10 @@ const handler = async (event: any) => {
     );
     return;
   }
-  if (!status.active || status.waiting_for_user) return;
-  lastStartupWakeMs = Date.now();
-  queueResumePing(status, event);
+  if (!status.active) return;
+  if (queueResumePing(status, event)) {
+    lastStartupWakeMs = Date.now();
+  }
 };
 
 export default handler;
@@ -1312,6 +2317,7 @@ def _configure_openclaw() -> tuple[bool, Path]:
         "OMNI_AGENT_OPENCLAW_HOOK_DIR",
         Path.home() / ".openclaw" / "hooks" / "omni-recovery",
     )
+    plugin_dir = _openclaw_plugin_dir()
     hook_dir.mkdir(parents=True, exist_ok=True)
     hook_md = hook_dir / "HOOK.md"
     handler_ts = hook_dir / "handler.ts"
@@ -1346,10 +2352,72 @@ def _configure_openclaw() -> tuple[bool, Path]:
             return False, f"{command_text}: timed out after 30 seconds"
 
         if result.returncode == 0:
-            return True, ""
+            return True, (result.stdout or "").strip()
 
         details = (result.stderr or result.stdout or "command failed").strip()
         return False, f"{command_text}: {details}"
+
+    plugin_manifest = plugin_dir / "openclaw.plugin.json"
+    plugin_entry = plugin_dir / "index.ts"
+    if not plugin_manifest.exists() or not plugin_entry.exists():
+        raise RuntimeError(f"OpenClaw plugin source missing at {plugin_dir}")
+
+    plugin_cli_ok, plugin_cli_error = _run_openclaw_command(["openclaw", "plugins", "--help"])
+    if not plugin_cli_ok:
+        raise RuntimeError(
+            "openclaw plugins CLI is required for OAA stop-gate enforcement: "
+            f"{plugin_cli_error}"
+        )
+
+    plugin_info_ok, plugin_info_output = _run_openclaw_command(
+        ["openclaw", "plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
+    )
+    plugin_needs_install = True
+    if plugin_info_ok:
+        try:
+            plugin_info = json.loads(plugin_info_output)
+        except json.JSONDecodeError:
+            plugin_info = None
+        if isinstance(plugin_info, dict):
+            source_value = str(plugin_info.get("source", "") or "").strip()
+            plugin_needs_install = not (
+                source_value
+                and (
+                    str(plugin_dir.resolve()) in source_value
+                    or source_value == str(plugin_entry.resolve())
+                )
+            )
+
+    if plugin_needs_install:
+        _run_openclaw_command(["openclaw", "plugins", "uninstall", OPENCLAW_PLUGIN_ID])
+        plugin_install_ok, plugin_install_error = _run_openclaw_command(
+            ["openclaw", "plugins", "install", "--link", str(plugin_dir)]
+        )
+        if not plugin_install_ok:
+            raise RuntimeError(
+                f"openclaw plugin install failed for {plugin_dir}: {plugin_install_error}"
+            )
+        changed = True
+
+    plugin_enable_ok, plugin_enable_error = _run_openclaw_command(
+        ["openclaw", "plugins", "enable", OPENCLAW_PLUGIN_ID]
+    )
+    if not plugin_enable_ok:
+        raise RuntimeError(f"openclaw plugin enable failed: {plugin_enable_error}")
+
+    plugin_verify_ok, plugin_verify_error = _run_openclaw_command(
+        ["openclaw", "plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
+    )
+    if not plugin_verify_ok:
+        raise RuntimeError(
+            f"openclaw plugin verification failed: {plugin_verify_error}"
+        )
+
+    plugin_doctor_ok, plugin_doctor_error = _run_openclaw_command(
+        ["openclaw", "plugins", "doctor"]
+    )
+    if not plugin_doctor_ok:
+        raise RuntimeError(f"openclaw plugin doctor failed: {plugin_doctor_error}")
 
     recovery_ok, recovery_error = _run_openclaw_command(
         ["openclaw", "hooks", "enable", "omni-recovery"]
@@ -1393,10 +2461,10 @@ def cmd_bootstrap() -> None:
     _header("Autonomous bootstrap")
 
     hook_capable = {
-        "claude": shutil.which("claude") is not None,
-        "gemini": shutil.which("gemini") is not None,
-        "opencode": shutil.which("opencode") is not None,
-        "openclaw": shutil.which("openclaw") is not None,
+        "claude": _has_cli("claude"),
+        "gemini": _has_cli("gemini"),
+        "opencode": _has_cli("opencode"),
+        "openclaw": _has_cli("openclaw"),
     }
 
     env_agent = os.environ.get("AGENT", "").strip()
@@ -1411,7 +2479,7 @@ def cmd_bootstrap() -> None:
             skipped_wrappers.append(wrapper_cmd)
             continue
         if (
-            shutil.which(wrapper_cmd) is not None
+            _has_cli(wrapper_cmd)
             or wrapper_cmd == env_agent_token
             or wrapper_name in forced_wrappers
         ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ from .constants import (
     BOLD,
     DIM,
     GREEN,
+    OPENCLAW_ROUTE_CACHE_FILE,
     RED,
     SANDBOX_ROOT,
     SEP,
@@ -362,14 +364,44 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
 
 
 def _normalize_state_fields(state: dict[str, Any]) -> bool:
+    changed = False
+
     policy = str(state.get("update_policy", "")).strip().lower()
     if policy in {"milestones", "final-only"}:
-        return False
+        pass
+    else:
+        request = str(state.get("request", ""))
+        duration_mode = str(state.get("duration_mode", "dynamic"))
+        state["update_policy"] = _infer_update_policy(request, duration_mode)
+        changed = True
 
-    request = str(state.get("request", ""))
-    duration_mode = str(state.get("duration_mode", "dynamic"))
-    state["update_policy"] = _infer_update_policy(request, duration_mode)
-    return True
+    runtime_bindings = state.get("runtime_bindings")
+    if runtime_bindings is not None and not isinstance(runtime_bindings, dict):
+        state.pop("runtime_bindings", None)
+        return True
+
+    if isinstance(runtime_bindings, dict):
+        normalized_bindings = dict(runtime_bindings)
+        normalized_openclaw = _coerce_openclaw_binding(
+            normalized_bindings.get("openclaw")
+        )
+        if normalized_openclaw is None:
+            if "openclaw" in normalized_bindings:
+                normalized_bindings.pop("openclaw", None)
+                changed = True
+        elif normalized_bindings.get("openclaw") != normalized_openclaw:
+            normalized_bindings["openclaw"] = normalized_openclaw
+            changed = True
+
+        if normalized_bindings:
+            if normalized_bindings != runtime_bindings:
+                state["runtime_bindings"] = normalized_bindings
+                changed = True
+        else:
+            state.pop("runtime_bindings", None)
+            changed = True
+
+    return changed
 
 
 def _load_with_error() -> tuple[dict[str, Any] | None, str | None]:
@@ -396,6 +428,157 @@ def _load_with_error() -> tuple[dict[str, Any] | None, str | None]:
         _save(loaded)
 
     return loaded, None
+
+
+def _openclaw_route_cache_ttl_seconds() -> int:
+    raw = os.environ.get("OMNI_AGENT_OPENCLAW_ROUTE_CACHE_TTL_SECONDS", "600").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 600
+    if value <= 0:
+        return 600
+    return value
+
+
+def _clean_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _coerce_openclaw_binding(
+    raw: Any, *, require_fresh: bool = False, now: datetime | None = None
+) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    binding: dict[str, str] = {}
+    for key in (
+        "agent_id",
+        "session_key",
+        "session_id",
+        "channel",
+        "to",
+        "from",
+        "account_id",
+    ):
+        value = _clean_text(raw.get(key))
+        if value:
+            binding[key] = value
+
+    if "session_id" not in binding:
+        return None
+
+    if "agent_id" not in binding:
+        binding["agent_id"] = "main"
+
+    updated_at_raw = _clean_text(raw.get("updated_at"))
+    updated_at_dt = _parse_iso_datetime(updated_at_raw) if updated_at_raw else None
+    if require_fresh:
+        reference_now = now or _now()
+        if updated_at_dt is None:
+            return None
+        if (reference_now - updated_at_dt).total_seconds() > _openclaw_route_cache_ttl_seconds():
+            return None
+    if updated_at_dt is not None:
+        binding["updated_at"] = updated_at_dt.isoformat()
+
+    return binding
+
+
+def _load_openclaw_route_cache(now: datetime | None = None) -> dict[str, str] | None:
+    if not OPENCLAW_ROUTE_CACHE_FILE.exists():
+        return None
+    try:
+        raw = OPENCLAW_ROUTE_CACHE_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _coerce_openclaw_binding(parsed, require_fresh=True, now=now)
+
+
+def _save_openclaw_route_cache(binding: dict[str, str]) -> None:
+    normalized = _coerce_openclaw_binding(binding)
+    if normalized is None:
+        return
+    existing = _load_openclaw_route_cache()
+    normalized = _merge_openclaw_binding(existing, normalized)
+    OPENCLAW_ROUTE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(normalized, indent=2)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        delete=False,
+        dir=str(OPENCLAW_ROUTE_CACHE_FILE.parent),
+    ) as temp_file:
+        temp_file.write(payload)
+        temp_path = Path(temp_file.name)
+    temp_path.replace(OPENCLAW_ROUTE_CACHE_FILE)
+
+
+def _clear_openclaw_route_cache() -> None:
+    try:
+        if OPENCLAW_ROUTE_CACHE_FILE.exists():
+            OPENCLAW_ROUTE_CACHE_FILE.unlink()
+    except OSError:
+        return
+
+
+def _read_openclaw_binding(state: dict[str, Any]) -> dict[str, str] | None:
+    runtime_bindings = state.get("runtime_bindings")
+    if not isinstance(runtime_bindings, dict):
+        return None
+    return _coerce_openclaw_binding(runtime_bindings.get("openclaw"))
+
+
+def _merge_openclaw_binding(
+    current: dict[str, str] | None, incoming: dict[str, str]
+) -> dict[str, str]:
+    if current is None:
+        return incoming
+
+    current_session_id = _clean_text(current.get("session_id"))
+    incoming_session_id = _clean_text(incoming.get("session_id"))
+    current_session_key = _clean_text(current.get("session_key"))
+    incoming_session_key = _clean_text(incoming.get("session_key"))
+
+    same_route = False
+    if current_session_id and incoming_session_id and current_session_id == incoming_session_id:
+        same_route = True
+    elif (
+        current_session_key
+        and incoming_session_key
+        and current_session_key == incoming_session_key
+    ):
+        same_route = True
+
+    if not same_route:
+        return incoming
+
+    merged = dict(current)
+    merged.update(incoming)
+    normalized = _coerce_openclaw_binding(merged)
+    return normalized if normalized is not None else incoming
+
+
+def _set_openclaw_binding(state: dict[str, Any], binding: dict[str, str]) -> bool:
+    normalized = _coerce_openclaw_binding(binding)
+    if normalized is None:
+        return False
+
+    runtime_bindings_raw = state.get("runtime_bindings")
+    runtime_bindings = (
+        dict(runtime_bindings_raw) if isinstance(runtime_bindings_raw, dict) else {}
+    )
+    current = _coerce_openclaw_binding(runtime_bindings.get("openclaw"))
+    merged = _merge_openclaw_binding(current, normalized)
+    if current == merged:
+        return False
+
+    runtime_bindings["openclaw"] = merged
+    state["runtime_bindings"] = runtime_bindings
+    return True
 
 
 def _clear_state() -> None:
@@ -947,6 +1130,25 @@ def _emit_hook_payload(continue_work: bool, message: str, **extra: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def _parse_duration_config(duration: str) -> tuple[str, str, int | None]:
+    duration_input = (duration or "dynamic").strip()
+    duration_mode = "dynamic"
+    duration_minutes: int | None = None
+
+    if duration_input.lower() != "dynamic":
+        try:
+            duration_minutes = int(duration_input)
+        except ValueError:
+            sys.exit(
+                "error: duration must be a positive integer in minutes, or 'dynamic'"
+            )
+        if duration_minutes <= 0:
+            sys.exit("error: duration must be a positive integer in minutes")
+        duration_mode = "fixed"
+
+    return duration_input, duration_mode, duration_minutes
+
+
 def cmd_add(request: str, duration: str) -> None:
     with _state_lock():
         request_clean = request.strip()
@@ -963,20 +1165,9 @@ def cmd_add(request: str, duration: str) -> None:
                 "error: an active session already exists. Use --status or --cancel first."
             )
 
-        duration_input = (duration or "dynamic").strip()
-        duration_mode = "dynamic"
-        duration_minutes: int | None = None
-
-        if duration_input.lower() != "dynamic":
-            try:
-                duration_minutes = int(duration_input)
-            except ValueError:
-                sys.exit(
-                    "error: duration must be a positive integer in minutes, or 'dynamic'"
-                )
-            if duration_minutes <= 0:
-                sys.exit("error: duration must be a positive integer in minutes")
-            duration_mode = "fixed"
+        duration_input, duration_mode, duration_minutes = _parse_duration_config(
+            duration
+        )
 
         now = _now()
         deadline = (
@@ -984,6 +1175,7 @@ def cmd_add(request: str, duration: str) -> None:
             if duration_minutes is not None
             else None
         )
+        inherited_openclaw_binding = _load_openclaw_route_cache(now)
 
         SANDBOX_ROOT.mkdir(parents=True, exist_ok=True)
         ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1005,9 +1197,13 @@ def cmd_add(request: str, duration: str) -> None:
             "status": "active",
             "update_policy": _infer_update_policy(request_clean, duration_mode),
         }
+        if inherited_openclaw_binding is not None:
+            state["runtime_bindings"] = {"openclaw": inherited_openclaw_binding}
 
         try:
             _save(state)
+            if inherited_openclaw_binding is not None:
+                _clear_openclaw_route_cache()
             _write_initial_report(state)
             _write_initial_log(state)
             _append_log(
@@ -1015,11 +1211,16 @@ def cmd_add(request: str, duration: str) -> None:
                 "Session registered",
                 details=[
                     f"Duration mode: {duration_mode}",
-                    f"Deadline: {_fmt_dt(deadline) if deadline else 'dynamic'}",
-                    f"Sandbox: {sandbox}",
-                    f"User updates: {state.get('update_policy', 'milestones')}",
-                ],
-            )
+                f"Deadline: {_fmt_dt(deadline) if deadline else 'dynamic'}",
+                f"Sandbox: {sandbox}",
+                f"User updates: {state.get('update_policy', 'milestones')}",
+                (
+                    "OpenClaw recovery route: cached route bound to active session."
+                    if inherited_openclaw_binding is not None
+                    else "OpenClaw recovery route: not bound."
+                ),
+            ],
+        )
         except Exception as exc:
             _clear_state()
             shutil.rmtree(sandbox, ignore_errors=True)
@@ -1044,6 +1245,121 @@ def cmd_add(request: str, duration: str) -> None:
 
 def cmd_dummy() -> None:
     cmd_add("Dummy autonomous session", "60")
+
+
+def cmd_revise_session(
+    *, request: str | None, duration: str | None, response_note: str
+) -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+        if request is None and duration is None and not response_note.strip():
+            sys.exit(
+                "error: --revise-session requires -R/--request, -D/--duration, or --response-note."
+            )
+
+        now = _now()
+        previous_request = str(state.get("request", "")).strip()
+        previous_duration = str(state.get("duration_input", "dynamic")).strip()
+        previous_deadline = _parse_iso_datetime(state.get("deadline"))
+
+        request_clean = previous_request
+        request_changed = False
+        if request is not None:
+            request_clean = request.strip()
+            if not request_clean:
+                sys.exit("error: request cannot be empty")
+            request_changed = request_clean != previous_request
+            state["request"] = request_clean
+
+        duration_changed = False
+        deadline = _parse_iso_datetime(state.get("deadline"))
+        if duration is not None:
+            duration_input, duration_mode, duration_minutes = _parse_duration_config(
+                duration
+            )
+            deadline = (
+                now + timedelta(minutes=duration_minutes)
+                if duration_minutes is not None
+                else None
+            )
+            duration_changed = duration_input != previous_duration
+            state["duration_input"] = duration_input
+            state["duration_mode"] = duration_mode
+            state["duration_minutes"] = duration_minutes
+            state["deadline"] = deadline.isoformat() if deadline else None
+        else:
+            duration_input = str(state.get("duration_input", previous_duration))
+
+        update_policy = _infer_update_policy(
+            request_clean, str(state.get("duration_mode", "dynamic"))
+        )
+        state["update_policy"] = update_policy
+
+        had_wait_window = _await_user_deadline(state) is not None
+        if had_wait_window:
+            _clear_await_user_fields(state)
+
+        cancel_state = _cancel_request_state(state)
+        cleared_cancel_state = cancel_state in {"pending", "denied"}
+        if cleared_cancel_state:
+            _clear_cancel_request_fields(state)
+
+        _save(state)
+
+        details = []
+        if request_changed:
+            details.append(
+                f"Request: {_display_sensitive_text(previous_request, label='request')} -> "
+                f"{_display_sensitive_text(request_clean, label='request')}"
+            )
+        if duration_changed:
+            previous_deadline_text = (
+                _fmt_dt(previous_deadline) if previous_deadline else "dynamic"
+            )
+            next_deadline_text = _fmt_dt(deadline) if deadline else "dynamic"
+            details.extend(
+                [
+                    f"Duration: {previous_duration or 'dynamic'} -> {duration_input or 'dynamic'}",
+                    f"Deadline: {previous_deadline_text} -> {next_deadline_text}",
+                ]
+            )
+        if not request_changed and not duration_changed:
+            details.append("Request and duration unchanged.")
+        if had_wait_window:
+            details.append("Await-user window cleared.")
+        if cleared_cancel_state:
+            details.append("Pending cancellation state cleared due to direct user instruction.")
+        note = response_note.strip()
+        if note:
+            details.append(
+                f"Response note: {_display_sensitive_text(note, label='response')}"
+            )
+        details.append(f"User updates: {update_policy}")
+
+        _append_log(state, "Session revised", details=details)
+        _append_report_checkpoint(state, "session-revised", now)
+
+        _header(f"{c(GREEN, 'OK')} Session revised")
+        _row("Request", request_clean)
+        _row("Now", _fmt_dt(now))
+        _row(
+            "Deadline",
+            _fmt_dt(deadline) if deadline else c(YELLOW, "dynamic (no fixed deadline)"),
+        )
+        _row(
+            "Time remaining",
+            _fmt_remaining((deadline - now).total_seconds()) if deadline else "dynamic",
+        )
+        _row("Sandbox", str(state.get("sandbox_dir", "")))
+        print(SEP)
 
 
 def cmd_await_user(question: str, wait_minutes: str) -> None:
@@ -1144,7 +1460,8 @@ def cmd_user_responded(response_note: str) -> None:
             hook="user-responded",
             active=True,
             waiting_for_user=False,
-            user_response_registered=False,
+            user_response_registered=True,
+            late_user_response=True,
             response_note=_display_sensitive_text(note, label="response"),
         )
 
@@ -1181,6 +1498,59 @@ def cmd_log_event(event: str, note: str) -> None:
             details.append(f"Note: {note_text}")
         _append_log(state, "Hook telemetry", details=details)
         _append_report_checkpoint(state, f"hook:{event_name}", now)
+
+
+def cmd_record_openclaw_route(
+    *,
+    agent_id: str,
+    session_key: str,
+    session_id: str,
+    channel: str,
+    reply_to: str,
+    reply_from: str,
+    account_id: str,
+) -> None:
+    binding = _coerce_openclaw_binding(
+        {
+            "agent_id": agent_id,
+            "session_key": session_key,
+            "session_id": session_id,
+            "channel": channel,
+            "to": reply_to,
+            "from": reply_from,
+            "account_id": account_id,
+            "updated_at": _now().isoformat(),
+        }
+    )
+    if binding is None:
+        return
+
+    try:
+        _save_openclaw_route_cache(binding)
+    except OSError:
+        pass
+
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error or not state:
+            return
+        if _set_openclaw_binding(state, binding):
+            _save(state)
+            _append_log(
+                state,
+                "OpenClaw recovery route updated",
+                details=[
+                    "Session key: "
+                    + _display_sensitive_text(
+                        binding.get("session_key", ""), label="openclaw-session"
+                    ),
+                    "Session id: "
+                    + _display_sensitive_text(
+                        binding.get("session_id", ""), label="openclaw-session-id"
+                    ),
+                    f"Channel: {binding.get('channel', '(unknown)')}",
+                ],
+            )
 
 
 def cmd_require_active() -> None:
@@ -1253,6 +1623,7 @@ def _status_json_payload(
     report_status_effective = report_status
     if closure_pending and report_status_effective not in {"COMPLETE", "PARTIAL"}:
         report_status_effective = "PARTIAL"
+    openclaw_binding = _read_openclaw_binding(state)
 
     lifecycle_state = "active"
     if closure_pending:
@@ -1306,6 +1677,9 @@ def _status_json_payload(
             "required_log_checkpoints": _required_log_checkpoints(
                 snapshot["elapsed_seconds"]
             ),
+            "runtime_bindings": {"openclaw": openclaw_binding}
+            if openclaw_binding is not None
+            else None,
         }
     )
     return payload
@@ -1457,6 +1831,7 @@ def _cancel_active_session(
         archived = _archive_sandbox(state, now)
     except RuntimeError as exc:
         archive_error = str(exc)
+    _clear_openclaw_route_cache()
     _clear_state()
     return archived, archive_error
 
@@ -1467,6 +1842,7 @@ def cmd_cancel() -> None:
         if state_error:
             quarantined = _quarantine_state_file(state_error)
             if quarantined is not None:
+                _clear_openclaw_route_cache()
                 _header(f"{c(YELLOW, 'Session cancelled')}")
                 _row("Cancelled at", _fmt_dt(_now()))
                 _row("Reason", "State file was corrupted and quarantined")
@@ -1740,12 +2116,14 @@ def cmd_hook_stop() -> None:
                     remaining_text = _fmt_remaining(wait_remaining)
                     template_context = _hook_template_context(state, snapshot, now)
                     template_text = render_template("stop-blocked", template_context)
+                    pause_seconds = max(1, math.ceil(wait_remaining))
                     _append_log(
                         state,
                         "Stop attempt blocked by user response window",
                         details=[
                             f"Response deadline: {_fmt_dt(await_deadline)}",
                             f"Remaining: {remaining_text}",
+                            f"Recheck in: {pause_seconds}s",
                             "Question: "
                             + _display_sensitive_text(
                                 str(state.get("await_user_question", "")),
@@ -1763,6 +2141,7 @@ def cmd_hook_stop() -> None:
                         active=True,
                         block=True,
                         waiting_for_user=True,
+                        pause_then_resume_seconds=pause_seconds,
                         retry_immediately=False,
                         response_deadline=_fmt_dt(await_deadline),
                         template_id="stop-blocked",
@@ -1809,7 +2188,7 @@ def cmd_hook_stop() -> None:
                 if pause_until is not None and now < pause_until:
                     pause_remaining = (pause_until - now).total_seconds()
                     remaining_text = _fmt_remaining(pause_remaining)
-                    pause_seconds = _cancel_pause_seconds()
+                    pause_seconds = max(1, math.ceil(pause_remaining))
                     _append_log(
                         state,
                         "Stop attempt blocked by pending cancellation request",
@@ -1976,6 +2355,7 @@ def cmd_hook_stop() -> None:
                 )
                 sys.exit(_blocked_stop_exit_code(retry_immediately=True))
 
+            _clear_openclaw_route_cache()
             _clear_state()
 
             _emit_hook_payload(

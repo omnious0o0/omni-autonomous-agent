@@ -1,0 +1,10 @@
+{
+  "id": "omni-autonomous-agent",
+  "name": "Omni Autonomous Agent",
+  "description": "Enforces OAA stop-gate continuation inside the OpenClaw agent lifecycle.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

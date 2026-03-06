@@ -3,10 +3,13 @@ from __future__ import annotations
 import itertools
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -90,6 +93,11 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
     def _read_state(self) -> dict[str, object]:
         return json.loads(self._state_file().read_text(encoding="utf-8"))
 
+    def _read_log(self) -> str:
+        state = self._read_state()
+        sandbox_dir = Path(str(state["sandbox_dir"]))
+        return (sandbox_dir / "LOG.md").read_text(encoding="utf-8")
+
     def _write_fake_binary(self, name: str) -> None:
         binary = self.bin_dir / name
         binary.write_text(
@@ -132,6 +140,379 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             encoding="utf-8",
         )
         binary.chmod(0o755)
+
+    def _run_openclaw_handler(
+        self,
+        *,
+        status_payload: dict[str, object],
+        event: dict[str, object],
+        extra_events: list[dict[str, object]] | None = None,
+        session_record: dict[str, object] | None = None,
+        session_store: dict[str, object] | None = None,
+        session_key: str = "agent:main:main",
+        require_active_code: int = 0,
+        write_session_file: bool = True,
+        precreated_lock_dirs: list[str] | None = None,
+        sync_launch: bool = True,
+        cli_store_payloads: list[dict[str, object]] | None = None,
+        cli_sessions_override: list[dict[str, object]] | None = None,
+        fake_openclaw_script: str | None = None,
+    ) -> tuple[str, str]:
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            self.skipTest("node is required for OpenClaw handler execution tests")
+
+        node_help = subprocess.run(
+            [node_bin, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "--experimental-transform-types" not in node_help.stdout:
+            self.skipTest(
+                "node --experimental-transform-types is required for OpenClaw handler execution tests"
+            )
+
+        bootstrap = _load_internal_modules("bootstrap")["bootstrap"]
+        handler_source = bootstrap._openclaw_handler_ts()
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            root = Path(work_dir)
+            home_dir = root / "home"
+            bin_dir = root / "bin"
+            sessions_dir = home_dir / ".openclaw" / "agents" / "main" / "sessions"
+            config_dir = home_dir / ".config" / "omni-autonomous-agent"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+
+            if session_record is None:
+                session_record = {
+                    "sessionId": "session-123",
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                }
+            sessions_payload = (
+                session_store if session_store is not None else {session_key: session_record}
+            )
+
+            if write_session_file:
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                (sessions_dir / "sessions.json").write_text(
+                    json.dumps(sessions_payload, indent=2),
+                    encoding="utf-8",
+                )
+
+            cli_store_entries: list[dict[str, object]] = []
+            for store_spec in cli_store_payloads or []:
+                relative_path = str(store_spec.get("relative_path", "")).strip()
+                store_sessions = store_spec.get("sessions")
+                if not relative_path or not isinstance(store_sessions, dict):
+                    continue
+                store_path = root / relative_path
+                store_path.parent.mkdir(parents=True, exist_ok=True)
+                store_path.write_text(
+                    json.dumps(store_sessions, indent=2), encoding="utf-8"
+                )
+                cli_store_entries.append(
+                    {
+                        "agentId": str(store_spec.get("agentId", "main")),
+                        "path": str(store_path),
+                    }
+                )
+
+            for lock_dir in precreated_lock_dirs or []:
+                (config_dir / lock_dir).mkdir(parents=True, exist_ok=True)
+
+            handler_path = root / "handler.ts"
+            handler_path.write_text(handler_source, encoding="utf-8")
+
+            oaa_log = root / "oaa.log"
+            openclaw_log = root / "openclaw.log"
+
+            fake_oaa = bin_dir / "omni-autonomous-agent"
+            fake_oaa.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'cmd="${1:-}"\n'
+                'if [[ "${cmd}" == "--status" ]]; then\n'
+                '  printf "%s\\n" "${TEST_HOOK_STATUS_JSON}"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [[ "${cmd}" == "--require-active" ]]; then\n'
+                '  exit "${TEST_HOOK_REQUIRE_ACTIVE_CODE:-0}"\n'
+                "fi\n"
+                'printf "%s\\n" "$*" >> "${TEST_HOOK_OAA_LOG}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_oaa.chmod(0o755)
+
+            fake_openclaw = bin_dir / "openclaw"
+            sessions_cli_payload = ""
+            if cli_sessions_override is not None:
+                cli_sessions = list(cli_sessions_override)
+            elif session_store is not None or write_session_file:
+                cli_sessions = []
+                for key, entry in sessions_payload.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    session_id = str(entry.get("sessionId", "")).strip()
+                    if not session_id:
+                        continue
+                    updated_at = entry.get("updatedAt")
+                    cli_sessions.append(
+                        {
+                            "key": key,
+                            "sessionId": session_id,
+                            "updatedAt": (
+                                updated_at
+                                if isinstance(updated_at, (int, float))
+                                else 0
+                            ),
+                            "agentId": "main",
+                        }
+                    )
+            else:
+                cli_sessions = []
+            if cli_sessions or cli_store_entries:
+                sessions_cli_payload = json.dumps(
+                    {"stores": cli_store_entries, "sessions": cli_sessions}
+                )
+            fake_openclaw.write_text(
+                fake_openclaw_script
+                if fake_openclaw_script is not None
+                else (
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    'if [[ "${1:-}" == "sessions" ]]; then\n'
+                    '  if [[ -n "${TEST_HOOK_OPENCLAW_SESSIONS_JSON:-}" ]]; then\n'
+                    '    printf "%s\\n" "${TEST_HOOK_OPENCLAW_SESSIONS_JSON}"\n'
+                    "    exit 0\n"
+                    "  fi\n"
+                    "  exit 1\n"
+                    "fi\n"
+                    'printf "%s\\n" "$*" >> "${TEST_HOOK_OPENCLAW_LOG}"\n'
+                    "exit 0\n"
+                ),
+                encoding="utf-8",
+            )
+            fake_openclaw.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home_dir),
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "OMNI_AGENT_OAA_BIN": str(fake_oaa),
+                    "OMNI_AGENT_OPENCLAW_BIN": str(fake_openclaw),
+                    "TEST_HOOK_STATUS_JSON": json.dumps(status_payload),
+                    "TEST_HOOK_REQUIRE_ACTIVE_CODE": str(require_active_code),
+                    "TEST_HOOK_OAA_LOG": str(oaa_log),
+                    "TEST_HOOK_OPENCLAW_LOG": str(openclaw_log),
+                    "TEST_HOOK_OPENCLAW_SESSIONS_JSON": sessions_cli_payload,
+                }
+            )
+            if sync_launch:
+                env["OMNI_AGENT_OPENCLAW_SYNC_LAUNCH"] = "1"
+
+            for current_event in [event, *(extra_events or [])]:
+                result = subprocess.run(
+                    [
+                        node_bin,
+                        "--experimental-transform-types",
+                        "--input-type=module",
+                        "-e",
+                        (
+                            "import { pathToFileURL } from 'url';"
+                            "const mod = await import(pathToFileURL(process.argv[1]).href);"
+                            "await mod.default(JSON.parse(process.argv[2]));"
+                        ),
+                        str(handler_path),
+                        json.dumps(current_event),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise AssertionError(
+                        "OpenClaw handler execution failed:\n"
+                        f"stdout={result.stdout}\n"
+                        f"stderr={result.stderr}"
+                    )
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if oaa_log.exists() or openclaw_log.exists():
+                    break
+                time.sleep(0.05)
+
+            oaa_text = oaa_log.read_text(encoding="utf-8") if oaa_log.exists() else ""
+            openclaw_text = (
+                openclaw_log.read_text(encoding="utf-8")
+                if openclaw_log.exists()
+                else ""
+            )
+            return oaa_text, openclaw_text
+
+    def _run_openclaw_plugin_agent_end(
+        self,
+        *,
+        hook_stop_code: int,
+        hook_stop_payload: dict[str, object],
+        ctx: dict[str, object] | None = None,
+        wait_ms: int = 0,
+    ) -> tuple[str, list[dict[str, object]], list[dict[str, object]], str]:
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            self.skipTest("node is required for OpenClaw plugin execution tests")
+
+        node_help = subprocess.run(
+            [node_bin, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "--experimental-transform-types" not in node_help.stdout:
+            self.skipTest(
+                "node --experimental-transform-types is required for OpenClaw plugin execution tests"
+            )
+
+        plugin_path = (
+            PROJECT_ROOT / ".omni-autonomous-agent" / "openclaw-plugin" / "index.ts"
+        )
+        self.assertTrue(plugin_path.exists())
+
+        if ctx is None:
+            ctx = {
+                "agentId": "main",
+                "sessionId": "plugin-session-123",
+                "sessionKey": "agent:main:main",
+            }
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            root = Path(work_dir)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+
+            oaa_log = root / "oaa.log"
+            system_log = root / "system.log"
+            heartbeat_log = root / "heartbeat.log"
+            plugin_log = root / "plugin.log"
+
+            fake_oaa = bin_dir / "omni-autonomous-agent"
+            fake_oaa.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'cmd="${1:-}"\n'
+                'if [[ "${cmd}" == "--hook-stop" ]]; then\n'
+                '  printf "HOOK_STOP\\n" >> "${TEST_PLUGIN_OAA_LOG}"\n'
+                '  printf "%s\\n" "${TEST_PLUGIN_STOP_OUTPUT}"\n'
+                '  exit "${TEST_PLUGIN_STOP_CODE:-0}"\n'
+                "fi\n"
+                'printf "%s\\n" "$*" >> "${TEST_PLUGIN_OAA_LOG}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_oaa.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "OMNI_AGENT_OAA_BIN": str(fake_oaa),
+                    "TEST_PLUGIN_OAA_LOG": str(oaa_log),
+                    "TEST_PLUGIN_STOP_OUTPUT": json.dumps(hook_stop_payload),
+                    "TEST_PLUGIN_STOP_CODE": str(hook_stop_code),
+                    "TEST_PLUGIN_SYSTEM_LOG": str(system_log),
+                    "TEST_PLUGIN_HEARTBEAT_LOG": str(heartbeat_log),
+                    "TEST_PLUGIN_LOG": str(plugin_log),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    node_bin,
+                    "--experimental-transform-types",
+                    "--input-type=module",
+                    "-e",
+                    (
+                        "import { appendFileSync } from 'fs';"
+                        "import { pathToFileURL } from 'url';"
+                        "const pluginPath = process.argv[1];"
+                        "const ctx = JSON.parse(process.argv[2]);"
+                        "const waitMs = Number(process.argv[3]);"
+                        "const handlers = new Map();"
+                        "const log = (level, message) => appendFileSync(process.env.TEST_PLUGIN_LOG, `${level}:${message}\\n`);"
+                        "const api = {"
+                        "  logger: {"
+                        "    info: (message) => log('info', message),"
+                        "    warn: (message) => log('warn', message),"
+                        "    error: (message) => log('error', message),"
+                        "  },"
+                        "  runtime: {"
+                        "    system: {"
+                        "      enqueueSystemEvent: (text, opts) => {"
+                        "        appendFileSync(process.env.TEST_PLUGIN_SYSTEM_LOG, `${JSON.stringify({ text, opts })}\\n`);"
+                        "        return true;"
+                        "      },"
+                        "      requestHeartbeatNow: (opts) => {"
+                        "        appendFileSync(process.env.TEST_PLUGIN_HEARTBEAT_LOG, `${JSON.stringify(opts)}\\n`);"
+                        "      },"
+                        "    },"
+                        "  },"
+                        "  on: (name, handler) => handlers.set(name, handler),"
+                        "};"
+                        "const mod = await import(pathToFileURL(pluginPath).href);"
+                        "mod.default(api);"
+                        "const beforeAgentStart = handlers.get('before_agent_start');"
+                        "if (beforeAgentStart) {"
+                        "  await beforeAgentStart({ prompt: 'Continue autonomous work.' }, ctx);"
+                        "}"
+                        "const agentEnd = handlers.get('agent_end');"
+                        "if (!agentEnd) throw new Error('agent_end hook not registered');"
+                        "await agentEnd({ success: true, messages: [] }, ctx);"
+                        "if (waitMs > 0) {"
+                        "  await new Promise((resolve) => setTimeout(resolve, waitMs));"
+                        "}"
+                    ),
+                    str(plugin_path),
+                    json.dumps(ctx),
+                    str(wait_ms),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise AssertionError(
+                    "OpenClaw plugin execution failed:\n"
+                    f"stdout={result.stdout}\n"
+                    f"stderr={result.stderr}"
+                )
+
+            oaa_text = oaa_log.read_text(encoding="utf-8") if oaa_log.exists() else ""
+            system_events = [
+                json.loads(line)
+                for line in system_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ] if system_log.exists() else []
+            heartbeat_events = [
+                json.loads(line)
+                for line in heartbeat_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ] if heartbeat_log.exists() else []
+            plugin_text = (
+                plugin_log.read_text(encoding="utf-8") if plugin_log.exists() else ""
+            )
+            return oaa_text, system_events, heartbeat_events, plugin_text
 
     def test_fixed_session_lifecycle(self) -> None:
         status = _run_cli(["--status"], self.env)
@@ -255,6 +636,28 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(bool(post_pause_payload.get("cancel_request_pending")))
         self.assertTrue(bool(post_pause_payload.get("cancel_pause_elapsed")))
         self.assertTrue(bool(post_pause_payload.get("waiting_for_cancel_decision")))
+
+    def test_cancel_pause_window_shrinks_to_actual_remaining_time(self) -> None:
+        added = _run_cli(["--add", "-R", "cancel remaining pause"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+
+        state = self._read_state()
+        now = datetime.now().astimezone()
+        state["cancel_requested_at"] = (now - timedelta(seconds=25)).isoformat()
+        state["cancel_pause_until"] = (now + timedelta(seconds=5)).isoformat()
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        wrapper_env = self.env.copy()
+        wrapper_env["OMNI_AGENT_HOOK_WRAPPER"] = "1"
+        stop_in_pause = _run_cli(["--hook-stop"], wrapper_env)
+        self.assertEqual(stop_in_pause.returncode, 5)
+        pause_payload = _json_output(stop_in_pause)
+        pause_seconds = int(pause_payload.get("pause_then_resume_seconds") or 0)
+        self.assertGreaterEqual(pause_seconds, 1)
+        self.assertLess(pause_seconds, 30)
 
     def test_cancel_deny_blocks_until_normal_stop_conditions_met(self) -> None:
         added = _run_cli(["--add", "-R", "cancel denied"], self.env)
@@ -425,6 +828,24 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIsInstance(started, str)
         self.assertIsInstance(deadline, str)
 
+    def test_wait_window_stop_payload_schedules_resume_for_openclaw(self) -> None:
+        added = _run_cli(["--add", "-R", "await-user-resume-schedule"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        stop = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop.returncode, 2)
+        stop_payload = _json_output(stop)
+        self.assertTrue(bool(stop_payload.get("waiting_for_user")))
+        pause_seconds = int(stop_payload.get("pause_then_resume_seconds") or 0)
+        self.assertGreaterEqual(pause_seconds, 1)
+        self.assertLessEqual(pause_seconds, 120)
+
     def test_user_responded_clears_wait_window(self) -> None:
         added = _run_cli(["--add", "-R", "await-user-resume"], self.env)
         self.assertEqual(added.returncode, 0)
@@ -455,6 +876,139 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertNotIn("await_user_started_at", state_after)
         self.assertNotIn("await_user_deadline", state_after)
         self.assertNotIn("await_user_question", state_after)
+
+    def test_user_responded_without_wait_window_is_still_recorded(self) -> None:
+        added = _run_cli(["--add", "-R", "late response"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        responded = _run_cli(
+            [
+                "--user-responded",
+                "--response-note",
+                "User came back after the timer expired",
+            ],
+            self.env,
+        )
+        self.assertEqual(responded.returncode, 0)
+        responded_payload = _json_output(responded)
+        self.assertTrue(bool(responded_payload.get("user_response_registered")))
+        self.assertTrue(bool(responded_payload.get("late_user_response")))
+        self.assertFalse(bool(responded_payload.get("waiting_for_user")))
+
+    def test_revise_session_updates_request_deadline_and_clears_wait_window(self) -> None:
+        added = _run_cli(["--add", "-R", "initial run", "-D", "10"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        sandbox_dir = str(state["sandbox_dir"])
+        started_at = str(state["started_at"])
+        previous_deadline = datetime.fromisoformat(str(state["deadline"]))
+        state["runtime_bindings"] = {
+            "openclaw": {
+                "agent_id": "main",
+                "session_key": "agent:main:telegram:direct:7026799796",
+                "session_id": "session-123",
+                "channel": "telegram",
+                "to": "telegram:7026799796",
+                "from": "telegram:7026799796",
+                "account_id": "default",
+                "updated_at": "2026-03-06T08:00:00+01:00",
+            }
+        }
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        waiting = _run_cli(
+            ["--await-user", "-Q", "Need constraints", "--wait-minutes", "2"],
+            self.env,
+        )
+        self.assertEqual(waiting.returncode, 0)
+
+        revised = _run_cli(
+            [
+                "--revise-session",
+                "-R",
+                "Work until 10:00 with no updates unless safety-critical",
+                "-D",
+                "90",
+                "--response-note",
+                "User is away; continue and only send the final report.",
+            ],
+            self.env,
+        )
+        self.assertEqual(revised.returncode, 0)
+        self.assertIn("Session revised", revised.stdout)
+
+        state_after = self._read_state()
+        self.assertEqual(
+            state_after["request"],
+            "Work until 10:00 with no updates unless safety-critical",
+        )
+        self.assertEqual(state_after["duration_input"], "90")
+        self.assertEqual(state_after["duration_mode"], "fixed")
+        self.assertEqual(state_after["duration_minutes"], 90)
+        self.assertEqual(state_after["sandbox_dir"], sandbox_dir)
+        self.assertEqual(state_after["started_at"], started_at)
+        self.assertEqual(state_after["update_policy"], "final-only")
+        self.assertNotIn("await_user_started_at", state_after)
+        self.assertNotIn("await_user_deadline", state_after)
+        self.assertNotIn("await_user_question", state_after)
+
+        revised_deadline = datetime.fromisoformat(str(state_after["deadline"]))
+        self.assertGreater(revised_deadline, previous_deadline)
+
+        binding = state_after["runtime_bindings"]["openclaw"]
+        self.assertEqual(binding["session_id"], "session-123")
+        self.assertEqual(binding["to"], "telegram:7026799796")
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertFalse(bool(payload.get("waiting_for_user")))
+        self.assertEqual(payload.get("update_policy"), "final-only")
+        self.assertEqual(
+            payload.get("request"),
+            "Work until 10:00 with no updates unless safety-critical",
+        )
+
+    def test_revise_session_can_reactivate_expired_fixed_session(self) -> None:
+        added = _run_cli(["--add", "-R", "expired-fixed", "-D", "1"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        state["deadline"] = "2000-01-01T00:00:00+00:00"
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        revised = _run_cli(
+            [
+                "--revise-session",
+                "-D",
+                "60",
+                "--response-note",
+                "User extended the session.",
+            ],
+            self.env,
+        )
+        self.assertEqual(revised.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertTrue(bool(payload.get("active")))
+        self.assertEqual(payload.get("duration_input"), "60")
+
+        stop = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop.returncode, 2)
+        stop_payload = _json_output(stop)
+        self.assertTrue(bool(stop_payload.get("continue")))
+        self.assertTrue(bool(stop_payload.get("block")))
+
+    def test_revise_session_requires_actual_input(self) -> None:
+        added = _run_cli(["--add", "-R", "revise-empty"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        revised = _run_cli(["--revise-session"], self.env)
+        self.assertNotEqual(revised.returncode, 0)
+        self.assertIn("--revise-session requires", revised.stderr)
 
     def test_status_shows_wait_window_and_clears_expired_window(self) -> None:
         added = _run_cli(["--add", "-R", "await-user-status"], self.env)
@@ -626,6 +1180,15 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         openclaw_handler = (
             self.home_dir / ".openclaw" / "hooks" / "omni-recovery" / "handler.ts"
         )
+        openclaw_plugin_manifest = (
+            PROJECT_ROOT
+            / ".omni-autonomous-agent"
+            / "openclaw-plugin"
+            / "openclaw.plugin.json"
+        )
+        openclaw_plugin_entry = (
+            PROJECT_ROOT / ".omni-autonomous-agent" / "openclaw-plugin" / "index.ts"
+        )
 
         self.assertTrue(gemini_settings.exists())
         self.assertTrue(opencode_plugin.exists())
@@ -634,9 +1197,15 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(plandex_wrapper.exists())
         self.assertTrue(openclaw_hook.exists())
         self.assertTrue(openclaw_handler.exists())
+        self.assertTrue(openclaw_plugin_manifest.exists())
+        self.assertTrue(openclaw_plugin_entry.exists())
 
         openclaw_hook_text = openclaw_hook.read_text(encoding="utf-8")
         openclaw_handler_text = openclaw_handler.read_text(encoding="utf-8")
+        openclaw_plugin_manifest_text = openclaw_plugin_manifest.read_text(
+            encoding="utf-8"
+        )
+        openclaw_plugin_entry_text = openclaw_plugin_entry.read_text(encoding="utf-8")
         opencode_plugin_text = opencode_plugin.read_text(encoding="utf-8")
         universal_wrapper_text = universal_wrapper.read_text(encoding="utf-8")
         codex_wrapper_text = codex_wrapper.read_text(encoding="utf-8")
@@ -664,10 +1233,8 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("--event", openclaw_handler_text)
         self.assertIn("--note", openclaw_handler_text)
         self.assertIn("--hook-precompact", openclaw_handler_text)
-        self.assertIn(
-            "eventSessionKey.startsWith('agent:') ? eventSessionKey : ''",
-            openclaw_handler_text,
-        )
+        self.assertIn("agentIdFromSessionKey", openclaw_handler_text)
+        self.assertIn("readPersistedOpenclawBinding", openclaw_handler_text)
         self.assertIn("readInboundEventText", openclaw_handler_text)
         self.assertIn(
             "['received', 'transcribed', 'preprocessed'].includes(event.action)",
@@ -709,10 +1276,27 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         self.assertIn("Request: [redacted]", openclaw_handler_text)
         self.assertIn("startup wake queued for agent=", openclaw_handler_text)
-        self.assertIn("failed to launch startup wake ping", openclaw_handler_text)
-        self.assertIn("event.context?.from", openclaw_handler_text)
+        self.assertIn("failed to launch agent wake runner", openclaw_handler_text)
+        self.assertIn("readInboundSender", openclaw_handler_text)
+        self.assertIn("eventMatchesActiveRoute", openclaw_handler_text)
+        self.assertIn("route_mismatch_ignored", openclaw_handler_text)
         self.assertIn("['--status', '--json']", openclaw_handler_text)
         self.assertIn("STARTUP_WAKE_COOLDOWN_MS", openclaw_handler_text)
+        self.assertIn("syncAgentLaunch", openclaw_handler_text)
+        self.assertIn("sameSessionRoutes", openclaw_handler_text)
+        self.assertIn("routeDeliveryScore", openclaw_handler_text)
+        self.assertIn("routeSubagentPenalty", openclaw_handler_text)
+        self.assertIn("sessions', '--json', '--all-agents", openclaw_handler_text)
+        self.assertIn("detached: true", openclaw_handler_text)
+        self.assertIn("launchDetachedOpenclawAgent", openclaw_handler_text)
+        self.assertIn("process.kill(pid, 0)", openclaw_handler_text)
+        self.assertIn('"id": "omni-autonomous-agent"', openclaw_plugin_manifest_text)
+        self.assertIn("before_agent_start", openclaw_plugin_entry_text)
+        self.assertIn("agent_end", openclaw_plugin_entry_text)
+        self.assertIn("enqueueSystemEvent", openclaw_plugin_entry_text)
+        self.assertIn("requestHeartbeatNow", openclaw_plugin_entry_text)
+        self.assertIn("--record-openclaw-route", openclaw_plugin_entry_text)
+        self.assertIn("--hook-stop", openclaw_plugin_entry_text)
         self.assertIn('runHook(["--hook-stop"])', opencode_plugin_text)
         self.assertIn('runHook(["--hook-precompact"])', opencode_plugin_text)
         self.assertIn('if [[ "$hook_status" -eq 5 ]]', universal_wrapper_text)
@@ -1157,6 +1741,1193 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("Note: route=abc session=def", log_text)
         self.assertIn("Checkpoint (hook:openclaw-startup-wake-queued)", report_text)
 
+    def test_openclaw_startup_wake_uses_origin_route_fallback(self) -> None:
+        _, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+        )
+
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn("--deliver", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+        self.assertIn("--reply-account default", openclaw_log)
+        self.assertIn("Gateway restarted and an autonomous session is still active.", openclaw_log)
+
+    def test_openclaw_startup_wake_uses_persisted_binding_without_session_store(self) -> None:
+        _, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake from binding",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "telegram:slash:7026799796",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "from": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={"type": "gateway", "action": "startup"},
+            write_session_file=False,
+        )
+
+        self.assertIn(
+            "agent --agent main --session-id persisted-session-456", openclaw_log
+        )
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+        self.assertIn("--reply-account default", openclaw_log)
+
+    def test_openclaw_startup_wake_prefers_freshest_route_for_same_session_id(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake route rebinding",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:telegram:direct:7026799796",
+                        "session_id": "session-123",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "from": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={"type": "gateway", "action": "startup"},
+            session_store={
+                "agent:main:telegram:direct:7026799796": {
+                    "sessionId": "session-123",
+                    "updatedAt": 100,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+                "agent:main:main": {
+                    "sessionId": "session-123",
+                    "updatedAt": 200,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+            },
+        )
+
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id session-123 --openclaw-session-key agent:main:main",
+            oaa_log,
+        )
+
+    def test_openclaw_startup_wake_dedupes_duplicate_restart_events(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake duplicate",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            extra_events=[{"type": "gateway", "action": "startup"}],
+        )
+
+        self.assertEqual(
+            openclaw_log.count("agent --agent main --session-id session-123"),
+            1,
+        )
+        self.assertIn("openclaw.startup.duplicate_skip", oaa_log)
+
+    def test_openclaw_startup_wake_skips_when_require_active_rejects(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake require-active",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            require_active_code=1,
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.startup.require_active_failed", oaa_log)
+
+    def test_openclaw_startup_wake_skips_when_route_is_unresolved(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake missing route",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            write_session_file=False,
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.startup.route_unresolved", oaa_log)
+
+    def test_openclaw_startup_wake_recovers_route_from_sessions_cli_when_file_missing(
+        self,
+    ) -> None:
+        cli_sessions_payload = json.dumps(
+            {
+                "sessions": [
+                    {
+                        "key": "agent:main:main",
+                        "sessionId": "cli-session-789",
+                        "updatedAt": 250,
+                        "agentId": "main",
+                    }
+                ]
+            }
+        )
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake sessions cli",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            write_session_file=False,
+            fake_openclaw_script=(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'if [[ "${1:-}" == "sessions" ]]; then\n'
+                f"  printf '%s\\n' '{cli_sessions_payload}'\n"
+                "  exit 0\n"
+                "fi\n"
+                'printf "%s\\n" "$*" >> "${TEST_HOOK_OPENCLAW_LOG}"\n'
+                "exit 0\n"
+            ),
+        )
+
+        self.assertIn("agent --agent main --session-id cli-session-789", openclaw_log)
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id cli-session-789 --openclaw-session-key agent:main:main",
+            oaa_log,
+        )
+
+    def test_openclaw_startup_wake_recovers_delivery_route_from_cli_store_when_default_file_missing(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake cli store recovery",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            write_session_file=False,
+            cli_sessions_override=[
+                {
+                    "key": "agent:main:main",
+                    "sessionId": "cli-session-789",
+                    "updatedAt": 300,
+                    "agentId": "main",
+                },
+                {
+                    "key": "agent:main:telegram:direct:7026799796",
+                    "sessionId": "cli-session-789",
+                    "updatedAt": 200,
+                    "agentId": "main",
+                },
+            ],
+            cli_store_payloads=[
+                {
+                    "relative_path": "discovered/openclaw-sessions.json",
+                    "agentId": "main",
+                    "sessions": {
+                        "agent:main:main": {
+                            "sessionId": "cli-session-789",
+                            "updatedAt": 300,
+                            "origin": {
+                                "surface": "telegram",
+                                "from": "telegram:7026799796",
+                                "to": "telegram:7026799796",
+                                "accountId": "default",
+                            },
+                        },
+                        "agent:main:telegram:direct:7026799796": {
+                            "sessionId": "cli-session-789",
+                            "updatedAt": 200,
+                            "deliveryContext": {
+                                "channel": "telegram",
+                                "to": "telegram:7026799796",
+                                "accountId": "default",
+                            },
+                            "origin": {
+                                "surface": "telegram",
+                                "from": "telegram:7026799796",
+                                "to": "telegram:7026799796",
+                                "accountId": "default",
+                            },
+                        },
+                    },
+                }
+            ],
+        )
+
+        self.assertIn("agent --agent main --session-id cli-session-789", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+        self.assertIn("--reply-account default", openclaw_log)
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id cli-session-789",
+            oaa_log,
+        )
+
+    def test_openclaw_startup_wake_skips_when_dedupe_lock_is_unavailable(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake lock contention",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            precreated_lock_dirs=["openclaw-startup-wake.json.lock"],
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.startup.dedupe_lock_unavailable", oaa_log)
+
+    def test_openclaw_preprocessed_message_records_route_and_forwards_message(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "record inbound route",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "preprocessed",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "bodyForAgent": "Stop now and report the current status.",
+                },
+            },
+        )
+
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id session-123 --openclaw-session-key agent:main:main",
+            oaa_log,
+        )
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn("Handle it immediately, then continue autonomous execution", openclaw_log)
+        self.assertIn(
+            "User message: Stop now and report the current status.",
+            openclaw_log,
+        )
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+
+    def test_openclaw_multiphase_inbound_events_dedupe_to_one_forward(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "dedupe inbound",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "messageId": "message-123",
+                    "content": "Continue, but prioritize restart recovery.",
+                    "from": "telegram:7026799796",
+                },
+            },
+            extra_events=[
+                {
+                    "type": "message",
+                    "action": "transcribed",
+                    "sessionKey": "agent:main:main",
+                    "context": {
+                        "messageId": "message-123",
+                        "transcript": "Continue, but prioritize restart recovery.",
+                        "from": "telegram:7026799796",
+                    },
+                },
+                {
+                    "type": "message",
+                    "action": "preprocessed",
+                    "sessionKey": "agent:main:main",
+                    "context": {
+                        "messageId": "message-123",
+                        "bodyForAgent": "Continue, but prioritize restart recovery.",
+                        "from": "telegram:7026799796",
+                    },
+                },
+            ],
+        )
+
+        self.assertEqual(
+            openclaw_log.count("agent --agent main --session-id session-123"),
+            1,
+        )
+        self.assertIn("openclaw.message.forward_duplicate", oaa_log)
+
+    def test_openclaw_received_message_registers_wait_response_and_forwards_message(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": True,
+                "request": "await reply",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "Stop now and report the current status.",
+                },
+            },
+        )
+
+        self.assertIn(
+            "--user-responded --response-note Stop now and report the current status.",
+            oaa_log,
+        )
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn(
+            "User message: Stop now and report the current status.",
+            openclaw_log,
+        )
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+
+    def test_openclaw_received_message_registers_late_user_reply_and_forwards_message(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "late reply",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "I am back, use the stricter constraints now.",
+                    "from": "telegram:7026799796",
+                },
+            },
+        )
+
+        self.assertIn(
+            "--user-responded --response-note I am back, use the stricter constraints now.",
+            oaa_log,
+        )
+        self.assertIn("openclaw.message.user_responded", oaa_log)
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+
+    def test_openclaw_startup_wake_merges_delivery_metadata_from_same_session_routes(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake merged route",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            session_store={
+                "agent:main:telegram:direct:7026799796": {
+                    "sessionId": "session-123",
+                    "updatedAt": 100,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+                "agent:main:main": {
+                    "sessionId": "session-123",
+                    "updatedAt": 200,
+                },
+            },
+        )
+
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+        self.assertIn("--reply-account default", openclaw_log)
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id session-123 --openclaw-session-key agent:main:main --openclaw-reply-channel telegram --openclaw-reply-to telegram:7026799796 --openclaw-reply-from telegram:7026799796 --openclaw-reply-account default",
+            oaa_log,
+        )
+
+    def test_openclaw_startup_wake_avoids_promoting_same_session_subagent_alias(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake subagent alias",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:telegram:direct:7026799796",
+                        "session_id": "session-123",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "from": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={"type": "gateway", "action": "startup"},
+            session_store={
+                "agent:main:telegram:direct:7026799796": {
+                    "sessionId": "session-123",
+                    "updatedAt": 100,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+                "agent:main:main": {
+                    "sessionId": "session-123",
+                    "updatedAt": 200,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+                "agent:main:subagent:worker-123": {
+                    "sessionId": "session-123",
+                    "updatedAt": 300,
+                    "origin": {
+                        "surface": "telegram",
+                        "from": "telegram:7026799796",
+                        "to": "telegram:7026799796",
+                        "accountId": "default",
+                    },
+                },
+            },
+        )
+
+        self.assertIn("agent --agent main --session-id session-123", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id session-123 --openclaw-session-key agent:main:main",
+            oaa_log,
+        )
+        self.assertNotIn("agent:main:subagent:worker-123", oaa_log)
+
+    def test_openclaw_cancel_accept_uses_persisted_binding_authorization(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "cancel approval",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "cancel_request_state": "pending",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:telegram:direct:7026799796",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "from": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "...",
+                    "from": "telegram:7026799796",
+                    "accountId": "default",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertIn(
+            "--cancel-accept --decision-note ...",
+            oaa_log,
+        )
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_cancel_accept_ignores_service_sender(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "cancel approval bot sender",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "cancel_request_state": "pending",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "from": "telegram-bot",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "...",
+                    "from": "telegram-bot",
+                    "accountId": "default",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertNotIn("--cancel-accept", oaa_log)
+        self.assertIn("openclaw.message.non_user_ignored", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_cancel_accept_fails_closed_without_route_authorization_metadata(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "cancel approval fail closed",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "cancel_request_state": "pending",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "...",
+                    "from": "random-user",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertNotIn("--cancel-accept", oaa_log)
+        self.assertIn("openclaw.message.cancel_decision_unauthorized", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_cancel_accept_rejects_account_only_route_metadata(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "cancel approval account only",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "cancel_request_state": "pending",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "...",
+                    "from": "telegram:7026799796",
+                    "accountId": "default",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertNotIn("--cancel-accept", oaa_log)
+        self.assertIn("openclaw.message.cancel_decision_unauthorized", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_message_recovers_delivery_metadata_from_event_context(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "recover delivery metadata",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "Resume and prioritize message recovery.",
+                    "from": "telegram:7026799796",
+                    "to": "telegram-bot",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id persisted-session-456 --openclaw-session-key agent:main:main --openclaw-reply-channel telegram --openclaw-reply-to telegram:7026799796 --openclaw-reply-from telegram-bot --openclaw-reply-account default",
+            oaa_log,
+        )
+        self.assertIn("agent --agent main --session-id persisted-session-456", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+        self.assertIn("--reply-account default", openclaw_log)
+
+    def test_openclaw_message_without_session_key_requires_bound_sender_match(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "ignore unrelated chat",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "Unrelated chat should not hijack the active route.",
+                    "from": "telegram:someone-else",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertNotIn("--record-openclaw-route", oaa_log)
+        self.assertNotIn("--user-responded", oaa_log)
+        self.assertIn("openclaw.message.route_mismatch_ignored", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_message_without_session_key_uses_matching_bound_sender(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "match bound sender",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "I am back, continue with the new constraint set.",
+                    "from": "telegram:7026799796",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertIn(
+            "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id persisted-session-456 --openclaw-session-key agent:main:main --openclaw-reply-channel telegram --openclaw-reply-to telegram:7026799796 --openclaw-reply-account default",
+            oaa_log,
+        )
+        self.assertIn("--user-responded --response-note I am back, continue with the new constraint set.", oaa_log)
+        self.assertIn("agent --agent main --session-id persisted-session-456", openclaw_log)
+        self.assertIn("--reply-channel telegram", openclaw_log)
+        self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+
+    def test_openclaw_message_foreign_session_key_is_ignored_without_store_match(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "ignore foreign session key",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "persisted-session-456",
+                        "channel": "telegram",
+                        "to": "telegram:7026799796",
+                        "account_id": "default",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:telegram:direct:someone-else",
+                "context": {
+                    "content": "Do not forward this unrelated session.",
+                    "from": "telegram:someone-else",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            write_session_file=False,
+        )
+
+        self.assertNotIn("--record-openclaw-route", oaa_log)
+        self.assertNotIn("--user-responded", oaa_log)
+        self.assertIn("openclaw.message.route_mismatch_ignored", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_non_user_message_event_is_ignored(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "ignore assistant traffic",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "Assistant emitted a summary.",
+                    "from": "assistant",
+                },
+            },
+        )
+
+        self.assertIn("openclaw.message.non_user_ignored", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_plugin_agent_end_requeues_retry_immediately(self) -> None:
+        oaa_log, system_events, heartbeat_events, plugin_log = (
+            self._run_openclaw_plugin_agent_end(
+                hook_stop_code=2,
+                hook_stop_payload={
+                    "continue": True,
+                    "block": True,
+                    "retry_immediately": True,
+                    "template_id": "stop-blocked",
+                    "template": "Keep working until stop is actually allowed.",
+                },
+            )
+        )
+
+        self.assertIn("HOOK_STOP", oaa_log)
+        self.assertIn("--record-openclaw-route", oaa_log)
+        self.assertEqual(len(system_events), 1)
+        self.assertEqual(
+            system_events[0]["text"],
+            "Keep working until stop is actually allowed.",
+        )
+        self.assertIn("oaa:stop-blocked", str(system_events[0]["opts"]["contextKey"]))
+        self.assertEqual(len(heartbeat_events), 1)
+        self.assertEqual(heartbeat_events[0]["sessionKey"], "agent:main:main")
+        self.assertEqual(heartbeat_events[0]["agentId"], "main")
+        self.assertEqual(heartbeat_events[0]["reason"], "oaa:stop-blocked")
+        self.assertNotIn("warn:", plugin_log)
+
+    def test_openclaw_startup_wake_reports_detached_launch_failure(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake detached failure",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            sync_launch=False,
+            fake_openclaw_script=(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "exit 1\n"
+            ),
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.startup.spawn_failed", oaa_log)
+
+    def test_openclaw_plugin_agent_end_respects_wait_window_block(self) -> None:
+        oaa_log, system_events, heartbeat_events, plugin_log = (
+            self._run_openclaw_plugin_agent_end(
+                hook_stop_code=4,
+                hook_stop_payload={
+                    "continue": True,
+                    "block": True,
+                    "retry_immediately": False,
+                    "waiting_for_user": True,
+                    "template_id": "stop-blocked",
+                    "template": "Wait for the user window to close.",
+                },
+            )
+        )
+
+        self.assertIn("HOOK_STOP", oaa_log)
+        self.assertIn("--record-openclaw-route", oaa_log)
+        self.assertEqual(system_events, [])
+        self.assertEqual(heartbeat_events, [])
+        self.assertIn(
+            "stop-gate blocked without immediate resume",
+            plugin_log,
+        )
+
+    def test_openclaw_plugin_agent_end_schedules_pause_then_resume(self) -> None:
+        _, system_events, heartbeat_events, plugin_log = (
+            self._run_openclaw_plugin_agent_end(
+                hook_stop_code=5,
+                hook_stop_payload={
+                    "continue": True,
+                    "block": True,
+                    "pause_then_resume_seconds": 1,
+                    "template_id": "stop-blocked",
+                    "template": "Pause, then resume autonomous execution.",
+                },
+                wait_ms=1100,
+            )
+        )
+
+        self.assertEqual(len(system_events), 1)
+        self.assertEqual(
+            system_events[0]["text"],
+            "Pause, then resume autonomous execution.",
+        )
+        self.assertEqual(len(heartbeat_events), 1)
+        self.assertIn("scheduled resume", plugin_log)
+
+    def test_record_openclaw_route_updates_state_and_status_json(self) -> None:
+        added = _run_cli(["--add", "-R", "record route", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        recorded = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-123",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(recorded.returncode, 0)
+
+        state = self._read_state()
+        binding = state["runtime_bindings"]["openclaw"]
+        self.assertEqual(binding["agent_id"], "main")
+        self.assertEqual(
+            binding["session_key"], "agent:main:telegram:direct:7026799796"
+        )
+        self.assertEqual(binding["session_id"], "session-123")
+        self.assertEqual(binding["channel"], "telegram")
+        self.assertEqual(binding["to"], "telegram:7026799796")
+        self.assertEqual(binding["from"], "telegram:7026799796")
+        self.assertEqual(binding["account_id"], "default")
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        runtime_bindings = payload.get("runtime_bindings") or {}
+        status_binding = runtime_bindings.get("openclaw") or {}
+        self.assertEqual(status_binding.get("session_id"), "session-123")
+        self.assertEqual(
+            status_binding.get("session_key"),
+            "agent:main:telegram:direct:7026799796",
+        )
+
+        log_text = self._read_log()
+        self.assertIn("OpenClaw recovery route updated", log_text)
+        self.assertIn("[openclaw-session-id:", log_text)
+
+    def test_record_openclaw_route_merges_partial_updates_without_losing_delivery_metadata(
+        self,
+    ) -> None:
+        added = _run_cli(["--add", "-R", "merge route", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        initial = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-123",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(initial.returncode, 0)
+
+        partial = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:main",
+                "--openclaw-session-id",
+                "session-123",
+            ],
+            self.env,
+        )
+        self.assertEqual(partial.returncode, 0)
+
+        state = self._read_state()
+        binding = state["runtime_bindings"]["openclaw"]
+        self.assertEqual(binding["session_key"], "agent:main:main")
+        self.assertEqual(binding["session_id"], "session-123")
+        self.assertEqual(binding["channel"], "telegram")
+        self.assertEqual(binding["to"], "telegram:7026799796")
+        self.assertEqual(binding["from"], "telegram:7026799796")
+        self.assertEqual(binding["account_id"], "default")
+
+        route_cache = self.config_dir / "openclaw-route-cache.json"
+        cached_binding = json.loads(route_cache.read_text(encoding="utf-8"))
+        self.assertEqual(cached_binding["session_key"], "agent:main:main")
+        self.assertEqual(cached_binding["session_id"], "session-123")
+        self.assertEqual(cached_binding["channel"], "telegram")
+        self.assertEqual(cached_binding["to"], "telegram:7026799796")
+        self.assertEqual(cached_binding["from"], "telegram:7026799796")
+        self.assertEqual(cached_binding["account_id"], "default")
+
+    def test_add_inherits_fresh_openclaw_route_cache(self) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = self.config_dir / "openclaw-route-cache.json"
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "agent_id": "main",
+                    "session_key": "agent:main:telegram:direct:7026799796",
+                    "session_id": "cached-session-321",
+                    "channel": "telegram",
+                    "to": "telegram:7026799796",
+                    "from": "telegram:7026799796",
+                    "account_id": "default",
+                    "updated_at": datetime.now().astimezone().isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        added = _run_cli(["--add", "-R", "inherit route cache", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        binding = state["runtime_bindings"]["openclaw"]
+        self.assertEqual(binding["session_id"], "cached-session-321")
+        self.assertEqual(
+            binding["session_key"], "agent:main:telegram:direct:7026799796"
+        )
+        self.assertFalse(cache_file.exists())
+
+    def test_cancel_accept_clears_openclaw_route_cache(self) -> None:
+        added = _run_cli(["--add", "-R", "cancel route cache", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        recorded = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-123",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(recorded.returncode, 0)
+
+        cancel_request = _run_cli(["--cancel"], self.env)
+        self.assertEqual(cancel_request.returncode, 0)
+
+        cancel_accept = _run_cli(["--cancel-accept"], self.env)
+        self.assertEqual(cancel_accept.returncode, 0)
+        self.assertFalse((self.config_dir / "openclaw-route-cache.json").exists())
+
+    def test_normal_stop_clears_openclaw_route_cache(self) -> None:
+        added = _run_cli(["--add", "-R", "stop route cache", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        recorded = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-123",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(recorded.returncode, 0)
+
+        state = self._read_state()
+        report_path = Path(str(state["sandbox_dir"])) / "REPORT.md"
+        report_text = report_path.read_text(encoding="utf-8")
+        report_path.write_text(
+            report_text.replace("IN_PROGRESS", "COMPLETE", 1),
+            encoding="utf-8",
+        )
+
+        stop = _run_cli(["--hook-stop"], self.env)
+        self.assertEqual(stop.returncode, 0)
+        self.assertFalse((self.config_dir / "openclaw-route-cache.json").exists())
+
     def test_final_only_update_policy_detected_for_until_requests(self) -> None:
         added = _run_cli(
             ["--add", "-R", "Clean workspace until 09:00 local time", "-D", "15"],
@@ -1245,6 +3016,18 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         for link in required_links:
             self.assertIn(link, text)
 
+    def test_install_help_clarifies_delivery_disabled_openclaw_proof_scope(
+        self,
+    ) -> None:
+        text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "internal OpenClaw session evidence, not external chat delivery",
+            "With `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0`, do not expect a human-chat echo.",
+            "rerun the same handler invocation without `OMNI_AGENT_OPENCLAW_WAKE_DELIVER=0`",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
     def test_install_help_keeps_future_agent_and_config_recovery_guidance(self) -> None:
         text = (PROJECT_ROOT / "install-help.md").read_text(encoding="utf-8")
         required_snippets = [
@@ -1287,6 +3070,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "Do chores until I stop you",
             "2 minutes",
             "install-help.md",
+            "install.ps1",
         ]
         for snippet in shared_snippets:
             self.assertIn(snippet, readme_text)

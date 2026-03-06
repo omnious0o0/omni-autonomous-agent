@@ -153,9 +153,36 @@ class CrossPlatformLogicTests(unittest.TestCase):
             "live-verified",
             "must **not** claim live provider verification",
             "simulated coverage only",
+            "defined-but-broken VM",
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)
+
+    def test_skill_matches_readme_operating_contract(self) -> None:
+        readme_text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        skill_text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        for snippet in [
+            "Work overnight",
+            "Work on this for 2 hours",
+            "Keep working on this until it's done",
+            "Do chores until I stop you",
+            "memory system",
+        ]:
+            self.assertIn(snippet, readme_text)
+            self.assertIn(snippet, skill_text)
+
+        for snippet in [
+            "does **not** replace the shell",
+            "Do not invent a rule that every command must start with `omni-autonomous-agent`",
+            "Use wrappers only for the **agent process**",
+            "configured",
+            "callable",
+            "authenticated",
+            "live-verified",
+            "simulated coverage only",
+        ]:
+            self.assertIn(snippet, skill_text)
 
     def test_install_ps1_keeps_self_healing_bootstrap_logic(self) -> None:
         text = (PROJECT_ROOT / ".omni-autonomous-agent" / "install.ps1").read_text(

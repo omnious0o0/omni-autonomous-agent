@@ -111,6 +111,19 @@ BIN
   done
   write_openclaw_binary
 
+  cat > "${WORK_DIR}/parse-windows-smoke.ps1" <<\PS1
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+  "/repo/tests/windows_smoke.ps1",
+  [ref]$null,
+  [ref]$errors
+) | Out-Null
+if ($errors -and $errors.Count -gt 0) {
+  throw (($errors | ForEach-Object { $_.Message }) -join "`n")
+}
+PS1
+  pwsh -NoLogo -NoProfile -File "${WORK_DIR}/parse-windows-smoke.ps1" >/dev/null
+
   pwsh -NoLogo -NoProfile -File /repo/.omni-autonomous-agent/install.ps1 >"${WORK_DIR}/install.out"
 
   test -f "${WORK_DIR}/bin/omni-autonomous-agent.ps1"

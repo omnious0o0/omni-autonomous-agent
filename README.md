@@ -4,7 +4,16 @@
 
 ## What it does
 
-Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. (e.g., "Work overnight," "work on this for 2 hours," "keep working on this until it's done," etc.). Basically any task that could take longer than usual. (3+ minutes)
+Makes your AI agent autonomous and able to work for a long or fixed duration, without interruptions. like:
+- Work overnight
+- Work on this for 2 hours
+- Keep working on this until it's done
+- Do chores until I stop you
+...
+
+Don't worry about the duration of the task, there's a memory system
+
+Basically any task that could take longer than usual.
 
 Your agent gets its own workspace where it can log its memory, reasoning, plans, timestamps of what it's doing, make its own tools and helpers, etc.
 
@@ -42,6 +51,11 @@ After install:
 
 1. Run `omni-autonomous-agent --status`
 2. Follow `install-help.md` self-check steps
+
+### Agent setup tip
+
+Treat `install-help.md` as the canonical hook setup playbook.
+It is intentionally machine-agnostic: validate behavior with commands and outputs, not host-specific path assumptions.
 
 ## Support
 

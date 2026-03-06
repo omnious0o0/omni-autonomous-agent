@@ -303,8 +303,34 @@ If you do not have a real Windows or macOS machine or VM available:
 - test path logic, wrapper generation, and installer logic with simulation/unit tests
 - test Linux behavior live where possible
 - report Windows/macOS as **simulated coverage only**
+- a defined-but-broken VM (missing disk, missing boot media, no boot path, no guest access) does **not** count as real OS availability
 
 Do not present simulated cross-platform checks as real OS verification.
+
+---
+
+## 10D) Preferred repo-native verification ladder
+
+If you are working inside the OAA repository, prefer existing verification entry points over ad-hoc checks.
+
+Run the strongest checks you can for the current environment:
+
+```bash
+python3 -m unittest tests.test_autonomous_agent tests.test_cross_platform_logic
+bash tests/launch_gate.sh
+bash tests/docker_smoke.sh
+bash tests/pwsh_install_smoke.sh
+bash tests/macos_smoke.sh
+pwsh -File tests/windows_smoke.ps1
+```
+
+Interpret them honestly:
+
+- `tests/docker_smoke.sh`: real fresh-machine Linux install + lifecycle proof in Docker
+- `tests/pwsh_install_smoke.sh`: strong PowerShell installer proof using a PowerShell runtime, but still simulated coverage rather than real Windows
+- `tests/macos_smoke.sh`: repo-native smoke flow intended for real macOS runners
+- `tests/windows_smoke.ps1`: repo-native smoke flow intended for real Windows runners
+- unit tests + launch gate: structural and cross-platform logic proof, not a substitute for live provider/OS proof
 
 ---
 

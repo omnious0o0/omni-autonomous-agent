@@ -1213,10 +1213,14 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "Final-only update policy check",
             "Evidence checklist",
             "AI self-setup playbook (non-scripted fallback)",
+            "Preferred repo-native verification ladder",
             "Official references and troubleshooting resources",
             "message:transcribed",
             "message:preprocessed",
             "session:compact:before",
+            "tests/pwsh_install_smoke.sh",
+            "tests/macos_smoke.sh",
+            "tests/windows_smoke.ps1",
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)
@@ -1245,6 +1249,58 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "provider config file was invalid",
             "quarantined or replaced safely",
             "simulated coverage only",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_skill_keeps_autonomy_contract_and_readme_alignment(self) -> None:
+        text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "Do chores until I stop you",
+            "Tell them they have 2 minutes to respond",
+            "Do not ask the human to perform manual setup",
+            "Do not invent a rule that every command must start with `omni-autonomous-agent`",
+            "Use wrappers only for the **agent process**",
+            "configured",
+            "callable",
+            "authenticated",
+            "live-verified",
+            "temporary disconnect or provider restart is not task completion",
+            "I will now ...",
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
+    def test_readme_and_skill_share_core_autonomous_examples(self) -> None:
+        readme_text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        skill_text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        shared_snippets = [
+            "Work overnight",
+            "Work on this for 2 hours",
+            "Keep working on this until it's done",
+            "Do chores until I stop you",
+            "install-help.md",
+        ]
+        for snippet in shared_snippets:
+            self.assertIn(snippet, readme_text)
+            self.assertIn(snippet, skill_text)
+
+    def test_skill_keeps_command_model_and_honest_proof_rules(self) -> None:
+        text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "memory system",
+            "Normal operation must not rely on manual git or GitHub commands.",
+            "Normal work commands remain normal commands.",
+            "`oaa <command>` alias",
+            "Use wrappers only for the **agent process**",
+            "2 minutes",
+            "--await-user",
+            "--user-responded",
+            "configured",
+            "callable",
+            "authenticated",
+            "live-verified",
+            "Compaction is not completion.",
         ]
         for snippet in required_snippets:
             self.assertIn(snippet, text)

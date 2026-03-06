@@ -162,12 +162,16 @@ required_install_help_markers = [
     '## 10) AI self-setup playbook (non-scripted fallback)',
     '## 10B) Provider coverage rule',
     '## 10C) Cross-OS proof rule',
+    '## 10D) Preferred repo-native verification ladder',
     '## 11) Official references and troubleshooting resources',
     'does **not** require every command to be prefixed',
     'Verification grades',
     'live-verified',
     'simulated coverage only',
     'quarantined or replaced safely',
+    'tests/pwsh_install_smoke.sh',
+    'tests/macos_smoke.sh',
+    'tests/windows_smoke.ps1',
     'https://docs.openclaw.ai/automation/hooks',
     'https://docs.openclaw.ai/automation/hooks#troubleshooting',
     'https://geminicli.com/docs/get-started/authentication/',
@@ -181,6 +185,55 @@ if missing_markers:
     raise SystemExit(
         'launch-gate failed: install-help.md missing required self-setup markers: '
         + ', '.join(missing_markers)
+    )
+
+readme_text = (root / 'README.md').read_text(encoding='utf-8')
+required_readme_markers = [
+    'Work overnight',
+    'Work on this for 2 hours',
+    "Keep working on this until it's done",
+    'Do chores until I stop you',
+    "there's a memory system",
+    'install-help.md',
+    'canonical hook setup playbook',
+]
+missing_readme_markers = [
+    marker for marker in required_readme_markers if marker not in readme_text
+]
+if missing_readme_markers:
+    raise SystemExit(
+        'launch-gate failed: README.md missing required autonomous contract markers: '
+        + ', '.join(missing_readme_markers)
+    )
+
+skill_text = (root / 'SKILL.md').read_text(encoding='utf-8')
+required_skill_markers = [
+    'Work overnight',
+    'Work on this for 2 hours',
+    "Keep working on this until it's done",
+    'Do chores until I stop you',
+    'memory system',
+    'install-help.md',
+    'Normal operation must not rely on manual git or GitHub commands.',
+    'Normal work commands remain normal commands.',
+    '`oaa <command>` alias',
+    'Use wrappers only for the **agent process**',
+    '2 minutes',
+    '--await-user',
+    '--user-responded',
+    'configured',
+    'callable',
+    'authenticated',
+    'live-verified',
+    'Compaction is not completion.',
+]
+missing_skill_markers = [
+    marker for marker in required_skill_markers if marker not in skill_text
+]
+if missing_skill_markers:
+    raise SystemExit(
+        'launch-gate failed: SKILL.md missing required autonomy contract markers: '
+        + ', '.join(missing_skill_markers)
     )
 
 docker_smoke = (root / 'tests' / 'docker_smoke.sh').read_text(encoding='utf-8')

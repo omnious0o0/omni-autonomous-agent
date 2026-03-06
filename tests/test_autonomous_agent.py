@@ -562,7 +562,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(bool(active_payload.get("ok")))
         self.assertTrue(bool(active_payload.get("active")))
         self.assertFalse(bool(active_payload.get("dynamic")))
-        self.assertEqual(active_payload.get("request"), "fixed lifecycle")
+        self.assertTrue(str(active_payload.get("request", "")).startswith("[request:"))
 
         cancel_request = _run_cli(["--cancel"], self.env)
         self.assertEqual(cancel_request.returncode, 0)
@@ -960,7 +960,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(binding["session_id"], "session-123")
         self.assertEqual(binding["to"], "telegram:7026799796")
 
-        status_json = _run_cli(["--status", "--json"], self.env)
+        env = self.env.copy()
+        env["OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT"] = "1"
+        status_json = _run_cli(["--status", "--json"], env)
         self.assertEqual(status_json.returncode, 0)
         payload = json.loads(status_json.stdout)
         self.assertFalse(bool(payload.get("waiting_for_user")))
@@ -1731,13 +1733,46 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertTrue(wrapper.exists())
 
     def test_bootstrap_supports_forced_wrapper_targets(self) -> None:
+        self._write_fake_binary("gemini")
         self.env["OMNI_AGENT_EXTRA_WRAPPERS"] = "soonagent"
 
         bootstrap = _run_cli(["--bootstrap"], self.env)
         self.assertEqual(bootstrap.returncode, 0)
 
         wrapper = self.home_dir / ".local" / "bin" / "omni-wrap-soonagent"
+        gemini_settings = self.home_dir / ".gemini" / "settings.json"
         self.assertTrue(wrapper.exists())
+        self.assertTrue(gemini_settings.exists())
+
+    def test_bootstrap_resolves_openclaw_from_home_local_bin(self) -> None:
+        local_bin = self.home_dir / ".local" / "bin"
+        local_bin.mkdir(parents=True, exist_ok=True)
+        openclaw_bin = local_bin / "openclaw"
+        openclaw_bin.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        openclaw_bin.chmod(0o755)
+
+        env = self.env.copy()
+        env["PATH"] = os.pathsep.join(
+            [
+                str(self.bin_dir),
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            ]
+        )
+
+        bootstrap = _run_cli(["--bootstrap"], env)
+        self.assertEqual(bootstrap.returncode, 0)
+        self.assertTrue(
+            (
+                self.home_dir / ".openclaw" / "hooks" / "omni-recovery" / "HOOK.md"
+            ).exists()
+        )
 
     def test_bootstrap_respects_wrapper_bin_override(self) -> None:
         self._write_fake_binary("codex")
@@ -2028,6 +2063,59 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         result = _run_cli(["--update"], env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("git pull timed out", result.stderr)
+
+    def test_status_does_not_trigger_auto_update(self) -> None:
+        modules = _load_internal_modules("session_manager", "updater", "cli")
+        cli = modules["cli"]
+
+        with mock.patch.object(cli, "maybe_auto_update") as auto_update_mock:
+            with mock.patch.object(cli, "cmd_status") as status_mock:
+                with mock.patch.object(sys, "argv", ["omni-autonomous-agent", "--status"]):
+                    cli.main()
+
+        auto_update_mock.assert_not_called()
+        status_mock.assert_called_once_with(json_output=False)
+
+    def test_add_triggers_auto_update_before_registering_session(self) -> None:
+        modules = _load_internal_modules("session_manager", "updater", "cli")
+        cli = modules["cli"]
+        call_order: list[str] = []
+
+        with mock.patch.object(
+            cli, "maybe_auto_update", side_effect=lambda: call_order.append("update")
+        ):
+            with mock.patch.object(
+                cli,
+                "cmd_add",
+                side_effect=lambda request, duration: call_order.append(
+                    f"add:{request}:{duration}"
+                ),
+            ):
+                with mock.patch.object(
+                    cli,
+                    "cmd_status",
+                    side_effect=lambda json_output=False: call_order.append(
+                        f"status:{json_output}"
+                    ),
+                ):
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "omni-autonomous-agent",
+                            "--add",
+                            "-R",
+                            "auto update trigger",
+                            "-D",
+                            "dynamic",
+                        ],
+                    ):
+                        cli.main()
+
+        self.assertEqual(
+            call_order,
+            ["update", "add:auto update trigger:dynamic", "status:False"],
+        )
 
     def test_cli_help_reflects_dynamic_duration_default(self) -> None:
         help_out = _run_cli(["--help"], self.env)
@@ -3302,7 +3390,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(binding["from"], "telegram:7026799796")
         self.assertEqual(binding["account_id"], "default")
 
-        status_json = _run_cli(["--status", "--json"], self.env)
+        env = self.env.copy()
+        env["OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT"] = "1"
+        status_json = _run_cli(["--status", "--json"], env)
         self.assertEqual(status_json.returncode, 0)
         payload = json.loads(status_json.stdout)
         runtime_bindings = payload.get("runtime_bindings") or {}
@@ -3316,6 +3406,49 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         log_text = self._read_log()
         self.assertIn("OpenClaw recovery route updated", log_text)
         self.assertIn("[openclaw-session-id:", log_text)
+
+    def test_status_json_redacts_sensitive_fields_by_default(self) -> None:
+        added = _run_cli(
+            ["--add", "-R", "apiKey=secret-token", "-D", "dynamic"], self.env
+        )
+        self.assertEqual(added.returncode, 0)
+
+        recorded = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-123",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(recorded.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertNotEqual(payload.get("request"), "apiKey=secret-token")
+        self.assertTrue(str(payload.get("request", "")).startswith("[request:"))
+        self.assertEqual(payload.get("sandbox_dir"), Path(self._read_state()["sandbox_dir"]).name)
+
+        runtime_bindings = payload.get("runtime_bindings") or {}
+        status_binding = runtime_bindings.get("openclaw") or {}
+        self.assertEqual(status_binding.get("channel"), "telegram")
+        self.assertNotEqual(status_binding.get("session_id"), "session-123")
+        self.assertTrue(
+            str(status_binding.get("session_id", "")).startswith("[openclaw-session-id:")
+        )
 
     def test_record_openclaw_route_merges_partial_updates_without_losing_delivery_metadata(
         self,
@@ -3368,14 +3501,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(binding["from"], "telegram:7026799796")
         self.assertEqual(binding["account_id"], "default")
 
-        route_cache = self.config_dir / "openclaw-route-cache.json"
-        cached_binding = json.loads(route_cache.read_text(encoding="utf-8"))
-        self.assertEqual(cached_binding["session_key"], "agent:main:main")
-        self.assertEqual(cached_binding["session_id"], "session-123")
-        self.assertEqual(cached_binding["channel"], "telegram")
-        self.assertEqual(cached_binding["to"], "telegram:7026799796")
-        self.assertEqual(cached_binding["from"], "telegram:7026799796")
-        self.assertEqual(cached_binding["account_id"], "default")
+        self.assertFalse((self.config_dir / "openclaw-route-cache.json").exists())
 
     def test_record_openclaw_route_replaces_metadata_when_session_id_changes(self) -> None:
         added = _run_cli(["--add", "-R", "replace route", "-D", "dynamic"], self.env)

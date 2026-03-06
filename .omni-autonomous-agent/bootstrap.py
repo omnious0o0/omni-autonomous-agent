@@ -397,10 +397,8 @@ def _windows_wrapper_script(command_line: str, owner_label: str) -> str:
         ")\n"
         "if not defined OMNI_OWNER_TOKEN set \"OMNI_OWNER_TOKEN=%RANDOM%%RANDOM%%RANDOM%\"\n"
         "set \"OMNI_AGENT_OWNER_TOKEN=!OMNI_OWNER_TOKEN!\"\n"
-        "set \"OMNI_OWNER_PID=\"\n"
-        "for /f \"usebackq delims=\" %%I in (`\"!OMNI_AGENT_PS_EXE!\" -NoProfile -Command \"$PID\"`) do set \"OMNI_OWNER_PID=%%I\"\n"
         "set \"ACTIVE_FILE=%TEMP%\\omni-agent-active-%RANDOM%-%RANDOM%.log\"\n"
-        f"omni-autonomous-agent --claim-execution-owner --execution-owner-kind wrapper --execution-owner-label {owner_label} --execution-owner-pid !OMNI_OWNER_PID! >\"!ACTIVE_FILE!\" 2>&1\n"
+        f"omni-autonomous-agent --claim-execution-owner --execution-owner-kind wrapper --execution-owner-label {owner_label} >\"!ACTIVE_FILE!\" 2>&1\n"
         "set CLAIM_STATUS=%ERRORLEVEL%\n"
         "if not \"!CLAIM_STATUS!\"==\"0\" (\n"
         "  findstr /c:\"no longer requires autonomous execution\" \"!ACTIVE_FILE!\" >nul 2>&1\n"
@@ -560,7 +558,7 @@ def _bash_wrapper_script(command_line: str, owner_label: str) -> str:
         "  fi\n"
         "  exit 3\n"
         "fi\n"
-        "trap cleanup_owner EXIT\n"
+        "trap 'omni_exit_status=$?; trap - EXIT; cleanup_owner; exit \"$omni_exit_status\"' EXIT\n"
         "omni_first_loop=1\n"
         "\n"
         "while true; do\n"
@@ -736,10 +734,25 @@ def _cli_candidate_paths(command: str) -> list[Path]:
     return candidates
 
 
+def _resolve_cli_command(command: str, *, override_env: str | None = None) -> str | None:
+    if override_env:
+        override = os.environ.get(override_env, "").strip()
+        if override:
+            return str(Path(override).expanduser())
+
+    resolved = shutil.which(command)
+    if resolved is not None:
+        return resolved
+
+    for candidate in _cli_candidate_paths(command):
+        if candidate.exists():
+            return str(candidate)
+
+    return None
+
+
 def _has_cli(command: str) -> bool:
-    if shutil.which(command) is not None:
-        return True
-    return any(candidate.exists() for candidate in _cli_candidate_paths(command))
+    return _resolve_cli_command(command) is not None
 
 
 def _cli_is_current_env_local(command: str) -> bool:
@@ -1414,11 +1427,14 @@ const spawnWithShimFallback = (
   });
 };
 
-const runOaa = (args: string[]) => {
+const runOaa = (args: string[], extraEnv: NodeJS.ProcessEnv = {}) => {
   const result = spawnWithShimFallback(oaaBin, args, {
     stdio: 'pipe',
     encoding: 'utf-8',
-    env: runtimeEnv,
+    env: {
+      ...runtimeEnv,
+      ...extraEnv,
+    },
   });
 
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
@@ -1455,7 +1471,9 @@ const recordHookTelemetry = (eventName: string, note: string) => {
 };
 
 const readStatusPayload = (): StatusPayload | null => {
-  const status = runOaa(['--status', '--json']);
+  const status = runOaa(['--status', '--json'], {
+    OMNI_AGENT_INCLUDE_SENSITIVE_CONTEXT: '1',
+  });
   if (!status.ok || !status.output) return null;
   try {
     return JSON.parse(status.output) as StatusPayload;
@@ -2631,8 +2649,15 @@ def _configure_openclaw() -> tuple[bool, Path]:
         handler_ts.write_text(handler_content, encoding="utf-8")
         changed = True
 
-    def _run_openclaw_command(command: list[str]) -> tuple[bool, str]:
-        command_text = " ".join(command)
+    openclaw_bin = _resolve_cli_command(
+        "openclaw", override_env="OMNI_AGENT_OPENCLAW_BIN"
+    )
+    if openclaw_bin is None:
+        raise RuntimeError("openclaw CLI is not installed or not discoverable")
+
+    def _run_openclaw_command(args: list[str]) -> tuple[bool, str]:
+        command = [openclaw_bin, *args]
+        command_text = " ".join(["openclaw", *args])
         try:
             result = subprocess.run(
                 command,
@@ -2640,8 +2665,11 @@ def _configure_openclaw() -> tuple[bool, Path]:
                 capture_output=True,
                 text=True,
                 stdin=subprocess.DEVNULL,
+                env=os.environ.copy(),
                 timeout=5,
             )
+        except FileNotFoundError as exc:
+            return False, f"{command_text}: {exc}"
         except subprocess.TimeoutExpired:
             return False, f"{command_text}: timed out after 5 seconds"
 
@@ -2656,7 +2684,9 @@ def _configure_openclaw() -> tuple[bool, Path]:
     if not plugin_manifest.exists() or not plugin_entry.exists():
         raise RuntimeError(f"OpenClaw plugin source missing at {plugin_dir}")
 
-    plugin_cli_ok, plugin_cli_error = _run_openclaw_command(["openclaw", "plugins", "--help"])
+    plugin_cli_ok, plugin_cli_error = _run_openclaw_command(
+        ["plugins", "--help"]
+    )
     if not plugin_cli_ok:
         raise RuntimeError(
             "openclaw plugins CLI is required for OAA stop-gate enforcement: "
@@ -2664,7 +2694,7 @@ def _configure_openclaw() -> tuple[bool, Path]:
         )
 
     plugin_info_ok, plugin_info_output = _run_openclaw_command(
-        ["openclaw", "plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
+        ["plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
     )
     plugin_needs_install = True
     if plugin_info_ok:
@@ -2683,9 +2713,9 @@ def _configure_openclaw() -> tuple[bool, Path]:
             )
 
     if plugin_needs_install:
-        _run_openclaw_command(["openclaw", "plugins", "uninstall", OPENCLAW_PLUGIN_ID])
+        _run_openclaw_command(["plugins", "uninstall", OPENCLAW_PLUGIN_ID])
         plugin_install_ok, plugin_install_error = _run_openclaw_command(
-            ["openclaw", "plugins", "install", "--link", str(plugin_dir)]
+            ["plugins", "install", "--link", str(plugin_dir)]
         )
         if not plugin_install_ok:
             raise RuntimeError(
@@ -2694,13 +2724,13 @@ def _configure_openclaw() -> tuple[bool, Path]:
         changed = True
 
     plugin_enable_ok, plugin_enable_error = _run_openclaw_command(
-        ["openclaw", "plugins", "enable", OPENCLAW_PLUGIN_ID]
+        ["plugins", "enable", OPENCLAW_PLUGIN_ID]
     )
     if not plugin_enable_ok:
         raise RuntimeError(f"openclaw plugin enable failed: {plugin_enable_error}")
 
     plugin_verify_ok, plugin_verify_error = _run_openclaw_command(
-        ["openclaw", "plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
+        ["plugins", "info", OPENCLAW_PLUGIN_ID, "--json"]
     )
     if not plugin_verify_ok:
         raise RuntimeError(
@@ -2708,25 +2738,25 @@ def _configure_openclaw() -> tuple[bool, Path]:
         )
 
     plugin_doctor_ok, plugin_doctor_error = _run_openclaw_command(
-        ["openclaw", "plugins", "doctor"]
+        ["plugins", "doctor"]
     )
     if not plugin_doctor_ok:
         raise RuntimeError(f"openclaw plugin doctor failed: {plugin_doctor_error}")
 
     recovery_ok, recovery_error = _run_openclaw_command(
-        ["openclaw", "hooks", "enable", "omni-recovery"]
+        ["hooks", "enable", "omni-recovery"]
     )
     if not recovery_ok:
         raise RuntimeError(recovery_error)
 
     session_memory_ok, session_memory_error = _run_openclaw_command(
-        ["openclaw", "hooks", "enable", "session-memory"]
+        ["hooks", "enable", "session-memory"]
     )
     if not session_memory_ok:
         _row("Warning", c(YELLOW, f"OpenClaw optional hook: {session_memory_error}"))
 
     hook_check_ok, hook_check_error = _run_openclaw_command(
-        ["openclaw", "hooks", "check"]
+        ["hooks", "check"]
     )
     if not hook_check_ok:
         raise RuntimeError(f"openclaw hooks health check failed: {hook_check_error}")
@@ -2787,13 +2817,6 @@ def cmd_bootstrap() -> None:
         ):
             wrapper_targets[wrapper_name] = wrapper_cmd
 
-    explicit_wrapper_targets: set[str] = set(forced_wrappers)
-    if env_agent_token and env_agent_token not in hook_capable:
-        explicit_wrapper_targets.add(_sanitize_wrapper_name(env_agent_token))
-    has_explicit_wrapper_targets = any(
-        wrapper_name in explicit_wrapper_targets for wrapper_name in wrapper_targets
-    )
-
     configured: list[str] = []
     warnings: list[str] = []
     failed_targets: list[str] = []
@@ -2802,20 +2825,12 @@ def cmd_bootstrap() -> None:
     def _hook_failure_is_critical(provider: str) -> bool:
         if env_agent_token == provider:
             return True
-        if has_explicit_wrapper_targets:
-            return False
         if _cli_is_current_env_local(provider):
             return True
         return not wrapper_targets and detected_hook_targets == [provider]
 
     def _should_configure_hook_provider(provider: str) -> bool:
-        if env_agent_token == provider:
-            return True
-        if has_explicit_wrapper_targets:
-            return False
-        if _cli_is_current_env_local(provider):
-            return True
-        return not wrapper_targets
+        return True
 
     if hook_capable["claude"] and _should_configure_hook_provider("claude"):
         if not _safe_apply("Claude hooks", _configure_claude, configured, warnings):

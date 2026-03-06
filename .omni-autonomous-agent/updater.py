@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .constants import BOLD, CONFIG_DIR, DIM, GREEN, SEP, c
+from .constants import BOLD, CONFIG_DIR, DIM, GREEN, REPO_ROOT, SEP, c
 
 
 def _header(title: str) -> None:
@@ -44,7 +44,7 @@ def _git(repo_root: Path, *args: str) -> str:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    return REPO_ROOT
 
 
 def _is_git_worktree(repo_root: Path) -> bool:

@@ -286,25 +286,7 @@ def main() -> None:
     if args.json and not args.status:
         parser.error("--json is only supported with --status")
 
-    if not (
-        args.update
-        or args.install
-        or args.hook_stop
-        or args.hook_precompact
-        or args.require_active
-        or args.cancel_accept
-        or args.cancel_deny
-        or args.revise_session
-        or args.bootstrap
-        or args.await_user
-        or args.user_responded
-        or args.log_event
-        or args.record_openclaw_route
-        or args.claim_execution_owner
-        or args.heartbeat_execution_owner
-        or args.release_execution_owner
-        or args.clear_stale_execution_owner
-    ):
+    if args.add:
         maybe_auto_update()
 
     if args.add:

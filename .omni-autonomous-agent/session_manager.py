@@ -87,6 +87,32 @@ def _display_path(path: Path) -> str:
     return path.name or "(path-hidden)"
 
 
+def _status_openclaw_binding_for_output(
+    binding: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if binding is None:
+        return None
+    if _include_sensitive_context():
+        return dict(binding)
+
+    output: dict[str, str] = {}
+    for key, value in binding.items():
+        if not value:
+            continue
+        if key in {"agent_id", "channel", "updated_at"}:
+            output[key] = value
+            continue
+        label = {
+            "session_key": "openclaw-session",
+            "session_id": "openclaw-session-id",
+            "to": "openclaw-to",
+            "from": "openclaw-from",
+            "account_id": "openclaw-account",
+        }.get(key, f"openclaw-{key}")
+        output[key] = _display_sensitive_text(value, label=label)
+    return output
+
+
 def _fallback_template(template_id: str) -> str:
     if template_id == "stop-blocked":
         return (
@@ -509,36 +535,6 @@ def _coerce_openclaw_binding(
         binding["updated_at"] = updated_at_dt.isoformat()
 
     return binding
-
-
-def _load_openclaw_route_cache(now: datetime | None = None) -> dict[str, str] | None:
-    if not OPENCLAW_ROUTE_CACHE_FILE.exists():
-        return None
-    try:
-        raw = OPENCLAW_ROUTE_CACHE_FILE.read_text(encoding="utf-8")
-        parsed = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return _coerce_openclaw_binding(parsed, require_fresh=True, now=now)
-
-
-def _save_openclaw_route_cache(binding: dict[str, str]) -> None:
-    normalized = _coerce_openclaw_binding(binding)
-    if normalized is None:
-        return
-    existing = _load_openclaw_route_cache()
-    normalized = _merge_openclaw_binding(existing, normalized)
-    OPENCLAW_ROUTE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(normalized, indent=2)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=str(OPENCLAW_ROUTE_CACHE_FILE.parent),
-    ) as temp_file:
-        temp_file.write(payload)
-        temp_path = Path(temp_file.name)
-    temp_path.replace(OPENCLAW_ROUTE_CACHE_FILE)
 
 
 def _clear_openclaw_route_cache() -> None:
@@ -1684,10 +1680,6 @@ def cmd_record_openclaw_route(
             return
         if _set_openclaw_binding(state, binding):
             _save(state)
-            try:
-                _save_openclaw_route_cache(binding)
-            except OSError:
-                pass
             _append_log(
                 state,
                 "OpenClaw recovery route updated",
@@ -1977,7 +1969,9 @@ def _status_json_payload(
             "dynamic": bool(snapshot["dynamic"]),
             "should_continue": bool(should_continue),
             "stop_allowed": not should_continue,
-            "request": str(state.get("request", "")),
+            "request": _display_sensitive_text(
+                str(state.get("request", "")), label="request"
+            ),
             "started_at": snapshot["started"].isoformat(),
             "deadline": snapshot["deadline"].isoformat()
             if snapshot["deadline"] is not None
@@ -1994,10 +1988,12 @@ def _status_json_payload(
             "response_deadline": await_deadline.isoformat()
             if waiting_for_user and await_deadline is not None
             else None,
-            "await_question": str(state.get("await_user_question", "") or "")
+            "await_question": _display_sensitive_text(
+                str(state.get("await_user_question", "") or ""), label="question"
+            )
             if waiting_for_user
             else None,
-            "sandbox_dir": str(state.get("sandbox_dir", "")),
+            "sandbox_dir": _display_path(Path(str(state.get("sandbox_dir", "")))),
             "cancel_request_state": cancel_state,
             "cancel_requested_at": cancel_requested_at.isoformat()
             if cancel_requested_at is not None
@@ -2021,7 +2017,9 @@ def _status_json_payload(
                 snapshot["elapsed_seconds"]
             ),
             "execution_owner": execution_owner_payload,
-            "runtime_bindings": {"openclaw": openclaw_binding}
+            "runtime_bindings": {
+                "openclaw": _status_openclaw_binding_for_output(openclaw_binding)
+            }
             if openclaw_binding is not None
             else None,
         }
@@ -2067,7 +2065,10 @@ def cmd_status(*, json_output: bool = False) -> None:
             color = GREEN if should_continue else YELLOW
             _header(f"omni-autonomous-agent - {c(color, active_label)}")
 
-            _row("Request", state["request"])
+            _row(
+                "Request",
+                _display_sensitive_text(str(state.get("request", "")), label="request"),
+            )
             _row("Current date/time", _fmt_dt(now))
             _row("Started", _fmt_dt(snapshot["started"]))
 
@@ -2115,7 +2116,10 @@ def cmd_status(*, json_output: bool = False) -> None:
                 await_remaining = (await_deadline - now).total_seconds()
                 if not json_output:
                     _row("User response", c(YELLOW, "waiting"))
-                    _row("Await question", await_question)
+                    _row(
+                        "Await question",
+                        _display_sensitive_text(await_question, label="question"),
+                    )
                     _row("Response deadline", _fmt_dt(await_deadline))
                     _row("Wait remaining", _fmt_remaining(await_remaining))
             else:
@@ -2131,7 +2135,10 @@ def cmd_status(*, json_output: bool = False) -> None:
                 )
                 if not json_output:
                     _row("User response", c(YELLOW, "window expired"))
-                    _row("Await question", await_question)
+                    _row(
+                        "Await question",
+                        _display_sensitive_text(await_question, label="question"),
+                    )
                     _row("Autonomous mode", "proceeding with defaults")
 
         cancel_state = _cancel_request_state(state)
@@ -2167,7 +2174,7 @@ def cmd_status(*, json_output: bool = False) -> None:
             return
 
         _row("Log checkpoints", f"{log_count} (target >= {log_target})")
-        _row("Sandbox", state["sandbox_dir"])
+        _row("Sandbox", _display_path(Path(str(state.get("sandbox_dir", "")))))
         print(SEP)
 
 

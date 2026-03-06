@@ -1116,6 +1116,139 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         after = _run_cli(["--require-active"], self.env)
         self.assertEqual(after.returncode, 0)
 
+    def test_require_active_rejects_dynamic_session_waiting_for_closure(self) -> None:
+        added = _run_cli(["--add", "-R", "dynamic complete", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        report_path = Path(str(state["sandbox_dir"])) / "REPORT.md"
+        report_path.write_text(
+            report_path.read_text(encoding="utf-8").replace(
+                "IN_PROGRESS", "COMPLETE", 1
+            ),
+            encoding="utf-8",
+        )
+
+        require_active = _run_cli(["--require-active"], self.env)
+        self.assertNotEqual(require_active.returncode, 0)
+        self.assertIn("no longer requires autonomous execution", require_active.stderr)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        self.assertFalse(bool(payload.get("active")))
+        self.assertFalse(bool(payload.get("should_continue")))
+        self.assertTrue(bool(payload.get("stop_allowed")))
+        self.assertTrue(bool(payload.get("closure_pending")))
+        self.assertEqual(
+            payload.get("lifecycle_state"), "completion_marked_waiting_closure"
+        )
+
+    def test_claim_execution_owner_rejects_live_conflict(self) -> None:
+        added = _run_cli(["--add", "-R", "ownership conflict", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        owner_env = dict(self.env)
+        owner_env["OMNI_AGENT_OWNER_TOKEN"] = "owner-a"
+        claim_a = _run_cli(
+            [
+                "--claim-execution-owner",
+                "--execution-owner-kind",
+                "wrapper",
+                "--execution-owner-label",
+                "codex",
+                "--execution-owner-pid",
+                str(os.getpid()),
+            ],
+            owner_env,
+        )
+        self.assertEqual(claim_a.returncode, 0)
+
+        competing_env = dict(self.env)
+        competing_env["OMNI_AGENT_OWNER_TOKEN"] = "owner-b"
+        claim_b = _run_cli(
+            [
+                "--claim-execution-owner",
+                "--execution-owner-kind",
+                "wrapper",
+                "--execution-owner-label",
+                "gemini",
+                "--execution-owner-pid",
+                str(os.getpid()),
+            ],
+            competing_env,
+        )
+        self.assertEqual(claim_b.returncode, 6)
+        self.assertIn("already being executed", claim_b.stderr)
+        self.assertIn("codex", claim_b.stderr)
+
+    def test_claim_execution_owner_steals_stale_owner(self) -> None:
+        added = _run_cli(["--add", "-R", "ownership steal", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        state = self._read_state()
+        now = datetime.now().astimezone()
+        state["execution_owner"] = {
+            "token": "stale-owner",
+            "kind": "wrapper",
+            "label": "codex",
+            "host_id": "foreign-host",
+            "pid": 999999,
+            "acquired_at": (now - timedelta(minutes=10)).isoformat(),
+            "heartbeat_at": (now - timedelta(minutes=10)).isoformat(),
+        }
+        self._state_file().write_text(json.dumps(state), encoding="utf-8")
+
+        owner_env = dict(self.env)
+        owner_env["OMNI_AGENT_OWNER_TOKEN"] = "owner-b"
+        claim = _run_cli(
+            [
+                "--claim-execution-owner",
+                "--execution-owner-kind",
+                "wrapper",
+                "--execution-owner-label",
+                "gemini",
+                "--execution-owner-pid",
+                str(os.getpid()),
+            ],
+            owner_env,
+        )
+        self.assertEqual(claim.returncode, 0)
+
+        state_after = self._read_state()
+        owner = state_after["execution_owner"]
+        self.assertEqual(owner["token"], "owner-b")
+        self.assertEqual(owner["label"], "gemini")
+        self.assertIn("Execution ownership stolen from stale runner", self._read_log())
+
+    def test_status_json_reports_execution_owner(self) -> None:
+        added = _run_cli(["--add", "-R", "ownership status", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        owner_env = dict(self.env)
+        owner_env["OMNI_AGENT_OWNER_TOKEN"] = "owner-a"
+        claim = _run_cli(
+            [
+                "--claim-execution-owner",
+                "--execution-owner-kind",
+                "wrapper",
+                "--execution-owner-label",
+                "codex",
+                "--execution-owner-pid",
+                str(os.getpid()),
+            ],
+            owner_env,
+        )
+        self.assertEqual(claim.returncode, 0)
+
+        status_json = _run_cli(["--status", "--json"], self.env)
+        self.assertEqual(status_json.returncode, 0)
+        payload = json.loads(status_json.stdout)
+        owner = payload.get("execution_owner") or {}
+        self.assertEqual(owner.get("kind"), "wrapper")
+        self.assertEqual(owner.get("label"), "codex")
+        self.assertEqual(owner.get("state"), "active")
+
     def test_corrupted_state_recovery(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self._state_file().write_text("{invalid-json", encoding="utf-8")
@@ -1290,6 +1423,8 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("detached: true", openclaw_handler_text)
         self.assertIn("launchDetachedOpenclawAgent", openclaw_handler_text)
         self.assertIn("process.kill(pid, 0)", openclaw_handler_text)
+        self.assertIn("--clear-stale-execution-owner", openclaw_handler_text)
+        self.assertIn("owner_busy_skip", openclaw_handler_text)
         self.assertIn('"id": "omni-autonomous-agent"', openclaw_plugin_manifest_text)
         self.assertIn("before_agent_start", openclaw_plugin_entry_text)
         self.assertIn("agent_end", openclaw_plugin_entry_text)
@@ -1305,6 +1440,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             'pause_seconds="$(printf "%s\\n" "$hook_output" | omni_pause_seconds)"',
             universal_wrapper_text,
         )
+        self.assertIn("--claim-execution-owner", universal_wrapper_text)
+        self.assertIn("--heartbeat-execution-owner", universal_wrapper_text)
+        self.assertIn("--release-execution-owner", universal_wrapper_text)
         self.assertNotIn("sleep 30", universal_wrapper_text)
         self.assertGreaterEqual(
             universal_wrapper_text.count(
@@ -1318,6 +1456,9 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             'pause_seconds="$(printf "%s\\n" "$hook_output" | omni_pause_seconds)"',
             codex_wrapper_text,
         )
+        self.assertIn("--claim-execution-owner", codex_wrapper_text)
+        self.assertIn("--heartbeat-execution-owner", codex_wrapper_text)
+        self.assertIn("--release-execution-owner", codex_wrapper_text)
         self.assertNotIn("sleep 30", codex_wrapper_text)
         self.assertGreaterEqual(
             codex_wrapper_text.count(
@@ -1336,7 +1477,8 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             text=True,
             check=False,
         )
-        self.assertEqual(wrapper_result.returncode, 3)
+        self.assertNotEqual(wrapper_result.returncode, 0)
+        self.assertIn("no active session", wrapper_result.stderr)
 
     def test_wrapper_blocks_until_session_can_stop(self) -> None:
         self._write_fake_binary("codex")
@@ -1385,7 +1527,7 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             check=False,
             timeout=5,
         )
-        self.assertEqual(wrapper_result.returncode, 7)
+        self.assertEqual(wrapper_result.returncode, 0)
         self.assertFalse(self._state_file().exists())
 
     def test_wrapper_uses_dynamic_pause_then_resume_seconds(self) -> None:
@@ -2286,6 +2428,64 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("--reply-channel telegram", openclaw_log)
         self.assertIn("--reply-to telegram:7026799796", openclaw_log)
 
+    def test_openclaw_message_with_unverified_metadata_less_binding_fails_closed(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "fail closed route auth",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "runtime_bindings": {
+                    "openclaw": {
+                        "agent_id": "main",
+                        "session_key": "agent:main:main",
+                        "session_id": "session-123",
+                    }
+                },
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "foreign message",
+                    "from": "telegram:foreign-user",
+                },
+            },
+            write_session_file=False,
+            cli_sessions_override=[],
+        )
+
+        self.assertIn("openclaw.message.route_mismatch_ignored", oaa_log)
+        self.assertNotIn("--user-responded", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
+
+    def test_openclaw_startup_skips_when_live_wrapper_owner_exists(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "owner busy",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "execution_owner": {
+                    "kind": "wrapper",
+                    "label": "codex",
+                    "state": "active",
+                    "pid": os.getpid(),
+                    "acquired_at": "2026-03-06T00:00:00+00:00",
+                    "heartbeat_at": "2026-03-06T00:00:00+00:00",
+                },
+            },
+            event={"type": "gateway", "action": "startup"},
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.startup.owner_busy_skip", oaa_log)
+
     def test_openclaw_multiphase_inbound_events_dedupe_to_one_forward(self) -> None:
         oaa_log, openclaw_log = self._run_openclaw_handler(
             status_payload={
@@ -3177,7 +3377,56 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(cached_binding["from"], "telegram:7026799796")
         self.assertEqual(cached_binding["account_id"], "default")
 
-    def test_add_inherits_fresh_openclaw_route_cache(self) -> None:
+    def test_record_openclaw_route_replaces_metadata_when_session_id_changes(self) -> None:
+        added = _run_cli(["--add", "-R", "replace route", "-D", "dynamic"], self.env)
+        self.assertEqual(added.returncode, 0)
+
+        initial = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-old",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
+        )
+        self.assertEqual(initial.returncode, 0)
+
+        replacement = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:main",
+                "--openclaw-session-id",
+                "session-new",
+            ],
+            self.env,
+        )
+        self.assertEqual(replacement.returncode, 0)
+
+        state = self._read_state()
+        binding = state["runtime_bindings"]["openclaw"]
+        self.assertEqual(binding["session_key"], "agent:main:main")
+        self.assertEqual(binding["session_id"], "session-new")
+        self.assertNotIn("channel", binding)
+        self.assertNotIn("to", binding)
+        self.assertNotIn("from", binding)
+        self.assertNotIn("account_id", binding)
+
+    def test_add_ignores_preseeded_openclaw_route_cache_without_active_session(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         cache_file = self.config_dir / "openclaw-route-cache.json"
         cache_file.write_text(
@@ -3197,16 +3446,39 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        added = _run_cli(["--add", "-R", "inherit route cache", "-D", "dynamic"], self.env)
+        added = _run_cli(
+            ["--add", "-R", "ignore foreign route cache", "-D", "dynamic"], self.env
+        )
         self.assertEqual(added.returncode, 0)
 
         state = self._read_state()
-        binding = state["runtime_bindings"]["openclaw"]
-        self.assertEqual(binding["session_id"], "cached-session-321")
-        self.assertEqual(
-            binding["session_key"], "agent:main:telegram:direct:7026799796"
+        runtime_bindings = state.get("runtime_bindings") or {}
+        self.assertEqual(runtime_bindings, {})
+        self.assertTrue(cache_file.exists())
+
+    def test_record_openclaw_route_without_active_session_does_not_create_cache(self) -> None:
+        recorded = _run_cli(
+            [
+                "--record-openclaw-route",
+                "--openclaw-agent-id",
+                "main",
+                "--openclaw-session-key",
+                "agent:main:telegram:direct:7026799796",
+                "--openclaw-session-id",
+                "session-outside-oaa",
+                "--openclaw-reply-channel",
+                "telegram",
+                "--openclaw-reply-to",
+                "telegram:7026799796",
+                "--openclaw-reply-from",
+                "telegram:7026799796",
+                "--openclaw-reply-account",
+                "default",
+            ],
+            self.env,
         )
-        self.assertFalse(cache_file.exists())
+        self.assertEqual(recorded.returncode, 0)
+        self.assertFalse((self.config_dir / "openclaw-route-cache.json").exists())
 
     def test_cancel_accept_clears_openclaw_route_cache(self) -> None:
         added = _run_cli(["--add", "-R", "cancel route cache", "-D", "dynamic"], self.env)

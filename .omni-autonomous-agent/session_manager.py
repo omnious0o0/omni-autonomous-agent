@@ -8,6 +8,8 @@ import shutil
 import sys
 import tempfile
 import hashlib
+import socket
+import uuid
 from collections import UserDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -42,6 +44,7 @@ from .constants import (
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 CANCEL_ACCEPT_TOKEN = "..."
 CANCEL_DENY_TOKEN = ".."
+OWNER_CONFLICT_EXIT_CODE = 6
 
 
 def _resolve_template_dir() -> Path:
@@ -242,7 +245,7 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     return parsed
 
 
-def _state_is_valid(state: dict[str, Any]) -> bool:
+def _validate_state(state: dict[str, Any]) -> str | None:
     required = {
         "request",
         "duration_input",
@@ -250,49 +253,50 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
         "started_at",
         "sandbox_dir",
     }
-    if not required.issubset(state.keys()):
-        return False
+    missing = sorted(required.difference(state.keys()))
+    if missing:
+        return "missing required fields: " + ", ".join(missing)
 
     request = state.get("request")
     if not isinstance(request, str) or not request.strip():
-        return False
+        return "request must be a non-empty string"
 
     duration_input = state.get("duration_input")
     if not isinstance(duration_input, str) or not duration_input.strip():
-        return False
+        return "duration_input must be a non-empty string"
 
     sandbox_dir = state.get("sandbox_dir")
     if not isinstance(sandbox_dir, str) or not sandbox_dir.strip():
-        return False
+        return "sandbox_dir must be a non-empty string"
 
     sandbox_path = Path(sandbox_dir).expanduser().resolve(strict=False)
     sandbox_root = SANDBOX_ROOT.resolve(strict=False)
     if not _is_path_inside(sandbox_root, sandbox_path):
-        return False
+        return "sandbox_dir escapes sandbox root"
     if sandbox_path == sandbox_root:
-        return False
+        return "sandbox_dir cannot equal sandbox root"
 
     if state.get("duration_mode") not in {"fixed", "dynamic"}:
-        return False
+        return "duration_mode must be 'fixed' or 'dynamic'"
 
     duration_minutes = state.get("duration_minutes")
     deadline = state.get("deadline")
 
     started_dt = _parse_iso_datetime(state.get("started_at"))
     if started_dt is None:
-        return False
+        return "started_at must be an aware ISO datetime"
 
     if state.get("duration_mode") == "fixed":
         if not isinstance(duration_minutes, int) or duration_minutes <= 0:
-            return False
+            return "fixed sessions require duration_minutes > 0"
         deadline_dt = _parse_iso_datetime(deadline)
         if deadline_dt is None:
-            return False
+            return "fixed sessions require an aware ISO deadline"
     else:
         if duration_minutes is not None:
-            return False
+            return "dynamic sessions cannot store duration_minutes"
         if deadline is not None:
-            return False
+            return "dynamic sessions cannot store a deadline"
 
     await_started = state.get("await_user_started_at")
     await_deadline = state.get("await_user_deadline")
@@ -304,17 +308,18 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
         started_dt = _parse_iso_datetime(await_started)
         deadline_dt = _parse_iso_datetime(await_deadline)
         if started_dt is None or deadline_dt is None:
-            return False
+            return "await-user window must use aware ISO datetimes"
         if deadline_dt < started_dt:
-            return False
+            return "await-user deadline cannot be earlier than await-user start"
         if await_question is not None and not isinstance(await_question, str):
-            return False
+            return "await_user_question must be a string"
 
     cancel_state = state.get("cancel_request_state")
     cancel_requested_at = state.get("cancel_requested_at")
     cancel_pause_until = state.get("cancel_pause_until")
     cancel_denied_at = state.get("cancel_denied_at")
     cancel_denied_note = state.get("cancel_denied_note")
+    execution_owner = state.get("execution_owner")
 
     cancel_fields_present = any(
         value is not None
@@ -329,38 +334,41 @@ def _state_is_valid(state: dict[str, Any]) -> bool:
 
     if cancel_fields_present:
         if cancel_state not in {"pending", "denied"}:
-            return False
+            return "cancel_request_state must be 'pending' or 'denied'"
         requested_dt = _parse_iso_datetime(cancel_requested_at)
         if requested_dt is None:
-            return False
+            return "cancel_requested_at must be an aware ISO datetime"
 
         pause_dt = None
         if cancel_pause_until is not None:
             pause_dt = _parse_iso_datetime(cancel_pause_until)
             if pause_dt is None:
-                return False
+                return "cancel_pause_until must be an aware ISO datetime"
 
         if cancel_state == "pending":
             if pause_dt is None:
-                return False
+                return "pending cancellations require cancel_pause_until"
             if pause_dt < requested_dt:
-                return False
+                return "cancel_pause_until cannot be earlier than cancel_requested_at"
             if cancel_denied_at is not None:
-                return False
+                return "pending cancellations cannot store cancel_denied_at"
             if cancel_denied_note is not None:
-                return False
+                return "pending cancellations cannot store cancel_denied_note"
         else:
             denied_dt = _parse_iso_datetime(cancel_denied_at)
             if denied_dt is None:
-                return False
+                return "denied cancellations require cancel_denied_at"
             if denied_dt < requested_dt:
-                return False
+                return "cancel_denied_at cannot be earlier than cancel_requested_at"
             if cancel_denied_note is not None and not isinstance(
                 cancel_denied_note, str
             ):
-                return False
+                return "cancel_denied_note must be a string"
 
-    return True
+    if execution_owner is not None and _coerce_execution_owner(execution_owner) is None:
+        return "execution_owner is malformed"
+
+    return None
 
 
 def _normalize_state_fields(state: dict[str, Any]) -> bool:
@@ -373,6 +381,11 @@ def _normalize_state_fields(state: dict[str, Any]) -> bool:
         request = str(state.get("request", ""))
         duration_mode = str(state.get("duration_mode", "dynamic"))
         state["update_policy"] = _infer_update_policy(request, duration_mode)
+        changed = True
+
+    session_id = _clean_text(state.get("session_id"))
+    if not session_id:
+        state["session_id"] = uuid.uuid4().hex
         changed = True
 
     runtime_bindings = state.get("runtime_bindings")
@@ -401,6 +414,16 @@ def _normalize_state_fields(state: dict[str, Any]) -> bool:
             state.pop("runtime_bindings", None)
             changed = True
 
+    execution_owner = state.get("execution_owner")
+    if execution_owner is not None:
+        normalized_owner = _coerce_execution_owner(execution_owner)
+        if normalized_owner is None:
+            state.pop("execution_owner", None)
+            changed = True
+        elif normalized_owner != execution_owner:
+            state["execution_owner"] = normalized_owner
+            changed = True
+
     return changed
 
 
@@ -421,8 +444,9 @@ def _load_with_error() -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(loaded, dict):
         return None, "state file is invalid: expected a JSON object"
 
-    if not _state_is_valid(loaded):
-        return None, "state file is invalid: missing required fields"
+    validation_error = _validate_state(loaded)
+    if validation_error is not None:
+        return None, f"state file is invalid: {validation_error}"
 
     if _normalize_state_fields(loaded):
         _save(loaded)
@@ -540,20 +564,9 @@ def _merge_openclaw_binding(
 
     current_session_id = _clean_text(current.get("session_id"))
     incoming_session_id = _clean_text(incoming.get("session_id"))
-    current_session_key = _clean_text(current.get("session_key"))
-    incoming_session_key = _clean_text(incoming.get("session_key"))
-
-    same_route = False
-    if current_session_id and incoming_session_id and current_session_id == incoming_session_id:
-        same_route = True
-    elif (
-        current_session_key
-        and incoming_session_key
-        and current_session_key == incoming_session_key
-    ):
-        same_route = True
-
-    if not same_route:
+    if not current_session_id or not incoming_session_id:
+        return incoming
+    if current_session_id != incoming_session_id:
         return incoming
 
     merged = dict(current)
@@ -628,6 +641,143 @@ def _fmt_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
+
+def _local_host_id() -> str:
+    try:
+        raw = socket.gethostname().strip()
+    except OSError:
+        raw = ""
+    if not raw:
+        raw = "unknown-host"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _execution_owner_stale_seconds() -> int:
+    raw = os.environ.get("OMNI_AGENT_EXECUTION_OWNER_STALE_SECONDS", "180").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 180
+    if value <= 0:
+        return 180
+    return value
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _parse_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _coerce_execution_owner(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    token = _clean_text(raw.get("token"))
+    if not token:
+        return None
+
+    acquired_at = _parse_iso_datetime(raw.get("acquired_at"))
+    heartbeat_at = _parse_iso_datetime(raw.get("heartbeat_at"))
+    if acquired_at is None or heartbeat_at is None or heartbeat_at < acquired_at:
+        return None
+
+    kind = _clean_text(raw.get("kind")).lower() or "runner"
+    label = _clean_text(raw.get("label")) or kind
+    host_id = _clean_text(raw.get("host_id"))
+    pid = _parse_positive_int(raw.get("pid"))
+
+    normalized: dict[str, Any] = {
+        "token": token,
+        "kind": kind,
+        "label": label,
+        "acquired_at": acquired_at.isoformat(),
+        "heartbeat_at": heartbeat_at.isoformat(),
+    }
+    if host_id:
+        normalized["host_id"] = host_id
+    if pid is not None:
+        normalized["pid"] = pid
+    return normalized
+
+
+def _read_execution_owner(state: dict[str, Any]) -> dict[str, Any] | None:
+    return _coerce_execution_owner(state.get("execution_owner"))
+
+
+def _clear_execution_owner(state: dict[str, Any]) -> None:
+    state.pop("execution_owner", None)
+
+
+def _set_execution_owner(state: dict[str, Any], owner: dict[str, Any]) -> None:
+    normalized = _coerce_execution_owner(owner)
+    if normalized is None:
+        _clear_execution_owner(state)
+        return
+    state["execution_owner"] = normalized
+
+
+def _execution_owner_is_live(owner: dict[str, Any], now: datetime) -> bool:
+    host_id = _clean_text(owner.get("host_id"))
+    pid = _parse_positive_int(owner.get("pid"))
+    if host_id and host_id == _local_host_id() and pid is not None:
+        return _pid_is_running(pid)
+
+    heartbeat_at = _parse_iso_datetime(owner.get("heartbeat_at"))
+    if heartbeat_at is None:
+        return False
+    stale_after = timedelta(seconds=_execution_owner_stale_seconds())
+    return now - heartbeat_at <= stale_after
+
+
+def _execution_owner_state(owner: dict[str, Any] | None, now: datetime) -> str:
+    if owner is None:
+        return "none"
+    return "active" if _execution_owner_is_live(owner, now) else "stale"
+
+
+def _execution_owner_summary(owner: dict[str, Any], now: datetime) -> str:
+    label = _clean_text(owner.get("label")) or "runner"
+    kind = _clean_text(owner.get("kind")) or "runner"
+    owner_state = _execution_owner_state(owner, now)
+    summary = f"{label} ({kind}, {owner_state})"
+    pid = _parse_positive_int(owner.get("pid"))
+    if pid is not None:
+        summary += f", pid={pid}"
+    heartbeat_at = _parse_iso_datetime(owner.get("heartbeat_at"))
+    if heartbeat_at is not None:
+        age_seconds = max(0.0, (now - heartbeat_at).total_seconds())
+        summary += f", heartbeat={_fmt_elapsed(age_seconds)} ago"
+    return summary
+
+
+def _owner_conflict(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(OWNER_CONFLICT_EXIT_CODE)
+
+
+def _caller_owner_token() -> str:
+    return os.environ.get("OMNI_AGENT_OWNER_TOKEN", "").strip()
 
 
 def _slugify(text: str, max_len: int = 56) -> str:
@@ -803,6 +953,10 @@ def _stop_should_block(snapshot: dict[str, Any], report_status: str) -> bool:
     if snapshot["dynamic"]:
         return report_status not in {"COMPLETE", "PARTIAL"}
     return bool(snapshot["remaining_seconds"] and snapshot["remaining_seconds"] > 0)
+
+
+def _session_should_continue(snapshot: dict[str, Any], report_status: str) -> bool:
+    return _stop_should_block(snapshot, report_status)
 
 
 def _cancel_instruction_text() -> str:
@@ -1161,8 +1315,15 @@ def cmd_add(request: str, duration: str) -> None:
                 f"error: {existing_error}. Run 'omni-autonomous-agent --cancel' to reset state safely."
             )
         if existing_state is not None:
+            existing_now = _now()
+            existing_snapshot = _status_snapshot(existing_state, existing_now)
+            existing_report_status = _read_report_status(existing_state)
+            if _session_should_continue(existing_snapshot, existing_report_status):
+                sys.exit(
+                    "error: an active session already exists. Use --status or --cancel first."
+                )
             sys.exit(
-                "error: an active session already exists. Use --status or --cancel first."
+                "error: a previous session is still waiting for closure. Let its stop hook finish archiving, or run 'omni-autonomous-agent --cancel' before starting a new session."
             )
 
         duration_input, duration_mode, duration_minutes = _parse_duration_config(
@@ -1175,7 +1336,6 @@ def cmd_add(request: str, duration: str) -> None:
             if duration_minutes is not None
             else None
         )
-        inherited_openclaw_binding = _load_openclaw_route_cache(now)
 
         SANDBOX_ROOT.mkdir(parents=True, exist_ok=True)
         ARCHIVE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1186,6 +1346,7 @@ def cmd_add(request: str, duration: str) -> None:
 
         state: dict[str, Any] = {
             "version": 1,
+            "session_id": uuid.uuid4().hex,
             "request": request_clean,
             "duration_input": duration_input,
             "duration_mode": duration_mode,
@@ -1197,28 +1358,20 @@ def cmd_add(request: str, duration: str) -> None:
             "status": "active",
             "update_policy": _infer_update_policy(request_clean, duration_mode),
         }
-        if inherited_openclaw_binding is not None:
-            state["runtime_bindings"] = {"openclaw": inherited_openclaw_binding}
 
         try:
             _save(state)
-            if inherited_openclaw_binding is not None:
-                _clear_openclaw_route_cache()
             _write_initial_report(state)
             _write_initial_log(state)
             _append_log(
                 state,
                 "Session registered",
                 details=[
-                    f"Duration mode: {duration_mode}",
+                f"Duration mode: {duration_mode}",
                 f"Deadline: {_fmt_dt(deadline) if deadline else 'dynamic'}",
                 f"Sandbox: {sandbox}",
                 f"User updates: {state.get('update_policy', 'milestones')}",
-                (
-                    "OpenClaw recovery route: cached route bound to active session."
-                    if inherited_openclaw_binding is not None
-                    else "OpenClaw recovery route: not bound."
-                ),
+                "OpenClaw recovery route: not bound.",
             ],
         )
         except Exception as exc:
@@ -1525,17 +1678,16 @@ def cmd_record_openclaw_route(
     if binding is None:
         return
 
-    try:
-        _save_openclaw_route_cache(binding)
-    except OSError:
-        pass
-
     with _state_lock():
         state, state_error = _load_with_error()
         if state_error or not state:
             return
         if _set_openclaw_binding(state, binding):
             _save(state)
+            try:
+                _save_openclaw_route_cache(binding)
+            except OSError:
+                pass
             _append_log(
                 state,
                 "OpenClaw recovery route updated",
@@ -1553,6 +1705,179 @@ def cmd_record_openclaw_route(
             )
 
 
+def _new_execution_owner(
+    *, token: str, kind: str, label: str, pid: int | None, now: datetime
+) -> dict[str, Any]:
+    owner: dict[str, Any] = {
+        "token": token,
+        "kind": kind.strip().lower() or "runner",
+        "label": label.strip() or kind.strip().lower() or "runner",
+        "host_id": _local_host_id(),
+        "acquired_at": now.isoformat(),
+        "heartbeat_at": now.isoformat(),
+    }
+    if pid is not None and pid > 0:
+        owner["pid"] = pid
+    return owner
+
+
+def cmd_claim_execution_owner(token: str, kind: str, label: str, pid_raw: str) -> None:
+    token_clean = token.strip()
+    if not token_clean:
+        sys.exit("error: missing OMNI_AGENT_OWNER_TOKEN for ownership claim")
+
+    pid = _parse_positive_int(pid_raw)
+
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            sys.exit(
+                "error: no active session. run 'omni-autonomous-agent --add -R \"<request>\" -D <minutes|dynamic>' first."
+            )
+
+        now = _now()
+        snapshot = _status_snapshot(state, now)
+        report_status = _read_report_status(state)
+        if not _session_should_continue(snapshot, report_status):
+            sys.exit(
+                "error: this session no longer requires autonomous execution. Let the current stop hook close it or register a new session."
+            )
+
+        current_owner = _read_execution_owner(state)
+        next_owner = _new_execution_owner(
+            token=token_clean, kind=kind, label=label, pid=pid, now=now
+        )
+
+        if current_owner is not None:
+            if current_owner.get("token") == token_clean:
+                current_owner.update(
+                    {
+                        "kind": next_owner["kind"],
+                        "label": next_owner["label"],
+                        "host_id": next_owner["host_id"],
+                        "heartbeat_at": next_owner["heartbeat_at"],
+                    }
+                )
+                if pid is not None:
+                    current_owner["pid"] = pid
+                _set_execution_owner(state, current_owner)
+                _save(state)
+                return
+
+            if _execution_owner_is_live(current_owner, now):
+                _owner_conflict(
+                    "error: active session is already being executed by "
+                    + _execution_owner_summary(current_owner, now)
+                    + ". Wait for the current runner to finish or go stale before taking over."
+                )
+
+            previous_summary = _execution_owner_summary(current_owner, now)
+            _set_execution_owner(state, next_owner)
+            _save(state)
+            _append_log(
+                state,
+                "Execution ownership stolen from stale runner",
+                details=[
+                    f"Previous owner: {previous_summary}",
+                    f"New owner: {_execution_owner_summary(next_owner, now)}",
+                ],
+            )
+            return
+
+        _set_execution_owner(state, next_owner)
+        _save(state)
+        _append_log(
+            state,
+            "Execution ownership claimed",
+            details=[f"Owner: {_execution_owner_summary(next_owner, now)}"],
+        )
+
+
+def cmd_heartbeat_execution_owner(token: str) -> None:
+    token_clean = token.strip()
+    if not token_clean:
+        sys.exit("error: missing OMNI_AGENT_OWNER_TOKEN for ownership heartbeat")
+
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            return
+
+        now = _now()
+        owner = _read_execution_owner(state)
+        if owner is None:
+            _owner_conflict(
+                "error: active session has no execution owner. Stop this runner and restart it so ownership can be claimed safely."
+            )
+
+        if owner.get("token") != token_clean:
+            _owner_conflict(
+                "error: execution ownership was taken by "
+                + _execution_owner_summary(owner, now)
+                + ". Stop this runner to avoid conflicting work."
+            )
+
+        owner["heartbeat_at"] = now.isoformat()
+        _set_execution_owner(state, owner)
+        _save(state)
+
+
+def cmd_release_execution_owner(token: str) -> None:
+    token_clean = token.strip()
+    if not token_clean:
+        return
+
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error or not state:
+            return
+
+        owner = _read_execution_owner(state)
+        if owner is None or owner.get("token") != token_clean:
+            return
+
+        _clear_execution_owner(state)
+        _save(state)
+
+
+def cmd_clear_stale_execution_owner() -> None:
+    with _state_lock():
+        state, state_error = _load_with_error()
+        if state_error:
+            sys.exit(
+                "error: state is invalid. run 'omni-autonomous-agent --cancel' to reset."
+            )
+        if not state:
+            return
+
+        now = _now()
+        owner = _read_execution_owner(state)
+        if owner is None:
+            return
+        if _execution_owner_is_live(owner, now):
+            _owner_conflict(
+                "error: active session is currently owned by "
+                + _execution_owner_summary(owner, now)
+            )
+
+        previous_summary = _execution_owner_summary(owner, now)
+        _clear_execution_owner(state)
+        _save(state)
+        _append_log(
+            state,
+            "Stale execution owner cleared",
+            details=[f"Previous owner: {previous_summary}"],
+        )
+
+
 def cmd_require_active() -> None:
     with _state_lock():
         state, state_error = _load_with_error()
@@ -1567,9 +1892,10 @@ def cmd_require_active() -> None:
             )
 
         snapshot = _status_snapshot(state, _now())
-        if not snapshot["dynamic"] and not snapshot["active"]:
+        report_status = _read_report_status(state)
+        if not _session_should_continue(snapshot, report_status):
             sys.exit(
-                "error: session deadline already passed. register a new session with --add."
+                "error: session no longer requires autonomous execution. Let the current stop hook close it or register a new session after cleanup."
             )
 
         print("active")
@@ -1610,7 +1936,8 @@ def _status_json_payload(
     await_deadline = _await_user_deadline(state)
     waiting_for_user = bool(await_deadline is not None and now < await_deadline)
     report_status = _read_report_status(state)
-    closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
+    should_continue = _session_should_continue(snapshot, report_status)
+    closure_pending = not should_continue
     cancel_state = _cancel_request_state(state) or "none"
     cancel_requested_at = _parse_iso_datetime(state.get("cancel_requested_at"))
     cancel_pause_until = _cancel_pause_deadline(state)
@@ -1626,14 +1953,30 @@ def _status_json_payload(
     openclaw_binding = _read_openclaw_binding(state)
 
     lifecycle_state = "active"
-    if closure_pending:
+    if closure_pending and snapshot["dynamic"]:
+        lifecycle_state = "completion_marked_waiting_closure"
+    elif closure_pending:
         lifecycle_state = "deadline_reached_waiting_closure"
+
+    execution_owner = _read_execution_owner(state)
+    execution_owner_payload: dict[str, Any] | None = None
+    if execution_owner is not None:
+        execution_owner_payload = {
+            "kind": str(execution_owner.get("kind", "runner")),
+            "label": str(execution_owner.get("label", "runner")),
+            "state": _execution_owner_state(execution_owner, now),
+            "pid": _parse_positive_int(execution_owner.get("pid")),
+            "acquired_at": str(execution_owner.get("acquired_at", "")) or None,
+            "heartbeat_at": str(execution_owner.get("heartbeat_at", "")) or None,
+        }
 
     payload.update(
         {
             "ok": True,
-            "active": bool(snapshot["active"]),
+            "active": bool(should_continue),
             "dynamic": bool(snapshot["dynamic"]),
+            "should_continue": bool(should_continue),
+            "stop_allowed": not should_continue,
             "request": str(state.get("request", "")),
             "started_at": snapshot["started"].isoformat(),
             "deadline": snapshot["deadline"].isoformat()
@@ -1677,6 +2020,7 @@ def _status_json_payload(
             "required_log_checkpoints": _required_log_checkpoints(
                 snapshot["elapsed_seconds"]
             ),
+            "execution_owner": execution_owner_payload,
             "runtime_bindings": {"openclaw": openclaw_binding}
             if openclaw_binding is not None
             else None,
@@ -1715,10 +2059,12 @@ def cmd_status(*, json_output: bool = False) -> None:
         snapshot = _status_snapshot(state, now)
         log_count = _count_log_checkpoints(state)
         log_target = _required_log_checkpoints(snapshot["elapsed_seconds"])
+        report_status = _read_report_status(state)
+        should_continue = _session_should_continue(snapshot, report_status)
 
         if not json_output:
-            active_label = "active" if snapshot["active"] else "deadline reached"
-            color = GREEN if snapshot["active"] else RED
+            active_label = "active" if should_continue else "closure pending"
+            color = GREEN if should_continue else YELLOW
             _header(f"omni-autonomous-agent - {c(color, active_label)}")
 
             _row("Request", state["request"])
@@ -1733,8 +2079,7 @@ def cmd_status(*, json_output: bool = False) -> None:
                 _row("Time remaining", _fmt_remaining(snapshot["remaining_seconds"]))
 
             _row("User updates", str(state.get("update_policy", "milestones")))
-            report_status = _read_report_status(state)
-            closure_pending = bool(not snapshot["dynamic"] and not snapshot["active"])
+            closure_pending = not should_continue
             report_display = report_status
             if closure_pending and report_status not in {"COMPLETE", "PARTIAL"}:
                 report_display = f"{report_status} (closure pending)"
@@ -1742,7 +2087,12 @@ def cmd_status(*, json_output: bool = False) -> None:
             _row("Duration", state["duration_input"])
             _row("Report status", report_display)
             if closure_pending:
-                _row("Closure", c(YELLOW, "pending stop/cancel after fixed deadline"))
+                closure_reason = (
+                    "pending stop/cancel after report completion"
+                    if snapshot["dynamic"]
+                    else "pending stop/cancel after fixed deadline"
+                )
+                _row("Closure", c(YELLOW, closure_reason))
 
         await_deadline = _await_user_deadline(state)
         if await_deadline is not None:
@@ -1807,6 +2157,10 @@ def cmd_status(*, json_output: bool = False) -> None:
             denied_note = _decision_note_for_output(state.get("cancel_denied_note"))
             if denied_note:
                 _row("Decision note", denied_note)
+
+        execution_owner = _read_execution_owner(state)
+        if not json_output and execution_owner is not None:
+            _row("Execution owner", _execution_owner_summary(execution_owner, now))
 
         if json_output:
             print(json.dumps(_status_json_payload(state, None, now)))
@@ -2094,6 +2448,31 @@ def cmd_hook_stop() -> None:
             snapshot = _status_snapshot(state, now)
             report_status = _read_report_status(state)
             user_update_allowed = _user_update_allowed(state, snapshot, report_status)
+            caller_owner_token = _caller_owner_token()
+            if caller_owner_token:
+                owner = _read_execution_owner(state)
+                if owner is None:
+                    _emit_hook_payload(
+                        False,
+                        "Execution ownership is missing. Stop this runner and reclaim the session before continuing.",
+                        hook="stop",
+                        active=True,
+                        block=False,
+                        ownership_lost=True,
+                    )
+                    return
+                if owner.get("token") != caller_owner_token:
+                    _emit_hook_payload(
+                        False,
+                        "Another runner owns this session now. Stop this runner to avoid conflicting work.",
+                        hook="stop",
+                        active=True,
+                        block=False,
+                        ownership_lost=True,
+                        execution_owner_state=_execution_owner_state(owner, now),
+                        execution_owner_label=str(owner.get("label", "runner")),
+                    )
+                    return
 
             await_deadline = _await_user_deadline(state)
             if await_deadline is not None:

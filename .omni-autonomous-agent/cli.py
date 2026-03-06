@@ -14,12 +14,16 @@ from .session_manager import (
     cmd_cancel_accept,
     cmd_cancel_deny,
     cmd_cancel,
+    cmd_claim_execution_owner,
+    cmd_clear_stale_execution_owner,
     cmd_dummy,
     cmd_hook_precompact,
     cmd_hook_stop,
     cmd_log_event,
     cmd_record_openclaw_route,
+    cmd_release_execution_owner,
     cmd_revise_session,
+    cmd_heartbeat_execution_owner,
     cmd_require_active,
     cmd_status,
     cmd_user_responded,
@@ -82,6 +86,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     group.add_argument(
         "--record-openclaw-route",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--claim-execution-owner",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--heartbeat-execution-owner",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--release-execution-owner",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
+        "--clear-stale-execution-owner",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -185,6 +209,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--execution-owner-kind",
+        metavar="KIND",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--execution-owner-label",
+        metavar="LABEL",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--execution-owner-pid",
+        metavar="PID",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -258,6 +300,10 @@ def main() -> None:
         or args.user_responded
         or args.log_event
         or args.record_openclaw_route
+        or args.claim_execution_owner
+        or args.heartbeat_execution_owner
+        or args.release_execution_owner
+        or args.clear_stale_execution_owner
     ):
         maybe_auto_update()
 
@@ -346,6 +392,29 @@ def main() -> None:
             reply_from=args.openclaw_reply_from or "",
             account_id=args.openclaw_reply_account or "",
         )
+        return
+
+    owner_token = os.environ.get("OMNI_AGENT_OWNER_TOKEN", "")
+
+    if args.claim_execution_owner:
+        cmd_claim_execution_owner(
+            owner_token,
+            args.execution_owner_kind or "",
+            args.execution_owner_label or "",
+            args.execution_owner_pid or "",
+        )
+        return
+
+    if args.heartbeat_execution_owner:
+        cmd_heartbeat_execution_owner(owner_token)
+        return
+
+    if args.release_execution_owner:
+        cmd_release_execution_owner(owner_token)
+        return
+
+    if args.clear_stale_execution_owner:
+        cmd_clear_stale_execution_owner()
         return
 
     if args.dummy:

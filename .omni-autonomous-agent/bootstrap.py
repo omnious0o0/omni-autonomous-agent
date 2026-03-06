@@ -382,7 +382,7 @@ def _windows_pause_seconds_command() -> str:
     )
 
 
-def _windows_wrapper_script(command_line: str) -> str:
+def _windows_wrapper_script(command_line: str, owner_label: str) -> str:
     pause_command = _windows_pause_seconds_command()
     return (
         "@echo off\n"
@@ -391,19 +391,70 @@ def _windows_wrapper_script(command_line: str) -> str:
         "set \"OMNI_AGENT_PS_EXE=pwsh\"\n"
         "where pwsh >nul 2>&1 || set \"OMNI_AGENT_PS_EXE=powershell\"\n"
         "\n"
-        "omni-autonomous-agent --require-active >nul 2>&1\n"
-        "if errorlevel 1 (\n"
-        "  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.\n"
+        "set \"OMNI_OWNER_TOKEN=%OMNI_AGENT_OWNER_TOKEN%\"\n"
+        "if not defined OMNI_OWNER_TOKEN (\n"
+        "  for /f \"usebackq delims=\" %%I in (`\"!OMNI_AGENT_PS_EXE!\" -NoProfile -Command \"[guid]::NewGuid().ToString('N')\"`) do set \"OMNI_OWNER_TOKEN=%%I\"\n"
+        ")\n"
+        "if not defined OMNI_OWNER_TOKEN set \"OMNI_OWNER_TOKEN=%RANDOM%%RANDOM%%RANDOM%\"\n"
+        "set \"OMNI_AGENT_OWNER_TOKEN=!OMNI_OWNER_TOKEN!\"\n"
+        "set \"OMNI_OWNER_PID=\"\n"
+        "for /f \"usebackq delims=\" %%I in (`\"!OMNI_AGENT_PS_EXE!\" -NoProfile -Command \"$PID\"`) do set \"OMNI_OWNER_PID=%%I\"\n"
+        "set \"ACTIVE_FILE=%TEMP%\\omni-agent-active-%RANDOM%-%RANDOM%.log\"\n"
+        f"omni-autonomous-agent --claim-execution-owner --execution-owner-kind wrapper --execution-owner-label {owner_label} --execution-owner-pid !OMNI_OWNER_PID! >\"!ACTIVE_FILE!\" 2>&1\n"
+        "set CLAIM_STATUS=%ERRORLEVEL%\n"
+        "if not \"!CLAIM_STATUS!\"==\"0\" (\n"
+        "  findstr /c:\"no longer requires autonomous execution\" \"!ACTIVE_FILE!\" >nul 2>&1\n"
+        "  if not errorlevel 1 (\n"
+        "    set \"OMNI_AGENT_OWNER_TOKEN=\"\n"
+        "    set OMNI_AGENT_HOOK_WRAPPER=1\n"
+        "    omni-autonomous-agent --hook-stop >\"!ACTIVE_FILE!\" 2>&1\n"
+        "    set HOOK_STATUS=!ERRORLEVEL!\n"
+        "    set OMNI_AGENT_HOOK_WRAPPER=\n"
+        "    if exist \"!ACTIVE_FILE!\" type \"!ACTIVE_FILE!\" >&2\n"
+        "    del /q \"!ACTIVE_FILE!\" >nul 2>&1\n"
+        "    exit /b !HOOK_STATUS!\n"
+        "  )\n"
+        "  if exist \"!ACTIVE_FILE!\" type \"!ACTIVE_FILE!\" >&2\n"
+        "  del /q \"!ACTIVE_FILE!\" >nul 2>&1\n"
         "  exit /b 3\n"
         ")\n"
+        "del /q \"!ACTIVE_FILE!\" >nul 2>&1\n"
+        "set \"OMNI_FIRST_ITERATION=1\"\n"
         "\n"
         ":loop\n"
-        "omni-autonomous-agent --require-active >nul 2>&1\n"
-        "if errorlevel 1 exit /b 0\n"
+        "if \"!OMNI_FIRST_ITERATION!\"==\"1\" (\n"
+        "  set \"OMNI_FIRST_ITERATION=0\"\n"
+        ") else (\n"
+        "  set \"OWNER_FILE=%TEMP%\\omni-agent-owner-%RANDOM%-%RANDOM%.log\"\n"
+        "  omni-autonomous-agent --heartbeat-execution-owner >\"!OWNER_FILE!\" 2>&1\n"
+        "  if errorlevel 1 (\n"
+        "    set OWNER_STATUS=!ERRORLEVEL!\n"
+        "    set \"HOOK_FILE=%TEMP%\\omni-agent-hook-%RANDOM%-%RANDOM%.log\"\n"
+        "    set OMNI_AGENT_HOOK_WRAPPER=1\n"
+        "    omni-autonomous-agent --hook-stop >\"!HOOK_FILE!\" 2>&1\n"
+        "    set HOOK_STATUS=!ERRORLEVEL!\n"
+        "    set OMNI_AGENT_HOOK_WRAPPER=\n"
+        "    if \"!HOOK_STATUS!\"==\"4\" (\n"
+        "      if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
+        "      del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "      call :release_owner\n"
+        "      exit /b !HOOK_STATUS!\n"
+        "    )\n"
+        "    del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "    call :release_owner\n"
+        "    exit /b !OWNER_STATUS!\n"
+        "  )\n"
+        "  omni-autonomous-agent --require-active >nul 2>&1\n"
+        "  if errorlevel 1 (\n"
+        "    call :release_owner\n"
+        "    exit /b 0\n"
+        "  )\n"
+        ")\n"
         "\n"
         f"{command_line}\n"
         "set CMD_STATUS=%ERRORLEVEL%\n"
         "\n"
+        "del /q \"!OWNER_FILE!\" >nul 2>&1\n"
         "set \"HOOK_FILE=%TEMP%\\omni-agent-hook-%RANDOM%-%RANDOM%.log\"\n"
         "set OMNI_AGENT_HOOK_WRAPPER=1\n"
         "omni-autonomous-agent --hook-stop >\"!HOOK_FILE!\" 2>&1\n"
@@ -424,56 +475,122 @@ def _windows_wrapper_script(command_line: str) -> str:
         "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
         "  if not defined PAUSE_SECONDS (\n"
         "    >&2 echo [omni] hook-stop pause payload missing pause_then_resume_seconds.\n"
+        "    call :release_owner\n"
         "    exit /b !HOOK_STATUS!\n"
         "  )\n"
         "  timeout /t !PAUSE_SECONDS! /nobreak >nul\n"
         "  omni-autonomous-agent --require-active >nul 2>&1\n"
-        "  if errorlevel 1 exit /b !CMD_STATUS!\n"
+        "  if errorlevel 1 (\n"
+        "    call :release_owner\n"
+        "    exit /b !CMD_STATUS!\n"
+        "  )\n"
         "  goto loop\n"
         ")\n"
         "if \"!HOOK_STATUS!\"==\"4\" (\n"
         "  if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
         "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  call :release_owner\n"
         "  exit /b !HOOK_STATUS!\n"
         ")\n"
         "if \"!HOOK_STATUS!\"==\"0\" (\n"
         "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  call :release_owner\n"
         "  exit /b !CMD_STATUS!\n"
         ")\n"
         "\n"
         "if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
         "del /q \"!HOOK_FILE!\" >nul 2>&1\n"
         ">&2 echo [omni] hook-stop failed with code !HOOK_STATUS!.\n"
+        "call :release_owner\n"
         "exit /b !HOOK_STATUS!\n"
+        "\n"
+        ":release_owner\n"
+        "omni-autonomous-agent --release-execution-owner >nul 2>&1\n"
+        "exit /b 0\n"
     )
 
 
-def _bash_wrapper_script(command_line: str) -> str:
+def _bash_wrapper_script(command_line: str, owner_label: str) -> str:
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "\n"
         + _bash_pause_seconds_helper()
         + "\n"
-        "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
-        "  printf '[omni] no active session. run omni-autonomous-agent --add first.\\n' >&2\n"
+        'omni_owner_token="${OMNI_AGENT_OWNER_TOKEN:-}"\n'
+        'if [[ -z "$omni_owner_token" ]]; then\n'
+        "  if command -v python3 >/dev/null 2>&1; then\n"
+        '    omni_owner_token="$(python3 -c \'import uuid; print(uuid.uuid4().hex)\')"\n'
+        "  else\n"
+        '    omni_owner_token="$$-$(date +%s)"\n'
+        "  fi\n"
+        "fi\n"
+        'export OMNI_AGENT_OWNER_TOKEN="$omni_owner_token"\n'
+        "cleanup_owner() {\n"
+        "  omni-autonomous-agent --release-execution-owner >/dev/null 2>&1 || true\n"
+        "}\n"
+        "run_hook_stop() {\n"
+        "  set +e\n"
+        '  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 omni-autonomous-agent --hook-stop 2>&1)"\n'
+        "  hook_status=$?\n"
+        "  set -e\n"
+        "}\n"
+        "run_hook_stop_unowned() {\n"
+        "  set +e\n"
+        '  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 OMNI_AGENT_OWNER_TOKEN= omni-autonomous-agent --hook-stop 2>&1)"\n'
+        "  hook_status=$?\n"
+        "  set -e\n"
+        "}\n"
+        "set +e\n"
+        f'claim_output="$(omni-autonomous-agent --claim-execution-owner --execution-owner-kind wrapper --execution-owner-label {owner_label} --execution-owner-pid "$$" 2>&1)"\n'
+        "claim_status=$?\n"
+        "set -e\n"
+        'if [[ "$claim_status" -ne 0 ]]; then\n'
+        '  if [[ "$claim_output" == *"no longer requires autonomous execution"* ]]; then\n'
+        "    run_hook_stop_unowned\n"
+        '    if [[ -n "$hook_output" ]]; then\n'
+        '      printf "%s\\n" "$hook_output" >&2\n'
+        "    fi\n"
+        '    exit "$hook_status"\n'
+        "  fi\n"
+        '  if [[ -n "$claim_output" ]]; then\n'
+        '    printf "%s\\n" "$claim_output" >&2\n'
+        "  else\n"
+        "    printf '[omni] no active session. run omni-autonomous-agent --add first.\\n' >&2\n"
+        "  fi\n"
         "  exit 3\n"
         "fi\n"
+        "trap cleanup_owner EXIT\n"
+        "omni_first_loop=1\n"
         "\n"
         "while true; do\n"
-        "  if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
-        "    exit 0\n"
+        '  if [[ "$omni_first_loop" -eq 0 ]]; then\n'
+        "    set +e\n"
+        "    omni-autonomous-agent --heartbeat-execution-owner >/dev/null 2>&1\n"
+        "    owner_status=$?\n"
+        "    set -e\n"
+        '    if [[ "$owner_status" -ne 0 ]]; then\n'
+        "      run_hook_stop\n"
+        '      if [[ "$hook_status" -eq 4 ]]; then\n'
+        '        if [[ -n "$hook_output" ]]; then\n'
+        '          printf "%s\\n" "$hook_output" >&2\n'
+        "        fi\n"
+        '        exit "$hook_status"\n'
+        "      fi\n"
+        '      exit "$owner_status"\n'
+        "    fi\n"
+        "    if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
+        "      exit 0\n"
+        "    fi\n"
         "  fi\n"
+        "  omni_first_loop=0\n"
         "\n"
         "  set +e\n"
         f"  {command_line}\n"
         "  cmd_status=$?\n"
         "  set -e\n"
         "\n"
-        "  set +e\n"
-        '  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 omni-autonomous-agent --hook-stop 2>&1)"\n'
-        "  hook_status=$?\n"
-        "  set -e\n"
+        "  run_hook_stop\n"
         "\n"
         '  if [[ "$hook_status" -eq 2 ]]; then\n'
         '    if [[ -n "$hook_output" ]]; then\n'
@@ -519,14 +636,14 @@ def _bash_wrapper_script(command_line: str) -> str:
 
 def _universal_wrapper_script() -> str:
     if _is_windows():
-        return _windows_wrapper_script("%*")
-    return _bash_wrapper_script('"$@"')
+        return _windows_wrapper_script("%*", "generic-wrapper")
+    return _bash_wrapper_script('"$@"', "generic-wrapper")
 
 
 def _specific_wrapper_script(agent_command: str) -> str:
     if _is_windows():
-        return _windows_wrapper_script(f"{agent_command} %*")
-    return _bash_wrapper_script(f'{agent_command} "$@"')
+        return _windows_wrapper_script(f"{agent_command} %*", agent_command)
+    return _bash_wrapper_script(f'{agent_command} "$@"', agent_command)
 
 
 def _configure_universal_wrapper() -> tuple[bool, Path]:
@@ -625,6 +742,41 @@ def _has_cli(command: str) -> bool:
     return any(candidate.exists() for candidate in _cli_candidate_paths(command))
 
 
+def _cli_is_current_env_local(command: str) -> bool:
+    resolved = shutil.which(command)
+    if not resolved:
+        return False
+
+    resolved_path = Path(resolved).expanduser().resolve(strict=False)
+    if _is_windows():
+        system_roots = [
+            Path("C:/Windows"),
+            Path("C:/Program Files"),
+            Path("C:/Program Files (x86)"),
+        ]
+    else:
+        system_roots = [Path("/usr/bin"), Path("/usr/local/bin"), Path("/bin")]
+
+    for root in system_roots:
+        if resolved_path == root or root in resolved_path.parents:
+            return False
+
+    current_home = Path.home().expanduser().resolve(strict=False)
+    if resolved_path == current_home or current_home in resolved_path.parents:
+        return True
+
+    path_entries = [
+        Path(entry).expanduser().resolve(strict=False)
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry.strip()
+    ]
+    if not path_entries:
+        return False
+
+    first_entry = path_entries[0]
+    return resolved_path == first_entry or first_entry in resolved_path.parents
+
+
 def _openclaw_hook_md() -> str:
     return """---
 name: omni-recovery
@@ -653,6 +805,8 @@ import { spawn, spawnSync } from 'child_process';
 
 type StatusPayload = {
   active?: boolean;
+  should_continue?: boolean;
+  stop_allowed?: boolean;
   waiting_for_user?: boolean;
   cancel_request_state?: string;
   request?: string;
@@ -660,9 +814,19 @@ type StatusPayload = {
   deadline?: string | null;
   report_status?: string;
   started_at?: string;
+  execution_owner?: ExecutionOwnerPayload | null;
   runtime_bindings?: {
     openclaw?: OpenclawBinding;
   } | null;
+};
+
+type ExecutionOwnerPayload = {
+  kind?: string;
+  label?: string;
+  state?: string;
+  pid?: number | null;
+  acquired_at?: string | null;
+  heartbeat_at?: string | null;
 };
 
 type OpenclawBinding = {
@@ -904,6 +1068,27 @@ const readPersistedOpenclawBinding = (status: StatusPayload | null): OpenclawBin
   return normalized;
 };
 
+const readExecutionOwner = (status: StatusPayload | null): ExecutionOwnerPayload | null => {
+  const owner = status?.execution_owner;
+  if (!owner || typeof owner !== 'object' || Array.isArray(owner)) return null;
+  return owner as ExecutionOwnerPayload;
+};
+
+const activeWrapperOwner = (status: StatusPayload | null): ExecutionOwnerPayload | null => {
+  const owner = readExecutionOwner(status);
+  if (!owner) return null;
+  if (readCandidateString(owner.state) !== 'active') return null;
+  if (readCandidateString(owner.kind) !== 'wrapper') return null;
+  return owner;
+};
+
+const staleExecutionOwner = (status: StatusPayload | null): ExecutionOwnerPayload | null => {
+  const owner = readExecutionOwner(status);
+  if (!owner) return null;
+  if (readCandidateString(owner.state) !== 'stale') return null;
+  return owner;
+};
+
 const readJsonObject = (path: string): Record<string, unknown> | null => {
   try {
     const raw = readFileSync(path, 'utf-8');
@@ -961,10 +1146,9 @@ const readSessionsFromCli = (
     env: runtimeEnv,
   });
 
-  if (typeof result.status === 'number' && result.status !== 0) {
-    return null;
-  }
-  if (result.error) {
+  if (typeof result.status === 'number') {
+    if (result.status !== 0) return null;
+  } else if (result.error) {
     return null;
   }
 
@@ -1213,6 +1397,9 @@ const spawnWithShimFallback = (
   options: Parameters<typeof spawnSync>[2],
 ) => {
   const direct = spawnSync(command, args, options);
+  if (direct.status === 0) {
+    return direct;
+  }
   const errorCode =
     direct.error && typeof direct.error === 'object' && 'code' in direct.error
       ? String((direct.error as NodeJS.ErrnoException).code ?? '')
@@ -1239,6 +1426,7 @@ const runOaa = (args: string[]) => {
     return {
       ok: result.status === 0,
       output,
+      code: result.status,
     };
   }
 
@@ -1247,12 +1435,14 @@ const runOaa = (args: string[]) => {
     return {
       ok: false,
       output: [output, reason].filter(Boolean).join('\\n').trim(),
+      code: result.status ?? -1,
     };
   }
 
   return {
     ok: result.status === 0,
     output,
+    code: result.status ?? 0,
   };
 };
 
@@ -1563,11 +1753,19 @@ const eventMatchesActiveRoute = (
 ): boolean => {
   const eventSessionKey = readEventSessionKey(event);
   if (eventSessionKey) {
-    if (route.sessionKey === eventSessionKey) return true;
+    const eventProvidesDeliveryMetadata =
+      eventProvidesRecoverableDeliveryContext(event);
+    if (route.sessionKey === eventSessionKey) {
+      return routeHasDeliveryMetadata(route) || eventProvidesDeliveryMetadata;
+    }
 
     const persistedBinding = readPersistedOpenclawBinding(status);
-    if (readCandidateString(persistedBinding?.session_key) === eventSessionKey) {
-      return true;
+    const persistedRoute = routeFromBinding(persistedBinding, targetAgentId);
+    if (
+      readCandidateString(persistedBinding?.session_key) === eventSessionKey &&
+      persistedRoute
+    ) {
+      return routeHasDeliveryMetadata(persistedRoute) || eventProvidesDeliveryMetadata;
     }
 
     const sessions = loadOpenclawSessions(targetAgentId);
@@ -1580,10 +1778,14 @@ const eventMatchesActiveRoute = (
 
     const persistedSessionId = readCandidateString(persistedBinding?.session_id);
     if (eventRoute.sessionId === route.sessionId) {
-      return true;
+      return routeHasDeliveryMetadata(eventRoute)
+        ? eventEnvelopeMatchesRoute(eventRoute, event)
+        : eventProvidesDeliveryMetadata;
     }
     if (persistedSessionId && eventRoute.sessionId === persistedSessionId) {
-      return true;
+      return routeHasDeliveryMetadata(eventRoute)
+        ? eventEnvelopeMatchesRoute(eventRoute, event)
+        : eventProvidesDeliveryMetadata;
     }
 
     return false;
@@ -1722,6 +1924,14 @@ const readInboundMessageId = (event: any): string =>
     event?.id,
   );
 
+const eventProvidesRecoverableDeliveryContext = (event: any): boolean => {
+  const channel = readEventChannel(event);
+  const from = readInboundSender(event);
+  const to = readInboundRecipient(event);
+  const accountId = readEventAccountId(event);
+  return Boolean(channel && from && (to || accountId));
+};
+
 const readEventDirection = (event: any): string =>
   readCandidateString(
     event?.context?.direction,
@@ -1834,6 +2044,9 @@ const routeAllowsInboundSender = (route: SessionRoute, from: string): boolean =>
   if (allowedSenders.length === 0) return false;
   return allowedSenders.includes(normalizedFrom);
 };
+
+const routeHasDeliveryMetadata = (route: SessionRoute): boolean =>
+  Boolean(route.channel || route.to || route.from || route.accountId);
 
 const eventEnvelopeMatchesRoute = (
   route: SessionRoute,
@@ -2111,6 +2324,20 @@ const queueResumePing = (status: StatusPayload, event: any) => {
   }
 
   const effectiveStatus = latestStatus ?? status;
+  const busyOwner = activeWrapperOwner(effectiveStatus);
+  if (busyOwner) {
+    recordHookTelemetry(
+      'openclaw.startup.owner_busy_skip',
+      `owner=${shortFingerprint(readCandidateString(busyOwner.label))}`,
+    );
+    return false;
+  }
+  if (staleExecutionOwner(effectiveStatus)) {
+    const cleared = runOaa(['--clear-stale-execution-owner']);
+    if (cleared.ok) {
+      recordHookTelemetry('openclaw.startup.stale_owner_cleared', 'status=ok');
+    }
+  }
 
   const dedupeKey = startupWakeDedupeKey(effectiveStatus, route);
   const dedupe = rememberStartupWake(dedupeKey);
@@ -2182,6 +2409,21 @@ const queueInboundUserMessage = (
   targetAgentId: string,
   route: SessionRoute,
 ) => {
+  const busyOwner = activeWrapperOwner(status);
+  if (busyOwner) {
+    recordHookTelemetry(
+      'openclaw.message.owner_busy_skip',
+      `owner=${shortFingerprint(readCandidateString(busyOwner.label))}`,
+    );
+    return false;
+  }
+  if (staleExecutionOwner(status)) {
+    const cleared = runOaa(['--clear-stale-execution-owner']);
+    if (cleared.ok) {
+      recordHookTelemetry('openclaw.message.stale_owner_cleared', 'status=ok');
+    }
+  }
+
   if (!route) {
     console.warn('[omni-recovery] inbound forward skipped: unresolved session route');
     recordHookTelemetry(
@@ -2309,7 +2551,12 @@ const handler = async (event: any) => {
     const targetAgentId = resolveTargetAgentId(event, status);
     if (!targetAgentId) return;
 
-    const route = resolveSessionRoute(event, targetAgentId, status);
+    const route = resolveSessionRoute(
+      event,
+      targetAgentId,
+      status,
+      { includeEventDelivery: false },
+    );
     if (!route) return;
     if (!eventMatchesActiveRoute(event, targetAgentId, status, route)) {
       recordHookTelemetry(
@@ -2318,7 +2565,8 @@ const handler = async (event: any) => {
       );
       return;
     }
-    persistOpenclawRoute(targetAgentId, route);
+    const effectiveRoute = mergeEventDeliveryContext(route, event);
+    persistOpenclawRoute(targetAgentId, effectiveRoute);
 
     if (raw) {
       runOaa(['--user-responded', '--response-note', note]);
@@ -2330,7 +2578,7 @@ const handler = async (event: any) => {
 
     if (!raw) return;
     const latestStatus = readStatusPayload() ?? status;
-    queueInboundUserMessage(latestStatus, event, raw, targetAgentId, route);
+    queueInboundUserMessage(latestStatus, event, raw, targetAgentId, effectiveRoute);
     return;
   }
 
@@ -2391,10 +2639,11 @@ def _configure_openclaw() -> tuple[bool, Path]:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
             )
         except subprocess.TimeoutExpired:
-            return False, f"{command_text}: timed out after 30 seconds"
+            return False, f"{command_text}: timed out after 5 seconds"
 
         if result.returncode == 0:
             return True, (result.stdout or "").strip()
@@ -2521,6 +2770,9 @@ def cmd_bootstrap() -> None:
     _row("Detected AGENT", env_agent or "(not set)")
 
     env_agent_token = env_agent.lower().split()[0] if env_agent.strip() else ""
+    detected_hook_targets = [
+        provider for provider, available in hook_capable.items() if available
+    ]
     forced_wrappers = _forced_wrapper_names()
     wrapper_targets: dict[str, str] = {}
     skipped_wrappers: list[str] = []
@@ -2535,27 +2787,61 @@ def cmd_bootstrap() -> None:
         ):
             wrapper_targets[wrapper_name] = wrapper_cmd
 
+    explicit_wrapper_targets: set[str] = set(forced_wrappers)
+    if env_agent_token and env_agent_token not in hook_capable:
+        explicit_wrapper_targets.add(_sanitize_wrapper_name(env_agent_token))
+    has_explicit_wrapper_targets = any(
+        wrapper_name in explicit_wrapper_targets for wrapper_name in wrapper_targets
+    )
+
     configured: list[str] = []
     warnings: list[str] = []
     failed_targets: list[str] = []
+    critical_failed_targets: list[str] = []
 
-    if hook_capable["claude"]:
+    def _hook_failure_is_critical(provider: str) -> bool:
+        if env_agent_token == provider:
+            return True
+        if has_explicit_wrapper_targets:
+            return False
+        if _cli_is_current_env_local(provider):
+            return True
+        return not wrapper_targets and detected_hook_targets == [provider]
+
+    def _should_configure_hook_provider(provider: str) -> bool:
+        if env_agent_token == provider:
+            return True
+        if has_explicit_wrapper_targets:
+            return False
+        if _cli_is_current_env_local(provider):
+            return True
+        return not wrapper_targets
+
+    if hook_capable["claude"] and _should_configure_hook_provider("claude"):
         if not _safe_apply("Claude hooks", _configure_claude, configured, warnings):
             failed_targets.append("Claude hooks")
+            if _hook_failure_is_critical("claude"):
+                critical_failed_targets.append("Claude hooks")
 
-    if hook_capable["gemini"]:
+    if hook_capable["gemini"] and _should_configure_hook_provider("gemini"):
         if not _safe_apply("Gemini hooks", _configure_gemini, configured, warnings):
             failed_targets.append("Gemini hooks")
+            if _hook_failure_is_critical("gemini"):
+                critical_failed_targets.append("Gemini hooks")
 
-    if hook_capable["opencode"]:
+    if hook_capable["opencode"] and _should_configure_hook_provider("opencode"):
         if not _safe_apply(
             "OpenCode plugin", _configure_opencode, configured, warnings
         ):
             failed_targets.append("OpenCode plugin")
+            if _hook_failure_is_critical("opencode"):
+                critical_failed_targets.append("OpenCode plugin")
 
-    if hook_capable["openclaw"]:
+    if hook_capable["openclaw"] and _should_configure_hook_provider("openclaw"):
         if not _safe_apply("OpenClaw hooks", _configure_openclaw, configured, warnings):
             failed_targets.append("OpenClaw hooks")
+            if _hook_failure_is_critical("openclaw"):
+                critical_failed_targets.append("OpenClaw hooks")
 
     for wrapper_name, wrapper_cmd in wrapper_targets.items():
         if not _safe_apply(
@@ -2567,11 +2853,13 @@ def cmd_bootstrap() -> None:
             warnings,
         ):
             failed_targets.append(f"{wrapper_name} wrapper")
+            critical_failed_targets.append(f"{wrapper_name} wrapper")
 
     if not _safe_apply(
         "Universal wrapper", _configure_universal_wrapper, configured, warnings
     ):
         failed_targets.append("Universal wrapper")
+        critical_failed_targets.append("Universal wrapper")
 
     if not any(hook_capable.values()) and not wrapper_targets and not env_agent:
         _row("Warning", c(YELLOW, "No supported native-hook agent binary detected"))
@@ -2588,5 +2876,5 @@ def cmd_bootstrap() -> None:
     _row("Next", "Run 'omni-autonomous-agent --status' to verify CLI availability")
     print(SEP)
 
-    if failed_targets:
+    if critical_failed_targets:
         raise SystemExit(2)

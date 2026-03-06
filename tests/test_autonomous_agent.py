@@ -3411,6 +3411,20 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         for snippet in required_snippets:
             self.assertIn(snippet, text)
 
+    def test_skill_keeps_readme_install_and_resume_contract(self) -> None:
+        text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required_snippets = [
+            "Don't worry about setup, your agent takes care of it.",
+            "Treat `install-help.md` as the canonical hook setup playbook.",
+            "Please install `https://github.com/omnious0o0/omni-autonomous-agent`.",
+            "please only report back when everything's fully installed and verified.",
+            "Otherwise it won't stop. Even if it goes offline, it will immediately resume when it comes back online.",
+            "waits for approval or denial",
+            'And none of the "I will now do..." and then doing nothing. That\'s fixed too.',
+        ]
+        for snippet in required_snippets:
+            self.assertIn(snippet, text)
+
     def test_readme_and_skill_share_core_autonomous_examples(self) -> None:
         readme_text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         skill_text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")

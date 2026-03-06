@@ -18,6 +18,8 @@ OAA is built for long sessions. Do not treat long duration as a special case or 
 
 ## One-time install
 
+Don't worry about setup, your agent takes care of it.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omni-autonomous-agent/install.sh | bash
 ```
@@ -29,6 +31,13 @@ irm https://raw.githubusercontent.com/omnious0o0/omni-autonomous-agent/main/.omn
 ```
 
 After install or update, read `install-help.md`, then verify the environment with the documented self-check and recovery flow before you claim setup is complete.
+Treat `install-help.md` as the canonical hook setup playbook.
+
+If the user asks you to install OAA from the repo, follow this contract:
+
+```text
+Please install `https://github.com/omnious0o0/omni-autonomous-agent`. Follow all instructions, do not ask questions or give progress updates, please only report back when everything's fully installed and verified. Make sure to follow `install-help.md`.
+```
 
 ### Self-Check (DO NOT SKIP)
 
@@ -54,6 +63,7 @@ If bootstrap or hooks fail, follow the "Recovery strategy" sequence and the self
 - Use wrappers only for the **agent process** when bootstrap requires automatic stop-gate enforcement around that agent binary.
 - Be honest about proof. If something is only configured or callable, do not claim it is live-verified. If a platform/provider was not exercised live, report simulated coverage only.
 - If you compact or recover after a disconnect, continue from the existing sandbox and session state instead of restarting the task from scratch.
+- Otherwise it won't stop. Even if it goes offline, it will immediately resume when it comes back online.
 
 ## Get started
 
@@ -152,6 +162,7 @@ When you notice stop conditions are near, start concluding your work and prepare
 - Verify outputs before claiming completion. Long autonomous time is for better work, not for rushing or guessing.
 - Treat stop-gate and precompact prompts as continuation controls unless stop is actually allowed.
 - Resume after temporary disconnects or provider restarts as soon as the agent is callable again. A temporary disconnect or provider restart is not task completion.
+- Once a stop request is sent it becomes idle for 30 seconds and waits for approval or denial. If you do not get approval within 30 seconds, or the stop is denied, resume autonomous work.
 
 ### What you MUST NOT do
 | Forbidden | Why |
@@ -246,4 +257,5 @@ Be completely honest and transparent.
 - Scope management is your responsibility. If the task is larger than the time budget, prioritize the highest-value work and note what you couldn't finish in your report.
 - Wrapper note: `omni-agent-wrap` and `omni-wrap-*` enforce `--require-active` and `--hook-stop` automatically. Do not replace this with simple EXIT traps.
 - OpenClaw note: hooks are event-driven (startup/inbound), not idle timers. If the session looks idle, send a message or restart gateway to trigger recovery hooks.
+- And none of the "I will now do..." and then doing nothing. That's fixed too.
 - If you find a bug or integration issue, report it at `https://github.com/omnious0o0/omni-autonomous-agent/issues` with reproduction steps.

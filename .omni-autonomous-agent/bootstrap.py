@@ -11,7 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .constants import BOLD, DIM, GREEN, SEP, YELLOW, c
+from .constants import BOLD, DIM, SEP, YELLOW, c
 
 
 KNOWN_WRAPPER_AGENTS: dict[str, str] = {
@@ -27,6 +27,7 @@ KNOWN_WRAPPER_AGENTS: dict[str, str] = {
 }
 
 OPENCLAW_PLUGIN_ID = "omni-autonomous-agent"
+_JSON_RECOVERY_NOTICES: list[str] = []
 
 
 def _is_windows() -> bool:
@@ -100,16 +101,26 @@ def _load_json(path: Path) -> dict[str, Any]:
         invalid_backup = path.with_name(f"{path.name}.invalid.{token}")
         try:
             path.rename(invalid_backup)
+            _JSON_RECOVERY_NOTICES.append(
+                f"{path.name} was invalid JSON and was quarantined to {invalid_backup.name}"
+            )
         except OSError:
-            pass
+            _JSON_RECOVERY_NOTICES.append(
+                f"{path.name} was invalid JSON and could not be quarantined cleanly"
+            )
         return {}
     if not isinstance(loaded, dict):
         token = uuid.uuid4().hex
         invalid_backup = path.with_name(f"{path.name}.invalid.{token}")
         try:
             path.rename(invalid_backup)
+            _JSON_RECOVERY_NOTICES.append(
+                f"{path.name} had an invalid root type and was quarantined to {invalid_backup.name}"
+            )
         except OSError:
-            pass
+            _JSON_RECOVERY_NOTICES.append(
+                f"{path.name} had an invalid root type and could not be quarantined cleanly"
+            )
         return {}
     return loaded
 
@@ -117,10 +128,6 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2) + "\n"
-    if path.exists():
-        backup = path.with_suffix(path.suffix + ".bak")
-        shutil.copy2(path, backup)
-
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", delete=False, dir=str(path.parent)
     ) as temp_file:
@@ -316,146 +323,138 @@ def _configure_opencode() -> tuple[bool, Path]:
     return changed, plugin_path
 
 
-def _universal_wrapper_script() -> str:
-    if _is_windows():
-        return """@echo off
-setlocal
+def _drain_json_recovery_notices() -> list[str]:
+    notices = list(_JSON_RECOVERY_NOTICES)
+    _JSON_RECOVERY_NOTICES.clear()
+    return notices
 
-omni-autonomous-agent --require-active >nul 2>&1
-if errorlevel 1 (
-  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.
-  exit /b 3
-)
 
-:loop
-omni-autonomous-agent --require-active >nul 2>&1
-if errorlevel 1 exit /b 0
-
-%*
-set CMD_STATUS=%ERRORLEVEL%
-
-set OMNI_AGENT_HOOK_WRAPPER=1
-omni-autonomous-agent --hook-stop
-set HOOK_STATUS=%ERRORLEVEL%
-set OMNI_AGENT_HOOK_WRAPPER=
-
-if "%HOOK_STATUS%"=="2" goto loop
-if "%HOOK_STATUS%"=="5" (
-  timeout /t 30 /nobreak >nul
-  omni-autonomous-agent --require-active >nul 2>&1
-  if errorlevel 1 exit /b %CMD_STATUS%
-  goto loop
-)
-if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%
-if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%
-
->&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.
-exit /b %HOOK_STATUS%
-"""
-
-    return """#!/usr/bin/env bash
-set -euo pipefail
-
-if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
-  printf '[omni] no active session. run omni-autonomous-agent --add first.\n' >&2
-  exit 3
-fi
-
-while true; do
-  if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
-    exit 0
+def _bash_pause_seconds_helper() -> str:
+    return """omni_pause_seconds() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
   fi
 
-  set +e
-  "$@"
-  cmd_status=$?
-  set -e
-
-  set +e
-  hook_output="$(OMNI_AGENT_HOOK_WRAPPER=1 omni-autonomous-agent --hook-stop 2>&1)"
-  hook_status=$?
-  set -e
-
-  if [[ "$hook_status" -eq 2 ]]; then
-    if [[ -n "$hook_output" ]]; then
-      printf '%s\n' "$hook_output" >&2
-    fi
-    continue
-  fi
-
-  if [[ "$hook_status" -eq 5 ]]; then
-    if [[ -n "$hook_output" ]]; then
-      printf '%s\n' "$hook_output" >&2
-    fi
-    sleep 30
-    if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then
-      exit "$cmd_status"
-    fi
-    continue
-  fi
-
-  if [[ "$hook_status" -eq 4 ]]; then
-    if [[ -n "$hook_output" ]]; then
-      printf '%s\n' "$hook_output" >&2
-    fi
-    exit "$hook_status"
-  fi
-
-  if [[ "$hook_status" -eq 0 ]]; then
-    exit "$cmd_status"
-  fi
-
-  if [[ -n "$hook_output" ]]; then
-    printf '%s\n' "$hook_output" >&2
-  fi
-  printf '[omni] hook-stop failed with code %s.\n' "$hook_status" >&2
-  exit "$hook_status"
-done
+  python3 -c 'import json, math, sys
+lines = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+for line in reversed(lines):
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    value = payload.get("pause_then_resume_seconds")
+    if isinstance(value, str):
+        if not value.isdigit():
+            continue
+        parsed = int(value)
+    elif isinstance(value, (int, float)):
+        parsed = math.ceil(value)
+    else:
+        continue
+    if parsed > 0:
+        print(parsed)
+        raise SystemExit(0)
+raise SystemExit(1)'
+}
 """
 
 
-def _specific_wrapper_script(agent_command: str) -> str:
-    if _is_windows():
-        return (
-            "@echo off\n"
-            "setlocal\n"
-            "\n"
-            "omni-autonomous-agent --require-active >nul 2>&1\n"
-            "if errorlevel 1 (\n"
-            "  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.\n"
-            "  exit /b 3\n"
-            ")\n"
-            "\n"
-            ":loop\n"
-            "omni-autonomous-agent --require-active >nul 2>&1\n"
-            "if errorlevel 1 exit /b 0\n"
-            "\n"
-            f"{agent_command} %*\n"
-            "set CMD_STATUS=%ERRORLEVEL%\n"
-            "\n"
-            "set OMNI_AGENT_HOOK_WRAPPER=1\n"
-            "omni-autonomous-agent --hook-stop\n"
-            "set HOOK_STATUS=%ERRORLEVEL%\n"
-            "set OMNI_AGENT_HOOK_WRAPPER=\n"
-            "\n"
-            'if "%HOOK_STATUS%"=="2" goto loop\n'
-            'if "%HOOK_STATUS%"=="5" (\n'
-            "  timeout /t 30 /nobreak >nul\n"
-            "  omni-autonomous-agent --require-active >nul 2>&1\n"
-            "  if errorlevel 1 exit /b %CMD_STATUS%\n"
-            "  goto loop\n"
-            ")\n"
-            'if "%HOOK_STATUS%"=="4" exit /b %HOOK_STATUS%\n'
-            'if "%HOOK_STATUS%"=="0" exit /b %CMD_STATUS%\n'
-            "\n"
-            ">&2 echo [omni] hook-stop failed with code %HOOK_STATUS%.\n"
-            "exit /b %HOOK_STATUS%\n"
-        )
+def _windows_pause_seconds_command() -> str:
+    return (
+        "$raw = Get-Content -Raw -LiteralPath $env:OMNI_AGENT_HOOK_FILE -ErrorAction Stop; "
+        "$lines = @($raw -split '\\r?\\n' | Where-Object { $_.Trim() }); "
+        "[array]::Reverse($lines); "
+        "foreach ($line in $lines) { "
+        "  try { "
+        "    $payload = $line | ConvertFrom-Json -ErrorAction Stop; "
+        "    $value = $payload.pause_then_resume_seconds; "
+        "    if ($null -eq $value) { continue }; "
+        "    $parsed = 0; "
+        "    if ($value -is [string]) { "
+        "      if ([int]::TryParse($value, [ref]$parsed) -and $parsed -gt 0) { Write-Output $parsed; exit 0 }; "
+        "      continue "
+        "    }; "
+        "    $parsed = [int][Math]::Ceiling([double]$value); "
+        "    if ($parsed -gt 0) { Write-Output $parsed; exit 0 } "
+        "  } catch {} "
+        "}; "
+        "exit 1"
+    )
 
+
+def _windows_wrapper_script(command_line: str) -> str:
+    pause_command = _windows_pause_seconds_command()
+    return (
+        "@echo off\n"
+        "setlocal EnableExtensions EnableDelayedExpansion\n"
+        "\n"
+        "set \"OMNI_AGENT_PS_EXE=pwsh\"\n"
+        "where pwsh >nul 2>&1 || set \"OMNI_AGENT_PS_EXE=powershell\"\n"
+        "\n"
+        "omni-autonomous-agent --require-active >nul 2>&1\n"
+        "if errorlevel 1 (\n"
+        "  >&2 echo [omni] no active session. run omni-autonomous-agent --add first.\n"
+        "  exit /b 3\n"
+        ")\n"
+        "\n"
+        ":loop\n"
+        "omni-autonomous-agent --require-active >nul 2>&1\n"
+        "if errorlevel 1 exit /b 0\n"
+        "\n"
+        f"{command_line}\n"
+        "set CMD_STATUS=%ERRORLEVEL%\n"
+        "\n"
+        "set \"HOOK_FILE=%TEMP%\\omni-agent-hook-%RANDOM%-%RANDOM%.log\"\n"
+        "set OMNI_AGENT_HOOK_WRAPPER=1\n"
+        "omni-autonomous-agent --hook-stop >\"!HOOK_FILE!\" 2>&1\n"
+        "set HOOK_STATUS=%ERRORLEVEL%\n"
+        "set OMNI_AGENT_HOOK_WRAPPER=\n"
+        "\n"
+        "if \"!HOOK_STATUS!\"==\"2\" (\n"
+        "  if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
+        "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  goto loop\n"
+        ")\n"
+        "if \"!HOOK_STATUS!\"==\"5\" (\n"
+        "  if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
+        "  set \"OMNI_AGENT_HOOK_FILE=!HOOK_FILE!\"\n"
+        "  set \"PAUSE_SECONDS=\"\n"
+        f"  for /f \"usebackq delims=\" %%I in (`\"!OMNI_AGENT_PS_EXE!\" -NoProfile -Command \"{pause_command}\"`) do set \"PAUSE_SECONDS=%%I\"\n"
+        "  set \"OMNI_AGENT_HOOK_FILE=\"\n"
+        "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  if not defined PAUSE_SECONDS (\n"
+        "    >&2 echo [omni] hook-stop pause payload missing pause_then_resume_seconds.\n"
+        "    exit /b !HOOK_STATUS!\n"
+        "  )\n"
+        "  timeout /t !PAUSE_SECONDS! /nobreak >nul\n"
+        "  omni-autonomous-agent --require-active >nul 2>&1\n"
+        "  if errorlevel 1 exit /b !CMD_STATUS!\n"
+        "  goto loop\n"
+        ")\n"
+        "if \"!HOOK_STATUS!\"==\"4\" (\n"
+        "  if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
+        "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  exit /b !HOOK_STATUS!\n"
+        ")\n"
+        "if \"!HOOK_STATUS!\"==\"0\" (\n"
+        "  del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        "  exit /b !CMD_STATUS!\n"
+        ")\n"
+        "\n"
+        "if exist \"!HOOK_FILE!\" type \"!HOOK_FILE!\" >&2\n"
+        "del /q \"!HOOK_FILE!\" >nul 2>&1\n"
+        ">&2 echo [omni] hook-stop failed with code !HOOK_STATUS!.\n"
+        "exit /b !HOOK_STATUS!\n"
+    )
+
+
+def _bash_wrapper_script(command_line: str) -> str:
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "\n"
+        + _bash_pause_seconds_helper()
+        + "\n"
         "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
         "  printf '[omni] no active session. run omni-autonomous-agent --add first.\\n' >&2\n"
         "  exit 3\n"
@@ -467,7 +466,7 @@ def _specific_wrapper_script(agent_command: str) -> str:
         "  fi\n"
         "\n"
         "  set +e\n"
-        f'  {agent_command} "$@"\n'
+        f"  {command_line}\n"
         "  cmd_status=$?\n"
         "  set -e\n"
         "\n"
@@ -487,7 +486,11 @@ def _specific_wrapper_script(agent_command: str) -> str:
         '    if [[ -n "$hook_output" ]]; then\n'
         '      printf "%s\\n" "$hook_output" >&2\n'
         "    fi\n"
-        "    sleep 30\n"
+        '    if ! pause_seconds="$(printf "%s\\n" "$hook_output" | omni_pause_seconds)"; then\n'
+        "      printf '[omni] hook-stop pause payload missing pause_then_resume_seconds.\\n' >&2\n"
+        '      exit "$hook_status"\n'
+        "    fi\n"
+        '    sleep "$pause_seconds"\n'
         "    if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then\n"
         '      exit "$cmd_status"\n'
         "    fi\n"
@@ -512,6 +515,18 @@ def _specific_wrapper_script(agent_command: str) -> str:
         '  exit "$hook_status"\n'
         "done\n"
     )
+
+
+def _universal_wrapper_script() -> str:
+    if _is_windows():
+        return _windows_wrapper_script("%*")
+    return _bash_wrapper_script('"$@"')
+
+
+def _specific_wrapper_script(agent_command: str) -> str:
+    if _is_windows():
+        return _windows_wrapper_script(f"{agent_command} %*")
+    return _bash_wrapper_script(f'{agent_command} "$@"')
 
 
 def _configure_universal_wrapper() -> tuple[bool, Path]:
@@ -953,7 +968,7 @@ const readSessionsFromCli = (
     return null;
   }
 
-  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  const output = `${result.stdout ?? ''}`.trim();
   if (!output) return null;
 
   try {
@@ -1333,8 +1348,11 @@ const routeFromEntry = (
   const to =
     readRecordString(deliveryContext, 'to') ||
     readRecordString(record, 'lastTo') ||
+    readRecordString(origin, 'from');
+  const from =
+    readRecordString(deliveryContext, 'from') ||
+    readRecordString(record, 'lastFrom') ||
     readRecordString(origin, 'to');
-  const from = readRecordString(origin, 'from');
   const accountId =
     readRecordString(deliveryContext, 'accountId') ||
     readRecordString(record, 'lastAccountId') ||
@@ -1905,13 +1923,38 @@ const launchDetachedOpenclawAgent = (
 ): { ok: boolean; reason: string } => {
   const shell = options.shell;
   if (process.platform !== 'win32') {
-    const quotedCommand = shell ? buildShellCommand(command, args) : buildShellCommand(command, args);
     const verifySeconds = Math.max(1, Math.ceil(DETACHED_LAUNCH_VERIFY_MS / 1000));
-    const script = `nohup ${quotedCommand} >/dev/null 2>&1 & child=$!; sleep ${verifySeconds}; kill -0 "$child" >/dev/null 2>&1`;
-    const result = spawnSync('sh', ['-lc', script], {
-      stdio: 'ignore',
-      env: runtimeEnv,
-    });
+    const verificationScript =
+      `sleep ${verifySeconds}; ` +
+      'if kill -0 "$child" >/dev/null 2>&1; then exit 0; fi; ' +
+      'wait "$child"; ' +
+      'exit "$?"';
+    const result = shell
+      ? spawnSync(
+          'sh',
+          [
+            '-lc',
+            `nohup ${buildShellCommand(command, args)} >/dev/null 2>&1 & child=$!; ${verificationScript}`,
+          ],
+          {
+            stdio: 'ignore',
+            env: runtimeEnv,
+          },
+        )
+      : spawnSync(
+          'sh',
+          [
+            '-lc',
+            `nohup "$@" >/dev/null 2>&1 & child=$!; ${verificationScript}`,
+            'sh',
+            command,
+            ...args,
+          ],
+          {
+            stdio: 'ignore',
+            env: runtimeEnv,
+          },
+        );
 
     if (result.status === 0) {
       return { ok: true, reason: '' };
@@ -2114,20 +2157,21 @@ const queueResumePing = (status: StatusPayload, event: any) => {
 
   const args = buildAgentArgs(targetAgentId, route, prompt);
 
-  console.log(
-    `[omni-recovery] startup wake queued for agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
-  );
-  recordHookTelemetry(
-    'openclaw.startup.wake_queued',
-    `agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
-  );
-
   const launched = launchOpenclawAgent(
     args,
     'openclaw.startup.spawn_failed',
     `route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} rollback=1`,
     dedupe.decision === 'recorded' ? dedupeKey : undefined,
   );
+  if (launched) {
+    console.log(
+      `[omni-recovery] startup wake queued for agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+    );
+    recordHookTelemetry(
+      'openclaw.startup.wake_queued',
+      `agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
+    );
+  }
   return launched;
 };
 
@@ -2183,19 +2227,20 @@ const queueInboundUserMessage = (
     `Report status: ${reportStatus}`,
   ].join('\\n');
   const args = buildAgentArgs(targetAgentId, route, prompt);
-
-  console.log(
-    `[omni-recovery] inbound message forwarded to agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
-  );
-  recordHookTelemetry(
-    'openclaw.message.forward_queued',
-    `action=${event.action} agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
-  );
   const launched = launchOpenclawAgent(
     args,
     'openclaw.message.forward_spawn_failed',
     `action=${event.action} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
   );
+  if (launched) {
+    console.log(
+      `[omni-recovery] inbound message forwarded to agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)}`,
+    );
+    recordHookTelemetry(
+      'openclaw.message.forward_queued',
+      `action=${event.action} agent=${targetAgentId} route=${shortFingerprint(route.sessionKey)} session=${shortFingerprint(route.sessionId)} deliver=${deliverStartupWake ? '1' : '0'}`,
+    );
+  }
   return launched;
 };
 
@@ -2447,12 +2492,17 @@ def _safe_apply(
     warnings: list[str],
 ) -> bool:
     try:
+        _drain_json_recovery_notices()
         changed, path = apply_fn()
         configured.append(
             f"{label} {'updated' if changed else 'already set'} at {path}"
         )
+        for notice in _drain_json_recovery_notices():
+            warnings.append(f"{label}: {notice}")
         return True
     except Exception as exc:
+        for notice in _drain_json_recovery_notices():
+            warnings.append(f"{label}: {notice}")
         warnings.append(f"{label} failed: {exc}")
         return False
 

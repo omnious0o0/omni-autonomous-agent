@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .constants import BOLD, CONFIG_DIR, DIM, GREEN, RED, SEP, c
+from .constants import BOLD, CONFIG_DIR, DIM, GREEN, SEP, c
 
 
 def _header(title: str) -> None:
@@ -103,6 +103,11 @@ def _parse_interval_minutes() -> int:
     return parsed
 
 
+def _auto_update_branch() -> str:
+    raw = os.environ.get("OMNI_AGENT_AUTO_UPDATE_BRANCH", "main").strip()
+    return raw or "main"
+
+
 def _should_skip_auto_update() -> bool:
     value = os.environ.get("OMNI_AGENT_DISABLE_AUTO_UPDATE", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -176,6 +181,16 @@ def maybe_auto_update() -> None:
         branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD")
         if dirty or branch == "HEAD":
             next_state["last_result"] = "skipped"
+            _save_auto_update_state(next_state)
+            return
+
+        allowed_branch = _auto_update_branch()
+        if branch != allowed_branch:
+            next_state["last_result"] = "skipped"
+            next_state["last_output"] = (
+                f"auto-update skipped on branch {branch}; "
+                f"set OMNI_AGENT_AUTO_UPDATE_BRANCH={branch} to allow it"
+            )
             _save_auto_update_state(next_state)
             return
 

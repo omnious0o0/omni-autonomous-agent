@@ -1300,7 +1300,12 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn('runHook(["--hook-stop"])', opencode_plugin_text)
         self.assertIn('runHook(["--hook-precompact"])', opencode_plugin_text)
         self.assertIn('if [[ "$hook_status" -eq 5 ]]', universal_wrapper_text)
-        self.assertIn("sleep 30", universal_wrapper_text)
+        self.assertIn("omni_pause_seconds()", universal_wrapper_text)
+        self.assertIn(
+            'pause_seconds="$(printf "%s\\n" "$hook_output" | omni_pause_seconds)"',
+            universal_wrapper_text,
+        )
+        self.assertNotIn("sleep 30", universal_wrapper_text)
         self.assertGreaterEqual(
             universal_wrapper_text.count(
                 "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then"
@@ -1308,7 +1313,12 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             2,
         )
         self.assertIn('if [[ "$hook_status" -eq 5 ]]', codex_wrapper_text)
-        self.assertIn("sleep 30", codex_wrapper_text)
+        self.assertIn("omni_pause_seconds()", codex_wrapper_text)
+        self.assertIn(
+            'pause_seconds="$(printf "%s\\n" "$hook_output" | omni_pause_seconds)"',
+            codex_wrapper_text,
+        )
+        self.assertNotIn("sleep 30", codex_wrapper_text)
         self.assertGreaterEqual(
             codex_wrapper_text.count(
                 "if ! omni-autonomous-agent --require-active >/dev/null 2>&1; then"
@@ -1377,6 +1387,61 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         )
         self.assertEqual(wrapper_result.returncode, 7)
         self.assertFalse(self._state_file().exists())
+
+    def test_wrapper_uses_dynamic_pause_then_resume_seconds(self) -> None:
+        self._write_fake_binary("codex")
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+
+        wrapper = self.home_dir / ".local" / "bin" / "omni-wrap-codex"
+        shim_bin = Path(self._temp_dir.name) / "wrapper-shims"
+        shim_bin.mkdir(parents=True, exist_ok=True)
+        pause_state = shim_bin / "pause-state.txt"
+
+        fake_oaa = shim_bin / "omni-autonomous-agent"
+        fake_oaa.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'cmd="${1:-}"\n'
+            'if [[ "${cmd}" == "--require-active" ]]; then\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${cmd}" == "--hook-stop" ]]; then\n'
+            '  count="0"\n'
+            '  if [[ -f "${TEST_HOOK_STATE_FILE}" ]]; then\n'
+            '    count="$(cat "${TEST_HOOK_STATE_FILE}")"\n'
+            "  fi\n"
+            '  if [[ "${count}" == "0" ]]; then\n'
+            '    printf "1" > "${TEST_HOOK_STATE_FILE}"\n'
+            '    printf \'{"continue": true, "block": true, "pause_then_resume_seconds": 1}\\n\'\n'
+            "    exit 5\n"
+            "  fi\n"
+            '  printf \'{"continue": false, "block": false}\\n\'\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_oaa.chmod(0o755)
+
+        env = self.env.copy()
+        env["PATH"] = f"{shim_bin}:{self.env['PATH']}"
+        env["TEST_HOOK_STATE_FILE"] = str(pause_state)
+
+        started = time.monotonic()
+        wrapper_result = subprocess.run(
+            [str(wrapper), "--exit-code", "7"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(wrapper_result.returncode, 7)
+        self.assertGreaterEqual(elapsed, 1.0)
+        self.assertLess(elapsed, 3.5)
 
     def test_wrapper_pauses_when_waiting_for_user_response(self) -> None:
         self._write_fake_binary("codex")
@@ -1570,6 +1635,31 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertEqual(bootstrap.returncode, 0)
         self.assertIn("OpenClaw optional hook", bootstrap.stdout)
 
+    def test_bootstrap_warns_when_invalid_provider_config_is_quarantined(self) -> None:
+        self._write_fake_binary("gemini")
+        gemini_dir = self.home_dir / ".gemini"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        (gemini_dir / "settings.json").write_text("{bad-json", encoding="utf-8")
+
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+        self.assertIn("Gemini hooks: settings.json was invalid JSON", bootstrap.stdout)
+        self.assertFalse((gemini_dir / "settings.json.bak").exists())
+        self.assertTrue(any(gemini_dir.glob("settings.json.invalid.*")))
+
+    def test_bootstrap_rewrites_provider_config_without_leaking_bak_copy(self) -> None:
+        self._write_fake_binary("gemini")
+        gemini_dir = self.home_dir / ".gemini"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        (gemini_dir / "settings.json").write_text(
+            json.dumps({"hooks": {"AfterAgent": []}}, indent=2),
+            encoding="utf-8",
+        )
+
+        bootstrap = _run_cli(["--bootstrap"], self.env)
+        self.assertEqual(bootstrap.returncode, 0)
+        self.assertFalse((gemini_dir / "settings.json.bak").exists())
+
     def test_installer_fails_when_bootstrap_fails(self) -> None:
         self._write_openclaw_failing_binary()
 
@@ -1635,6 +1725,10 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("Get-PowerShellHostCommand", text)
         self.assertIn("$env:ComSpec", text)
         self.assertIn("$runnerPs1", text)
+        self.assertIn("Get-PythonVersion", text)
+        self.assertIn("requires >= 3.10", text)
+        self.assertIn("Assert-CleanGitCheckout", text)
+        self.assertIn("Invoke-GitPullNoPrompt", text)
 
     def test_installer_script_contains_bootstrap_timeout_guard(self) -> None:
         install_sh = PROJECT_ROOT / ".omni-autonomous-agent" / "install.sh"
@@ -1643,6 +1737,61 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         text = install_sh.read_text(encoding="utf-8")
         self.assertIn("OMNI_AGENT_BOOTSTRAP_TIMEOUT", text)
         self.assertIn("run_bootstrap_with_timeout", text)
+        self.assertIn("python3 >= 3.10", text)
+        self.assertIn("ensure_clean_git_checkout", text)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", text)
+
+    def test_shell_installer_refuses_dirty_existing_clone_before_pull(self) -> None:
+        bundle_root = Path(self._temp_dir.name) / "install-bundle"
+        script_dir = bundle_root / ".omni-autonomous-agent"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        install_copy = script_dir / "install.sh"
+        install_copy.write_text(
+            (PROJECT_ROOT / ".omni-autonomous-agent" / "install.sh").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+
+        fake_bin = Path(self._temp_dir.name) / "install-fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [[ "${1:-}" == "-C" ]]; then\n'
+            '  shift 2\n'
+            "fi\n"
+            'if [[ "${1:-}" == "status" && "${2:-}" == "--porcelain" ]]; then\n'
+            '  printf " M dirty-file\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "${1:-}" == "rev-parse" && "${2:-}" == "--abbrev-ref" ]]; then\n'
+            '  printf "main\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+
+        install_dir = Path(self._temp_dir.name) / "existing-install"
+        (install_dir / ".git").mkdir(parents=True, exist_ok=True)
+
+        env = self.env.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["OMNI_AGENT_INSTALL_DIR"] = str(install_dir)
+
+        result = subprocess.run(
+            ["bash", str(install_copy)],
+            cwd=bundle_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has local changes", result.stderr)
 
     def test_json_flag_requires_status(self) -> None:
         invalid = _run_cli(["--cancel", "--json"], self.env)
@@ -1676,6 +1825,35 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         result = _run_cli(["--update"], env)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not a git repository", result.stderr)
+
+    def test_auto_update_skips_non_default_branch(self) -> None:
+        updater = _load_internal_modules("updater")["updater"]
+        saved_state: dict[str, str] = {}
+
+        def fake_git(_repo_root: Path, *args: str) -> str:
+            if args == ("status", "--porcelain"):
+                return ""
+            if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+                return "feature/oaa-hardening"
+            raise AssertionError(f"unexpected git args: {args}")
+
+        with mock.patch.object(updater, "_should_skip_auto_update", return_value=False):
+            with mock.patch.object(updater.shutil, "which", return_value="/usr/bin/git"):
+                with mock.patch.object(updater, "_is_git_worktree", return_value=True):
+                    with mock.patch.object(
+                        updater, "_load_auto_update_state", return_value={}
+                    ):
+                        with mock.patch.object(
+                            updater, "_save_auto_update_state", side_effect=saved_state.update
+                        ):
+                            with mock.patch.object(updater, "_repo_root", return_value=PROJECT_ROOT):
+                                with mock.patch.object(updater, "_git", side_effect=fake_git):
+                                    with mock.patch.object(updater.subprocess, "run") as run_mock:
+                                        updater.maybe_auto_update()
+
+        self.assertEqual(saved_state.get("last_result"), "skipped")
+        self.assertIn("feature/oaa-hardening", str(saved_state.get("last_output", "")))
+        run_mock.assert_not_called()
 
     def test_update_times_out_cleanly(self) -> None:
         fake_git = self.bin_dir / "git"
@@ -1944,6 +2122,46 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
             "--record-openclaw-route --openclaw-agent-id main --openclaw-session-id cli-session-789 --openclaw-session-key agent:main:main",
             oaa_log,
         )
+
+    def test_openclaw_startup_wake_ignores_sessions_cli_stderr_noise(self) -> None:
+        cli_sessions_payload = json.dumps(
+            {
+                "sessions": [
+                    {
+                        "key": "agent:main:main",
+                        "sessionId": "cli-session-789",
+                        "updatedAt": 250,
+                        "agentId": "main",
+                    }
+                ]
+            }
+        )
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake stderr warning",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            write_session_file=False,
+            fake_openclaw_script=(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'if [[ "${1:-}" == "sessions" ]]; then\n'
+                f"  printf '%s\\n' '{cli_sessions_payload}'\n"
+                '  printf "warning: benign stderr noise\\n" >&2\n'
+                "  exit 0\n"
+                "fi\n"
+                'printf "%s\\n" "$*" >> "${TEST_HOOK_OPENCLAW_LOG}"\n'
+                "exit 0\n"
+            ),
+        )
+
+        self.assertIn("agent --agent main --session-id cli-session-789", openclaw_log)
+        self.assertIn("openclaw.startup.wake_queued", oaa_log)
 
     def test_openclaw_startup_wake_recovers_delivery_route_from_cli_store_when_default_file_missing(
         self,
@@ -2471,6 +2689,40 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("--reply-to telegram:7026799796", openclaw_log)
         self.assertIn("--reply-account default", openclaw_log)
 
+    def test_openclaw_message_forward_failure_does_not_emit_forward_queued(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "forward failure telemetry",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "sessionKey": "agent:main:main",
+                "context": {
+                    "content": "Forward this message.",
+                    "from": "telegram:7026799796",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            sync_launch=False,
+            fake_openclaw_script=(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "exit 1\n"
+            ),
+        )
+
+        self.assertEqual(openclaw_log.strip(), "")
+        self.assertIn("openclaw.message.forward_spawn_failed", oaa_log)
+        self.assertNotIn("openclaw.message.forward_queued", oaa_log)
+
     def test_openclaw_message_without_session_key_requires_bound_sender_match(
         self,
     ) -> None:
@@ -2552,6 +2804,80 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
         self.assertIn("agent --agent main --session-id persisted-session-456", openclaw_log)
         self.assertIn("--reply-channel telegram", openclaw_log)
         self.assertIn("--reply-to telegram:7026799796", openclaw_log)
+
+    def test_openclaw_message_without_session_key_matches_asymmetric_origin_route(
+        self,
+    ) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "match asymmetric route",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "Continue with the updated plan.",
+                    "from": "telegram:test-user",
+                    "to": "telegram:test-bot",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            session_record={
+                "sessionId": "session-123",
+                "origin": {
+                    "surface": "telegram",
+                    "from": "telegram:test-user",
+                    "to": "telegram:test-bot",
+                    "accountId": "default",
+                },
+            },
+        )
+
+        self.assertIn("--user-responded --response-note Continue with the updated plan.", oaa_log)
+        self.assertIn("openclaw.message.forward_queued", oaa_log)
+        self.assertIn("--reply-to telegram:test-user", openclaw_log)
+        self.assertNotIn("route_mismatch_ignored", oaa_log)
+
+    def test_openclaw_cancel_accept_allows_asymmetric_origin_sender(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "cancel approval asymmetric route",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "cancel_request_state": "pending",
+            },
+            event={
+                "type": "message",
+                "action": "received",
+                "context": {
+                    "content": "...",
+                    "from": "telegram:test-user",
+                    "to": "telegram:test-bot",
+                    "accountId": "default",
+                    "channel": "telegram",
+                },
+            },
+            session_record={
+                "sessionId": "session-123",
+                "origin": {
+                    "surface": "telegram",
+                    "from": "telegram:test-user",
+                    "to": "telegram:test-bot",
+                    "accountId": "default",
+                },
+            },
+        )
+
+        self.assertIn("--cancel-accept --decision-note ...", oaa_log)
+        self.assertNotIn("cancel_decision_unauthorized", oaa_log)
+        self.assertEqual(openclaw_log.strip(), "")
 
     def test_openclaw_message_foreign_session_key_is_ignored_without_store_match(
         self,
@@ -2665,6 +2991,31 @@ class AutonomousAgentHardeningTests(unittest.TestCase):
 
         self.assertEqual(openclaw_log.strip(), "")
         self.assertIn("openclaw.startup.spawn_failed", oaa_log)
+        self.assertNotIn("openclaw.startup.wake_queued", oaa_log)
+
+    def test_openclaw_startup_wake_accepts_short_lived_detached_success(self) -> None:
+        oaa_log, openclaw_log = self._run_openclaw_handler(
+            status_payload={
+                "active": True,
+                "waiting_for_user": False,
+                "request": "startup wake detached success",
+                "dynamic": True,
+                "report_status": "IN_PROGRESS",
+                "started_at": "2026-03-06T00:00:00+00:00",
+            },
+            event={"type": "gateway", "action": "startup"},
+            sync_launch=False,
+            fake_openclaw_script=(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf "%s\\n" "$*" >> "${TEST_HOOK_OPENCLAW_LOG}"\n'
+                "exit 0\n"
+            ),
+        )
+
+        self.assertIn("openclaw.startup.wake_queued", oaa_log)
+        self.assertNotIn("openclaw.startup.spawn_failed", oaa_log)
+        self.assertIn("sessions --json --all-agents", openclaw_log)
 
     def test_openclaw_plugin_agent_end_respects_wait_window_block(self) -> None:
         oaa_log, system_events, heartbeat_events, plugin_log = (

@@ -26,6 +26,8 @@ omni-autonomous-agent --status
 omni-autonomous-agent --bootstrap
 ```
 
+OAA requires Python 3.10 or newer on the current host.
+
 Then choose the branch that matches the current host:
 
 - If OpenClaw is installed or this host is supposed to use the OpenClaw integration, run:

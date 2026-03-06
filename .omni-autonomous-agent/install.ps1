@@ -6,6 +6,24 @@ function Write-Section($title) {
   Write-Output "----------------------------------------------------------------------"
 }
 
+function Get-PythonVersion($command) {
+  try {
+    $versionOutput = & $command.Source --version 2>&1
+  }
+  catch {
+    return $null
+  }
+
+  if ($versionOutput -match "Python (\d+)\.(\d+)(?:\.(\d+))?") {
+    $major = [int]$matches[1]
+    $minor = [int]$matches[2]
+    $patch = if ($matches[3]) { [int]$matches[3] } else { 0 }
+    return [Version]::new($major, $minor, $patch)
+  }
+
+  return $null
+}
+
 function Get-PythonCommand {
   foreach ($name in @("python", "python3", "py")) {
     $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -13,15 +31,28 @@ function Get-PythonCommand {
       continue
     }
 
-    try {
-      $versionOutput = & $cmd.Source --version 2>&1
+    $version = Get-PythonVersion $cmd
+    if ($version -and $version.Major -eq 3 -and $version.Minor -ge 10) {
+      return $cmd
     }
-    catch {
+  }
+
+  return $null
+}
+
+function Get-LegacyPythonCommand {
+  foreach ($name in @("python", "python3", "py")) {
+    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    if (-not $cmd) {
       continue
     }
 
-    if ($versionOutput -match "Python 3\.(\d+)") {
-      return $cmd
+    $version = Get-PythonVersion $cmd
+    if ($version) {
+      return @{
+        Command = $cmd
+        Version = $version
+      }
     }
   }
 
@@ -77,13 +108,17 @@ function Ensure-PythonCommand {
   }
 
   Write-Section "Installing Python runtime"
+  $legacyPython = Get-LegacyPythonCommand
+  if ($legacyPython) {
+    Write-Output "  Detected:    $($legacyPython.Command.Source) ($($legacyPython.Version), requires >= 3.10)"
+  }
   $winget = Ensure-WingetCommand
   & $winget.Source install --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements
   Refresh-Path
 
   $python = Get-PythonCommand
   if (-not $python) {
-    throw "python installation did not succeed"
+    throw "python 3.10 or newer installation did not succeed"
   }
 
   return $python
@@ -112,6 +147,50 @@ function Ensure-GitCommand {
   return $git
 }
 
+function Assert-CleanGitCheckout($git, $repoDir) {
+  $dirty = & $git.Source -C $repoDir status --porcelain 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "failed to inspect existing repository state at $repoDir"
+  }
+  if ($dirty.Trim()) {
+    throw "existing install at $repoDir has local changes. Commit or stash them before rerunning installer."
+  }
+
+  $branch = & $git.Source -C $repoDir rev-parse --abbrev-ref HEAD 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "failed to inspect existing repository branch at $repoDir"
+  }
+  if ($branch.Trim() -eq "HEAD") {
+    throw "existing install at $repoDir is in detached HEAD state. Checkout a branch before rerunning installer."
+  }
+}
+
+function Invoke-GitPullNoPrompt($git, $repoDir) {
+  $previousPrompt = [Environment]::GetEnvironmentVariable("GIT_TERMINAL_PROMPT", "Process")
+  $previousGcm = [Environment]::GetEnvironmentVariable("GCM_INTERACTIVE", "Process")
+  $env:GIT_TERMINAL_PROMPT = "0"
+  $env:GCM_INTERACTIVE = "never"
+
+  try {
+    & $git.Source -C $repoDir pull --ff-only
+  }
+  finally {
+    if ($null -eq $previousPrompt) {
+      Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue
+    }
+    else {
+      $env:GIT_TERMINAL_PROMPT = $previousPrompt
+    }
+
+    if ($null -eq $previousGcm) {
+      Remove-Item Env:GCM_INTERACTIVE -ErrorAction SilentlyContinue
+    }
+    else {
+      $env:GCM_INTERACTIVE = $previousGcm
+    }
+  }
+}
+
 $scriptSourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $rootDir = Resolve-Path (Join-Path $scriptSourceDir "..")
 $mainScript = Join-Path $rootDir "main.py"
@@ -131,8 +210,9 @@ if (-not (Test-Path $mainScript)) {
   $null = Ensure-PythonCommand
 
   if (Test-Path $repoGitDir) {
+    Assert-CleanGitCheckout $git $installDir
     Write-Output "  Repository:  $installDir (existing, pulling latest)"
-    & $git.Source -C $installDir pull --ff-only
+    Invoke-GitPullNoPrompt $git $installDir
     if ($LASTEXITCODE -ne 0) {
       throw "failed to pull latest repository at $installDir"
     }

@@ -35,6 +35,26 @@ has_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+python3_meets_minimum() {
+  if ! has_cmd python3; then
+    return 1
+  fi
+
+  python3 - <<'PY' >/dev/null 2>&1
+import sys
+
+sys.exit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+python3_version_text() {
+  if ! has_cmd python3; then
+    return 1
+  fi
+
+  python3 --version 2>&1 | awk '{print $2}'
+}
+
 pkg_manager() {
   local managers=(apt-get dnf yum pacman zypper apk brew)
   local manager
@@ -103,14 +123,21 @@ install_packages() {
 }
 
 ensure_python() {
-  if has_cmd python3; then
+  if python3_meets_minimum; then
     return
   fi
 
   header "Installing Python runtime"
+  if has_cmd python3; then
+    local current_version
+    current_version="$(python3_version_text || true)"
+    if [[ -n "${current_version}" ]]; then
+      row "Detected" "python3 ${current_version} (requires >= 3.10)"
+    fi
+  fi
   local manager
   if ! manager="$(pkg_manager)"; then
-    fail "python3 is required and no supported package manager is available"
+    fail "python3 >= 3.10 is required and no supported package manager is available"
   fi
 
   case "${manager}" in
@@ -123,7 +150,7 @@ ensure_python() {
     brew) install_packages python ;;
   esac
 
-  has_cmd python3 || fail "python3 installation did not succeed"
+  python3_meets_minimum || fail "python3 >= 3.10 installation did not succeed"
 }
 
 ensure_git() {
@@ -145,6 +172,25 @@ ensure_git() {
   has_cmd git || fail "git installation did not succeed"
 }
 
+ensure_clean_git_checkout() {
+  local repo_dir="$1"
+  local dirty branch
+
+  if ! dirty="$(git -C "${repo_dir}" status --porcelain 2>/dev/null)"; then
+    fail "failed to inspect existing repository state at ${repo_dir}"
+  fi
+  if [[ -n "${dirty}" ]]; then
+    fail "existing install at ${repo_dir} has local changes. Commit or stash them before rerunning installer."
+  fi
+
+  if ! branch="$(git -C "${repo_dir}" rev-parse --abbrev-ref HEAD 2>/dev/null)"; then
+    fail "failed to inspect existing repository branch at ${repo_dir}"
+  fi
+  if [[ "${branch}" == "HEAD" ]]; then
+    fail "existing install at ${repo_dir} is in detached HEAD state. Checkout a branch before rerunning installer."
+  fi
+}
+
 SCRIPT_SOURCE_DIR=""
 if ! SCRIPT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"; then
   SCRIPT_SOURCE_DIR=""
@@ -155,8 +201,9 @@ if [[ -z "${SCRIPT_SOURCE_DIR}" || ! -f "${SCRIPT_SOURCE_DIR}/../main.py" ]]; th
   ensure_git
 
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
+    ensure_clean_git_checkout "${INSTALL_DIR}"
     row "Repository" "${INSTALL_DIR} (existing, pulling latest)"
-    git -C "${INSTALL_DIR}" pull --ff-only
+    GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -C "${INSTALL_DIR}" pull --ff-only
   elif [[ -e "${INSTALL_DIR}" ]]; then
     fail "${INSTALL_DIR} exists but is not a git repository. Remove it manually or set OMNI_AGENT_INSTALL_DIR to a clean location."
   else
